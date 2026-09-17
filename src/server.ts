@@ -109,6 +109,7 @@ import {
 import { countRequestSamples } from "./ping/probe-cache.js";
 import { detectOpenAiFrontProtocol, openAiFrontPath } from "./routes/openai-front.js";
 import { anthropicMessagesPath } from "./routes/messages.js";
+import { beginLaneRequest, LANE_ACTIVITY_HEADER, laneActivityTag } from "./lane-activity.js";
 
 export { baseLog, logSafePath } from "./request-log.js";
 export { DEFAULT_MAX_BODY_BYTES } from "./stream-pipeline.js";
@@ -127,6 +128,7 @@ const CONTROL_ROUTES = new Set([
   ...TOKENLESS_CONTROL_READS,
   "/cooldowns/clear",
   "/dispatch/telemetry",
+  "/dispatch/activity",
   "/registry",
   "/ping",
   "/health/stats",
@@ -427,6 +429,28 @@ export function contextCeilingFor(
   return null;
 }
 
+/**
+ * A request that carries a dispatch lane's activity tag (`lane-activity.ts`) touches that tag when
+ * it starts, on every response write, and when it ends. `res.write`/`res.end` are the one place
+ * every response path on both fronts passes through, so no front can miss a write.
+ */
+function trackLaneActivity(req: IncomingMessage, res: ServerResponse): void {
+  const tag = laneActivityTag(req.headers[LANE_ACTIVITY_HEADER]);
+  if (tag === null) return;
+  const lane = beginLaneRequest(tag);
+  const write = res.write.bind(res) as (...args: unknown[]) => boolean;
+  const end = res.end.bind(res) as (...args: unknown[]) => ServerResponse;
+  res.write = ((...args: unknown[]) => {
+    lane.wrote();
+    return write(...args);
+  }) as ServerResponse["write"];
+  res.end = ((...args: unknown[]) => {
+    lane.wrote();
+    return end(...args);
+  }) as ServerResponse["end"];
+  res.once("close", lane.ended);
+}
+
 async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h: Handlers): Promise<void> {
   const started = Date.now();
   const path = req.url ?? "/";
@@ -442,6 +466,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
   }
 
   if (await handleDashboardAdapter(req, res, path, started, cfg, h)) return;
+  trackLaneActivity(req, res);
 
   let reqBuf: Buffer;
   try {

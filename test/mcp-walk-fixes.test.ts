@@ -27,6 +27,7 @@ import type { AgyLogSnapshot } from "../src/mcp/agy-quota-log.js";
 
 const WALK: DispatchWalkSettings = {
   enabled: true,
+  idleMs: 40,
   attemptMs: 40,
   agentAttemptMs: 40,
   attemptQuantile: 0.8,
@@ -332,7 +333,12 @@ describe("F6 — the quota death AGY states only in its log", () => {
     const h = new Harness({
       buildView: async () => view([agyLane(), cli("l2")]),
       spawn: laneRunner({ l2: ok("the fallback answered") }),
-      now: () => 1_000,
+      // A clock that moves, so the AGY lane goes idle and the walk stops it; it stays below the
+      // log's mtime, so the log still counts as written after the lane started.
+      now: (() => {
+        let t = 1_000;
+        return () => (t += 10);
+      })(),
       readAgyLog: () => agyLog(MODEL),
       reportExhaustion: (r) => {
         reports.push(r);

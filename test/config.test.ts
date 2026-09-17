@@ -1716,6 +1716,7 @@ describe("routing.dispatchWalk", () => {
     const cfg = loadConfig(write("dw-absent.json", base()));
     expect(cfg.routing.dispatchWalk).toEqual({
       enabled: true,
+      idleMs: 300_000,
       attemptMs: 90_000,
       agentAttemptMs: 600_000,
       attemptQuantile: 0.8,
@@ -1756,6 +1757,16 @@ describe("routing.dispatchWalk", () => {
     expect(off.routing.dispatchWalk?.attemptMs).toBe(90_000);
   });
 
+  it("accepts idleMs between 30 s and 1 h, and refuses anything else by name", () => {
+    const ok = loadConfig(write("dw-idle.json", base({ routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { idleMs: 120_000 } } })));
+    expect(ok.routing.dispatchWalk?.idleMs).toBe(120_000);
+    for (const idleMs of [29_999, 3_600_001, "300000"]) {
+      expect(() =>
+        loadConfig(write("dw-idle-bad.json", base({ routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { idleMs } } }))),
+      ).toThrow(/config.routing.dispatchWalk.idleMs must be a number between 30000 and 3600000/);
+    }
+  });
+
   it("accepts a partial object, filling the rest from the defaults, and floors to integers", () => {
     const cfg = loadConfig(
       write("dw-obj.json", base({
@@ -1764,6 +1775,7 @@ describe("routing.dispatchWalk", () => {
     );
     expect(cfg.routing.dispatchWalk).toEqual({
       enabled: true,
+      idleMs: 300_000,
       attemptMs: 45_000,
       agentAttemptMs: 600_000,
       attemptQuantile: 0.8,

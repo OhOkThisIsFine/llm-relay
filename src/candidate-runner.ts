@@ -107,6 +107,7 @@ import { DEFAULT_ANTHROPIC_VERSION } from "./config.js";
 import { buildAuthHeaders } from "./authEnv.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "./control-authorization.js";
 import { STICKY_SESSION_HEADER } from "./session-pin.js";
+import { LANE_ACTIVITY_HEADER } from "./lane-activity.js";
 import { CrawlAbortedError, failClosed, HOP_BY_HOP } from "./stream-pipeline.js";
 
 const INTERNAL_REQUEST_HEADERS = new Set([
@@ -114,6 +115,7 @@ const INTERNAL_REQUEST_HEADERS = new Set([
   "x-llm-relay-dashboard-session",
   STICKY_SESSION_HEADER,
   CONTROL_AUTHORIZATION_HEADER,
+  LANE_ACTIVITY_HEADER,
 ]);
 
 /** Inbound header names a CONTAINED target is allowed to receive (allow-list).

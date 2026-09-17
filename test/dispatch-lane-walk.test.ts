@@ -2,12 +2,12 @@
  * The automatic dispatch lane WALK (`src/mcp/server.ts`, owner request 2026-09-06).
  *
  * `dispatch` used to run ONE lane and report a failure when that lane was slow; the calling agent
- * then picked the next lane by hand. It now walks the ladder past a lane that does not answer
- * inside its budget, kills that lane, tries the next, and — when every lane is spent — returns an
+ * then picked the next lane by hand. It now walks the ladder past a lane that shows no activity
+ * for `idleMs` (a time budget until 2026-09-17), kills that lane, tries the next, and — when every lane is spent — returns an
  * instruction to do the work in the calling session instead.
  *
  * ⚠ **The slow lane here NEVER resolves on its own; it resolves only when killed.** That makes
- * every walk assertion deterministic rather than a race between two timers: if the budget failed to
+ * every walk assertion deterministic rather than a race between two timers: if the idle stop failed to
  * fire, the test hangs and fails outright instead of passing on a lucky schedule.
  *
  * ⚠ **The `Config` is hand-built rather than loaded.** `parseDispatchWalk` floors `attemptMs` at
@@ -30,6 +30,7 @@ import type { LaneRunResult, LaneSpawner } from "../src/mcp/lane-runner.js";
 
 const WALK: DispatchWalkSettings = {
   enabled: true,
+  idleMs: 40,
   attemptMs: 40,
   // The daemon's agent-mode floor. The walk here reads `attemptMs` and each lane's own budget; this
   // field only completes the type, so it matches `attemptMs` to keep the timing obvious.
@@ -162,26 +163,19 @@ describe("dispatch lane walk", () => {
     expect(spawn.killed).toEqual(["l1"]);
   });
 
-  it("⚠ honours the LANE's own budget, not the configuration default", async () => {
-    // ⚠ Every other test in this file sets `attemptMinSamples` high, so each lane's budget equals
-    // the flat `attemptMs` and the two are indistinguishable — wiring the walk to `opts.attemptMs`
-    // instead of `lane.attemptBudget.ms` would leave them all green. This case separates them: the
-    // configuration says 5 seconds, the LANE says 30 ms, and only one of those lets the walk reach
-    // the second lane inside this test.
+  it("⚠ stops an idle lane at idleMs, whatever time budget the lane's history gives it", async () => {
+    // Owner decision 2026-09-17: a lane is stopped when it is IDLE, never because it passed a time
+    // budget. The lane's recorded budget says 5 seconds; the walk ignores it and stops the silent
+    // lane at the 40 ms idle limit.
     const spawn = laneRunner({ l2: ok("the second lane answered") });
     const withBudget = view(["l1", "l2"]);
-    withBudget.ladder[0]!.attemptBudget = { ms: 30, basis: "history", samples: 10 };
-    const h = new Harness({
-      config: config({ ...WALK, attemptMs: 5_000 }),
-      buildView: async () => withBudget,
-      spawn,
-    });
+    withBudget.ladder[0]!.attemptBudget = { ms: 5_000, basis: "history", samples: 10 };
+    const h = new Harness({ buildView: async () => withBudget, spawn });
     const { text, isError } = await h.tool("dispatch", { task: "do it" });
     expect(isError).toBe(false);
     expect(text).toContain("the second lane answered");
     expect(spawn.started).toEqual(["l1", "l2"]);
-    // And the reason names the budget that actually applied, not the configured one.
-    expect(text).toContain("no answer within the 0s walk budget");
+    expect(text).toContain("no activity for 0s (no relay traffic, output or file change)");
   });
 
   it("names every lane it tried and why, so the walk is legible", async () => {
@@ -190,7 +184,7 @@ describe("dispatch lane walk", () => {
     expect(text).toContain("lanes tried:");
     expect(text).toContain("1. l1");
     expect(text).toContain("abandoned after");
-    expect(text).toContain("walk budget");
+    expect(text).toContain("no activity for");
     expect(text).toContain("3. l3");
     expect(text).toContain("completed after");
   });

@@ -9,6 +9,20 @@
 
 ## Open
 
+- **The dispatch walk carries budget code that stops no lane.** Since 2026-09-17 the walk stops a
+  lane only when it is idle (`routing.dispatchWalk.idleMs`, `src/mcp/server.ts` `latestActivity`).
+  The daemon still computes `DispatchLane.attemptBudget` (`laneHistoryFacts` in `src/dispatch.ts`,
+  with its doubling `raisedBy`), `formatAttemptBudget` has no caller in `src/`, and the config keys
+  `attemptMs`, `agentAttemptMs` and `attemptQuantile` still load with no effect. **Property:** no
+  code computes a figure nothing reads, and a config that sets one of those three keys loads with a
+  warning that names the key and says it has no effect (never a hard error, so an existing config
+  keeps loading).
+- **An idle AGY, Codex or OpenCode lane is judged on output and file changes only.** These lanes do
+  not send their model traffic through the relay, so the walk cannot see a lane that thinks for
+  more than `idleMs` without output or a file change, and stops it. **Property:** either such a lane
+  gives the walk a live signal (for example its process tree's CPU time), or a measurement shows no
+  such lane was stopped while it still worked.
+
 - **Route B reaches the vendor; the SERVED half waits for the free allowance to refill**
   (route B shipped 2026-09-09: `wire: "responses"` on a `kind: "openai"` provider, `src/backend.ts`;
   tests in `test/backend-responses-upstream.test.ts`). Everything this entry asked for except a

@@ -27,7 +27,7 @@ import { CREDENTIAL_LABEL_PATTERN, makeCredentialId } from "./credential-id.js";
 import { providerCredentialSlots, slotAllowsModel } from "./credential-fleet.js";
 import { loadLaneManifest, rosterIsStale, verifyModel } from "./lane-manifest.js";
 import { probeLanes } from "./lane-probe.js";
-import { buildDispatch, allLadderRungs, normalizeCliCommand, resolveLaneLauncherPath, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, TASK_TOKEN, formatLaneStats, formatAttemptBudget, type DispatchLane, type DispatchView } from "./dispatch.js";
+import { buildDispatch, allLadderRungs, normalizeCliCommand, resolveLaneLauncherPath, restoreExhaustedRows, specContextWindow, CONTEXT_TOKEN, TASK_TOKEN, formatLaneStats, type DispatchLane, type DispatchView } from "./dispatch.js";
 import { flushLaneAffinityPersistence, loadLaneAffinityRows, restoreLaneAffinityRows } from "./lane-affinity.js";
 import { flushDispatchLaneStatsPersistence, loadLaneStatsRows, restoreLaneStatsRows, type DispatchMode } from "./dispatch-lane-stats.js";
 import { McpDispatchServer } from "./mcp/server.js";
@@ -1336,6 +1336,29 @@ export async function reportMcpTelemetry(
     return live !== null;
   } catch {
     return false;
+  }
+}
+
+/**
+ * A dispatch lane's live traffic from the running relay (`GET /dispatch/activity`). Null when no
+ * relay answers, the relay holds no record, or the answer is malformed — each of which the MCP
+ * server reads as no signal, never as idle.
+ */
+export async function readMcpLaneActivity(
+  cfg: Config,
+  tag: string,
+  request: DispatchReportRequest = tryServer,
+): Promise<{ inFlight: number; lastActivityAt: number } | null> {
+  try {
+    const live = await request(cfg, `/dispatch/activity?tag=${encodeURIComponent(tag)}`, { method: "GET" });
+    const activity = (live as { activity?: unknown } | null)?.activity;
+    if (typeof activity !== "object" || activity === null) return null;
+    const { inFlight, lastActivityAt } = activity as { inFlight?: unknown; lastActivityAt?: unknown };
+    const at = typeof lastActivityAt === "string" ? Date.parse(lastActivityAt) : Number.NaN;
+    if (typeof inFlight !== "number" || !Number.isFinite(at)) return null;
+    return { inFlight, lastActivityAt: at };
+  } catch {
+    return null;
   }
 }
 
@@ -2718,6 +2741,7 @@ export async function runMcp(): Promise<void> {
     readAgyLog: () => readAgyLog(),
     reportExhaustion: (report) => reportMcpExhaustion(cfg, report),
     reportTelemetry: (report) => { void reportMcpTelemetry(cfg, report); },
+    readLaneActivity: (tag) => readMcpLaneActivity(cfg, tag),
     // ⚠ The running-job journal is what makes a restart REPORTABLE. Without it the measured
     // symptom was five lanes disappearing behind a bare `unknown jobId: job-0051` on a routine
     // poll (2026-09-06, ~90 lane-minutes lost). A row survives only while its job runs, so
@@ -2975,7 +2999,6 @@ export async function runDispatch(arg: string | undefined): Promise<void> {
     // The routing memory from previous walks. Shown ON THE LANE, not only in the selection reason,
     // because the reason names one lane while the reordering it caused affects the whole list —
     // an operator seeing rung 3 tried first must be able to see WHY without inferring it.
-    if (l.attemptBudget) process.stdout.write(`   ${formatAttemptBudget(l.attemptBudget)}\n`);
     // Config alone — this process is not the MCP server that would spawn a job for this rung, so
     // it has no live in-flight count to add beside it (see `LaneJobStore.inFlight`, per-process by
     // construction). `dispatch_lanes` is where the live count renders.

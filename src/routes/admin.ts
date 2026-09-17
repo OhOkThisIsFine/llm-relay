@@ -26,6 +26,7 @@ import {
   type DispatchedTelemetryReport,
   type DispatchLaneStatus,
 } from "../dispatch-lane-stats.js";
+import { laneActivityTag, readLaneActivity } from "../lane-activity.js";
 import { clearLaneAffinity, demoteLane, forgetLaneMemory, lanePin, MAX_AFFINITY_MS, pinLane, recordLaneOutlier } from "../lane-affinity.js";
 
 const MAX_TASK_LEN = 4096;
@@ -184,6 +185,34 @@ export interface AdminHandlers {
 function failClosed(res: ServerResponse, status: number, message: string): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify({ error: { type: "error", message } }));
+}
+
+/**
+ * `GET /dispatch/activity?tag=` — a dispatch lane's live traffic (`lane-activity.ts`). The MCP
+ * server asks it to decide whether a lane is idle. No record is `activity: null`, which the MCP
+ * server reads as no signal, never as idle.
+ */
+function answerDispatchActivity(
+  method: string | undefined,
+  path: string,
+  ok: (body: unknown) => true,
+  bad: (status: number, message: string) => true,
+): true {
+  if (method !== "GET") return bad(404, `${method} /dispatch/activity is not a route — GET it with ?tag=`);
+  const tag = laneActivityTag(pickQuery(path, "tag"));
+  if (tag === null) return bad(400, `GET /dispatch/activity needs a valid tag`);
+  const activity = readLaneActivity(tag);
+  return ok({
+    tag,
+    activity:
+      activity === null
+        ? null
+        : {
+            inFlight: activity.inFlight,
+            requests: activity.requests,
+            lastActivityAt: new Date(activity.lastActivityAt).toISOString(),
+          },
+  });
 }
 
 function pickQuery(url: string, param: string): string | undefined {
@@ -733,6 +762,8 @@ export async function handleAdminRoutes(
     view.source = "daemon";
     return ok(view, true);
   }
+
+  if (pathname === "/dispatch/activity") return answerDispatchActivity(req.method, path, ok, bad);
 
   if ((req.method === "GET" || req.method === "HEAD") && pathname === "/dispatch/telemetry") {
     // POST-only, like `/cooldowns/clear`: an explicit 404 rather than the model-path

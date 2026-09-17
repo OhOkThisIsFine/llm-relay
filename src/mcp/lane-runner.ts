@@ -313,11 +313,11 @@ export interface LaneJob {
    */
   treeDelta?: string;
   /**
-   * Each lane the walk kept past its attempt budget because it was still working, one line per lane,
-   * with the reason. Kept for the whole job — not replaced per lane — because the lane that was kept
-   * can still be stopped later, and the record of why it ran long must survive that.
+   * The newest activity the walk saw for the lane now running (relay traffic, output, a file
+   * change), with its source. Replaced per lane; the walk stops a lane when this is older than
+   * `routing.dispatchWalk.idleMs`.
    */
-  extended?: string[];
+  lastActive?: { at: number; source: string };
 }
 
 /**
@@ -1212,6 +1212,7 @@ export class LaneJobStore {
     delete job.activity;
     delete job.readOnly;
     delete job.launch;
+    delete job.lastActive;
   }
 
   /**
@@ -1253,12 +1254,11 @@ export class LaneJobStore {
     if (job.status !== "running") this.archive.record(job);
   }
 
-  /** Record (or update) why the walk kept `laneId` past its budget. One line per lane. */
-  noteExtension(id: string, laneId: string, text: string): void {
+  /** Record the newest activity the walk saw for the running lane. */
+  noteLastActivity(id: string, at: number, source: string): void {
     const job = this.jobs.get(id);
     if (!job || job.status !== "running") return;
-    const others = (job.extended ?? []).filter((line) => !line.startsWith(`${laneId} `));
-    job.extended = [...others, text];
+    job.lastActive = { at, source };
   }
 
   noteLaunch(id: string, notes: readonly string[]): void {

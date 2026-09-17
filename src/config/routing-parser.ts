@@ -524,6 +524,7 @@ export const DEFAULT_DISPATCH_WALK_OUTLIER: DispatchWalkOutlierSettings = {
 
 export const DEFAULT_DISPATCH_WALK: DispatchWalkSettings = {
   enabled: true,
+  idleMs: 300_000,
   attemptMs: 90_000,
   // Agent mode's own floor (`DispatchWalkSettings.agentAttemptMs`): a tool loop runs for minutes.
   agentAttemptMs: 600_000,
@@ -547,7 +548,7 @@ function parseDispatchWalk(raw: unknown): DispatchWalkSettings {
     throw new Error(`config.routing.dispatchWalk must be a boolean or an object`);
   }
   const o = raw as Record<string, unknown>;
-  const keys = ["enabled", "attemptMs", "agentAttemptMs", "attemptQuantile", "attemptMinSamples", "maxLanes", "pinMs", "demoteMs", "outlier"] as const;
+  const keys = ["enabled", "idleMs", "attemptMs", "agentAttemptMs", "attemptQuantile", "attemptMinSamples", "maxLanes", "pinMs", "demoteMs", "outlier"] as const;
   for (const key of Object.keys(o)) {
     if (!(keys as readonly string[]).includes(key)) {
       throw new Error(`config.routing.dispatchWalk.${key} is not a recognized key (${keys.join(", ")})`);
@@ -565,6 +566,8 @@ function parseDispatchWalk(raw: unknown): DispatchWalkSettings {
   };
   return {
     enabled: o.enabled ?? DEFAULT_DISPATCH_WALK.enabled,
+    // Floor 30 s: two activity checks (15 s apart) must fit inside it. Ceiling 1 h, as below.
+    idleMs: bounded("idleMs", o.idleMs, DEFAULT_DISPATCH_WALK.idleMs, 30_000, 3_600_000),
     // Floor 1 s: a budget under that abandons every lane before a process can start, which reads
     // as "every lane is broken". Ceiling 1 h matches the longest a lane rung is configured for.
     attemptMs: bounded("attemptMs", o.attemptMs, DEFAULT_DISPATCH_WALK.attemptMs, 1_000, 3_600_000),

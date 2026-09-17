@@ -877,6 +877,16 @@ export interface LaneProbeSettings {
 export interface DispatchWalkSettings {
   enabled: boolean;
   /**
+   * How long a lane may show NO activity before the walk stops it and starts the next one. Default
+   * 300000 (5 minutes). Activity is a request the relay daemon serves with the lane's tag, the lane's
+   * own output, or a change in its git working tree (`mcp/server.ts` `latestActivity`).
+   *
+   * ⚠ Owner decision 2026-09-17: a lane is stopped only when it is IDLE, never because it ran longer
+   * than its past runs. The five minutes covers a lane that runs a long command (a test suite) and
+   * sends no model traffic meanwhile. The last lane in a walk is never stopped.
+   */
+  idleMs: number;
+  /**
    * How long ONE lane gets to answer before the walk kills it and starts the next.
    *
    * ⚠ This is a BUDGET the operator sets, not a health threshold derived from measurement — which

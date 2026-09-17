@@ -1,21 +1,24 @@
 /**
- * The walk keeps a lane that is still WORKING past its attempt budget, and never moves a packet to a
- * rung that declares a lower capability (2026-09-17, `docs/backlog.md`). Measured 2026-09-16: the
- * walk stopped `free-pool` at its 789 s p80 with +203 lines written, then started a lane kept for
- * short advisory work with the same implementation packet.
+ * The walk stops a lane only when it is IDLE, and never moves a packet to a rung that declares a
+ * lower capability (2026-09-17). Owner decision the same day: a lane is stopped after
+ * `routing.dispatchWalk.idleMs` with no activity — no request the relay daemon serves with the
+ * lane's tag, no output, no change in its working tree — never because it ran longer than its past
+ * runs. Measured 2026-09-16: the old budget stopped `free-pool` at its 789 s p80 with +203 lines
+ * written, then started a lane kept for short advisory work with the same implementation packet.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { LANE_ACTIVITY_WINDOW_MS, McpDispatchServer } from "../src/mcp/server.js";
+import { IDLE_POLL_MS, McpDispatchServer, type LaneTraffic } from "../src/mcp/server.js";
 import { newestChangeMs, sameTree, type TreeSnapshot, type TreeSnapshotReader } from "../src/mcp/tree-delta.js";
 import { loadConfig } from "../src/config.js";
 import type { Config } from "../src/config.js";
 import type { DispatchLane, DispatchView } from "../src/dispatch.js";
 import type { LaneRunResult, LaneSpawnOptions, LaneSpawner } from "../src/mcp/lane-runner.js";
+import { LANE_ACTIVITY_HEADER } from "../src/lane-activity.js";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const BUDGET_MS = 10_000;
+const IDLE_MS = 30_000;
 
 interface LaneScript {
   /** When the lane answers, from its start. */
@@ -31,7 +34,6 @@ function cliLane(id: string, extra: Partial<DispatchLane> = {}): DispatchLane {
     position: 1,
     state: "ready",
     invoke: { command: id, args: ["{task}"] },
-    attemptBudget: { ms: BUDGET_MS, basis: "floor", samples: 0 },
     ...extra,
   } as DispatchLane;
 }
@@ -41,11 +43,16 @@ function harness(opts: {
   scripts: Record<string, LaneScript>;
   tier?: string;
   readings?: Array<TreeSnapshot | null>;
+  /** What the relay daemon reports for a tag; absent = no daemon. */
+  traffic?: (tag: string, now: number) => LaneTraffic | null;
 }) {
   const out: Array<{ id?: number; result?: { content: Array<{ text: string }> } }> = [];
   const started: string[] = [];
+  const headers: string[] = [];
+  const asked: string[] = [];
   const spawn: LaneSpawner = (command, _args, spawnOpts: LaneSpawnOptions) => {
     started.push(command);
+    headers.push(spawnOpts.env["ANTHROPIC_CUSTOM_HEADERS"] ?? "");
     const script = opts.scripts[command] ?? { answersAfterMs: 1_000 };
     let settle: (r: LaneRunResult) => void = () => {};
     const timers: Array<ReturnType<typeof setTimeout>> = [];
@@ -78,15 +85,24 @@ function harness(opts: {
   } as DispatchView;
   const readings = opts.readings;
   const treeSnapshot: TreeSnapshotReader = async () => (readings === undefined ? null : (readings.shift() ?? null));
+  const traffic = opts.traffic;
   const server = new McpDispatchServer({
     config: {
       host: "127.0.0.1",
       port: 8791,
-      routing: { default: "x", dispatchWalk: { enabled: true, attemptMs: BUDGET_MS, maxLanes: 5 } },
+      routing: { default: "x", dispatchWalk: { enabled: true, idleMs: IDLE_MS, maxLanes: 5 } },
     } as unknown as Config,
     buildView: async () => view,
     spawn,
     treeSnapshot,
+    ...(traffic === undefined
+      ? {}
+      : {
+          readLaneActivity: async (tag: string) => {
+            asked.push(tag);
+            return traffic(tag, Date.now());
+          },
+        }),
     cwd: () => process.cwd(),
     write: (chunk) => out.push(JSON.parse(chunk) as (typeof out)[number]),
   });
@@ -99,7 +115,7 @@ function harness(opts: {
     const text = (): string => out.find((m) => m.id === reqId)?.result?.content[0]?.text ?? "";
     return { done, text };
   };
-  return { call, started };
+  return { call, started, headers, asked };
 }
 
 beforeEach(() => {
@@ -114,33 +130,71 @@ async function finish(h: ReturnType<typeof harness>, args: Record<string, unknow
   await vi.advanceTimersByTimeAsync(1_500);
   await first.done;
   const jobId = /jobId "(job-\d+)"/.exec(first.text())?.[1] ?? /job: (job-\d+)/.exec(first.text())?.[1];
-  await vi.advanceTimersByTimeAsync(10 * 60_000);
+  await vi.advanceTimersByTimeAsync(20 * 60_000);
   const result = h.call("dispatch_result", { jobId });
   await result.done;
   return result.text();
 }
 
-describe("the walk keeps a working lane past its budget", () => {
-  it("does not stop a lane that keeps writing output, and names the extension", async () => {
+describe("the walk stops a lane only when it is idle", () => {
+  it("does not stop a slow lane that keeps writing output", async () => {
     const h = harness({
       lanes: [cliLane("slow"), cliLane("next")],
-      scripts: { slow: { answersAfterMs: 3 * BUDGET_MS, outputEveryMs: 5_000 }, next: { answersAfterMs: 100 } },
+      scripts: { slow: { answersAfterMs: 10 * IDLE_MS, outputEveryMs: 5_000 }, next: { answersAfterMs: 100 } },
     });
     const text = await finish(h, {});
     expect(h.started).toEqual(["slow"]);
     expect(text).toContain("slow answered");
-    expect(text).toMatch(/extended: slow kept past its 10s budget because it wrote output \d+s ago/);
   });
 
-  it("stops a silent lane at its budget and moves on, as before", async () => {
+  it("stops a lane that shows no activity for idleMs, and names why", async () => {
     const h = harness({
       lanes: [cliLane("slow"), cliLane("next")],
-      scripts: { slow: { answersAfterMs: 3 * BUDGET_MS }, next: { answersAfterMs: 100 } },
+      scripts: { slow: { answersAfterMs: 10 * IDLE_MS }, next: { answersAfterMs: 100 } },
     });
     const text = await finish(h, {});
     expect(h.started).toEqual(["slow", "next"]);
     expect(text).toContain("next answered");
-    expect(text).not.toContain("extended:");
+    expect(text).toContain("no activity for 30s (no relay traffic, output or file change)");
+  });
+
+  it("keeps a silent lane while the relay serves a request with its tag", async () => {
+    const h = harness({
+      lanes: [cliLane("slow"), cliLane("next")],
+      scripts: { slow: { answersAfterMs: 10 * IDLE_MS }, next: { answersAfterMs: 100 } },
+      traffic: () => ({ inFlight: 1, lastActivityAt: 0 }),
+    });
+    const text = await finish(h, {});
+    expect(h.started).toEqual(["slow"]);
+    expect(text).toContain("slow answered");
+    // The tag the lane was launched with is the tag the walk asked the daemon about.
+    const tag = new RegExp(`^${LANE_ACTIVITY_HEADER}: ([A-Za-z0-9]+)$`).exec(h.headers[0] ?? "")?.[1];
+    expect(tag).toMatch(/^[a-f0-9]{32}$/);
+    expect(h.asked.length).toBeGreaterThan(0);
+    expect(new Set(h.asked)).toEqual(new Set([tag]));
+  });
+
+  it("keeps a silent lane while its relay traffic is recent, and stops it once the traffic ends", async () => {
+    const trafficUntil = Date.now() + 3 * IDLE_MS;
+    const h = harness({
+      lanes: [cliLane("slow"), cliLane("next")],
+      scripts: { slow: { answersAfterMs: 20 * IDLE_MS }, next: { answersAfterMs: 100 } },
+      traffic: (_tag, now) => ({ inFlight: 0, lastActivityAt: Math.min(now, trafficUntil) }),
+    });
+    const text = await finish(h, {});
+    expect(h.started).toEqual(["slow", "next"]);
+    // Traffic stops at 90 s, so the lane is stopped at the first poll 30 s later: 120 s.
+    expect(text).toContain("1. slow: abandoned after 120s");
+  });
+
+  it("treats no record at the daemon as no signal, not as activity", async () => {
+    const h = harness({
+      lanes: [cliLane("slow"), cliLane("next")],
+      scripts: { slow: { answersAfterMs: 10 * IDLE_MS }, next: { answersAfterMs: 100 } },
+      traffic: () => null,
+    });
+    await finish(h, {});
+    expect(h.started).toEqual(["slow", "next"]);
   });
 
   it("keeps a silent lane whose git tree changed, and stops it once the tree stops changing", async () => {
@@ -148,19 +202,29 @@ describe("the walk keeps a working lane past its budget", () => {
     const changed: TreeSnapshot = { prefix: "", entries: new Map([["gone/never-on-disk.ts", "??"]]) };
     const h = harness({
       lanes: [cliLane("slow"), cliLane("next")],
-      // Start; first budget check (changed); second check (same, and the file cannot be stat-ed);
-      // the terminal reading.
-      readings: [start, changed, changed, changed],
-      scripts: { slow: { answersAfterMs: 20 * BUDGET_MS }, next: { answersAfterMs: 100 } },
+      // Start; then one reading per poll: changed once, then the same (the file cannot be stat-ed).
+      readings: [start, start, changed, changed, changed, changed, changed, changed],
+      scripts: { slow: { answersAfterMs: 20 * IDLE_MS }, next: { answersAfterMs: 100 } },
     });
     const text = await finish(h, {});
     expect(h.started).toEqual(["slow", "next"]);
-    expect(text).toContain("extended: slow kept past its 10s budget because its working tree changed");
     expect(text).toContain("next answered");
+    // Active at the 30 s poll (the change), so stopped at 60 s rather than 30 s.
+    expect(text).toContain("1. slow: abandoned after 60s");
   });
 
-  it("extends in steps of the activity window", () => {
-    expect(LANE_ACTIVITY_WINDOW_MS).toBe(60_000);
+  it("never stops the last lane, however long it is idle", async () => {
+    const h = harness({
+      lanes: [cliLane("only")],
+      scripts: { only: { answersAfterMs: 10 * IDLE_MS } },
+    });
+    const text = await finish(h, {});
+    expect(h.started).toEqual(["only"]);
+    expect(text).toContain("only answered");
+  });
+
+  it("checks for activity every 15 s", () => {
+    expect(IDLE_POLL_MS).toBe(15_000);
   });
 });
 

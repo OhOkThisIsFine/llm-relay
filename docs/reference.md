@@ -1484,22 +1484,26 @@ agent had to notice, give up, and name a different lane by hand — which is wha
 
 A dispatch now WALKS the ladder:
 
-- Each lane gets an **attempt budget** drawn from ITS OWN recorded runs: the 80th percentile of
-  the last 100 times it took to ANSWER, on this tier and in this mode. If it has not answered by
-  then, the relay stops it and starts the next one. A lane with fewer than `attemptMinSamples`
-  completed runs gets the flat floor instead — unmeasured means no opinion, never "slow" — and the
-  budget never falls below that floor however fast a lane's history is. The floor is `attemptMs`
-  for answer mode and `agentAttemptMs` (default 10 min) for agent mode, because an agent-mode run
-  takes minutes where an answer-mode call takes seconds: on 2026-09-10 one shared 90 s floor stopped
-  nearly every agent-mode `free-pool` run before it could answer.
-- Only a COMPLETED run adds a time. A failed or timed-out run says nothing about how long the lane
-  takes to answer (a window built from timeouts made one lane's own timeout its budget), and a run
-  the walk stopped measures the budget, not the lane. Instead, **each run the walk stopped since the
-  lane's last answer doubles its next budget**, up to one hour, and one answer resets it — without
-  that, a lane slower than its budget could never show that it needed longer.
-- ⚠ **The LAST lane gets no budget.** There is nowhere to move to, so killing a lane that is still
+- **A lane is stopped only when it is IDLE** (owner decision 2026-09-17): when it has shown no
+  activity for `idleMs` (default 5 min), the relay stops it and starts the next one. How long it has
+  run does not matter; a slow lane that still works runs until its own `--timeout`. Activity is any
+  of these, checked every 15 s:
+  - **relay traffic** — the MCP server tags each lane it starts, and a `claude -p` lane sends that
+    tag with every model request (`ANTHROPIC_CUSTOM_HEADERS`). The daemon records the tag's requests
+    in flight and its last request or response write (`GET /dispatch/activity`). A request in flight
+    counts as activity now. This is the signal that matters for a pool lane, because `claude -p`
+    writes no output until it exits. The tag never leaves the relay.
+  - **output** from the lane process.
+  - **its git working tree** — a `git status` change since the last check, or the newest mtime of a
+    changed file.
+
+  A lane that does not talk to this relay (AGY, Codex, OpenCode) has only the last two signs. Five
+  minutes of no traffic covers a lane that runs a long command, such as a test suite. The job shows
+  the newest sign on a `last activity:` line while it runs, and an attempt the walk stopped says
+  `no activity for 300s (no relay traffic, output or file change)`.
+- ⚠ **The LAST lane is never stopped.** There is nowhere to move to, so killing a lane that is still
   working would throw away the only answer still coming. Its own `--timeout` still bounds it.
-- ⚠ **Nor does a lane whose later lanes cannot answer.** When every lane after it is on a streak of
+- ⚠ **Nor is a lane whose later lanes cannot answer.** When every lane after it is on a streak of
   three or more own failures, or is marked failing (below), stopping it would trade a lane that may
   still answer for lanes that most likely will not — which is what every `medium` walk did on
   2026-09-10. A lane with no record counts as able to answer.
@@ -1529,9 +1533,7 @@ A dispatch now WALKS the ladder:
 "routing": {
   "dispatchWalk": {
     "enabled": true,
-    "attemptMs": 90000,        // the budget for a lane with too little history, and the floor
-    "agentAttemptMs": 600000,  // the same floor for an agent-mode dispatch
-    "attemptQuantile": 0.8,    // which point of a lane's own history the budget sits at
+    "idleMs": 300000,          // how long a lane may show no activity before the walk stops it
     "attemptMinSamples": 5,    // recorded runs a lane needs before its own history is used
     "maxLanes": 4,        // how many lanes one dispatch may try
     "pinMs": 900000,      // how long the lane that answered is preferred
@@ -1542,26 +1544,16 @@ A dispatch now WALKS the ladder:
 ```
 
 Default ON; `"dispatchWalk": false` is a byte-for-byte revert to one lane per call with no memory.
-An unknown key is a config error.
+An unknown key is a config error. `attemptMs`, `agentAttemptMs` and `attemptQuantile` still load,
+but since 2026-09-17 they stop no lane: the walk stops a lane only when it is idle.
 
-⚠ **The METHOD comes from the request path; none of its NUMBERS do.** Deriving a threshold from
-what an endpoint has actually done is the same mechanism `hedge-trigger.ts` and
-`latency-demotion.ts` use. But their figures (250 ms/token, a 30 s ceiling) are calibrated for
-single completions, and a lane legitimately runs an agent loop for minutes — pointing them at a
-lane would stop every healthy one at once. Every figure here comes from lane data.
-
-⚠ **The quantile is 0.8, not the 0.95 the request path uses, and the measurement says why.** On
-this machine the three working lanes read p80 at 165 s, 224 s and 1383 s; at p90 and p95 the
-slowest lane's figure IS its own configured timeout, so a budget there could never fire for the one
-lane most in need of bounding. p80 is the highest point still carrying information for every lane.
-
-⚠ **The token-normalised half of that ladder is deliberately absent.** A walk budget fires BEFORE
-any answer arrives, so there is no output token to normalise by — the same reason the request
-path's own per-token rung is inert when it decides whether to hedge.
+Each lane's recorded runs still give its **usual time to answer** (the median and 80th percentile
+of its completed runs), which a running job and `dispatch_lanes` show so a caller can tell a slow
+lane from a stuck one.
 
 ⚠ **The window is keyed by lane, tier AND mode** (mode since 2026-09-10: one lane's agent-mode and
-answer-mode runs differ by minutes). Each tier is its own ladder, so a lane's budget on
-`high` is derived only from its runs on `high`; runs on `low` never move it. A stats file written
+answer-mode runs differ by minutes). Each tier is its own ladder, so a lane's usual time to
+answer on `high` comes only from its runs on `high`; runs on `low` never move it. A stats file written
 before tiering loads unchanged as tier-less rows, and a tier whose own window holds fewer than
 `attemptMinSamples` samples falls back to that tier-less window — never merging the two into one
 quantile — until its own samples pass the floor. A mode falls back the same way, most specific
@@ -1571,7 +1563,7 @@ first: tier and mode, then tier, then mode, then the legacy row.
 carries its timestamp, so "recent" is the tail of the window in time. When the median of the last
 `recentCount` runs (default 5) exceeds the p`historyQuantile` (default 0.8) of the earlier runs by
 more than `outlierFactor` (default 7.6), the lane is demoted through the same entry the walk's own
-missed-budget demotion uses, with a reason naming both figures and the factor. Both halves need at
+idle-stop demotion uses, with a reason naming both figures and the factor. Both halves need at
 least `attemptMinSamples` runs or the rule is silent — too little history is no opinion, never
 "slow". `routing.dispatchWalk.outlier: false` makes the rule inert; the object form takes
 `recentCount`, `historyQuantile` and `outlierFactor`, each validated by name. The 7.6 default was
@@ -1714,14 +1706,6 @@ that names the rung.
 { "id": "opencode-muse-spark", "kind": "cli", "command": "opencode", "args": ["run", "{task}"], "capability": "medium" }
 ```
 
-The walk also does not stop a lane that still works when its attempt budget ends. At the budget,
-the MCP server looks for three signs, in this order: the lane wrote output in the last 60 s; the
-`git status` of its `cwd` changed since the last reading; or a changed file in that tree has an
-mtime in the last 60 s. The last two signs are for `claude -p`, which writes no output until it
-exits. If a sign is present, the walk gives the lane 60 s more and checks again. The lane's own
-`timeoutMs` stays the hard limit. The job shows each extension on an `extended:` line, for example
-`extended: free-pool kept past its 789s budget because its working tree changed`. A lane with no
-sign stops at its budget, as before.
 
 #### Host-adaptive lanes (`routing.cliLane`)
 

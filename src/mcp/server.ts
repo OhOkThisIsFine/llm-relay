@@ -20,12 +20,14 @@
  * suite exercises the whole surface without spawning a real lane or spending real quota. Same
  * discipline as `lane-quota-probe.ts` and `availability-snapshot.ts`.
  */
+import { randomUUID } from "node:crypto";
 import type { Config } from "../config.js";
+import { LANE_ACTIVITY_HEADER } from "../lane-activity.js";
 import { DEFAULT_MCP_BLOCKING_WAIT_MS, DEFAULT_MCP_MAX_WAIT_MS, EFFORT_LEVELS, type EffortLevel } from "../config-types.js";
 import type { AssistantMessage, ContentBlock, ToolUseBlock } from "../anthropic.js";
 import { isToolUseBlock } from "../anthropic.js";
 import type { DispatchLane, DispatchView } from "../dispatch.js";
-import { formatAttemptBudget, formatLaneStats, isPassThroughSpec, LANE_UNRELIABLE_STREAK, mcpPassThroughReason } from "../dispatch.js";
+import { formatLaneStats, isPassThroughSpec, LANE_UNRELIABLE_STREAK, mcpPassThroughReason } from "../dispatch.js";
 import { laneOfRung } from "../lane-manifest.js";
 import {
   defaultTreeSnapshot,
@@ -103,13 +105,21 @@ export type DispatchViewBuilder = (opts: {
   tier: string | undefined;
   lane: string | undefined;
   /**
-   * How this dispatch will run its lanes, so the relay hands back budgets measured in the SAME mode
+   * How this dispatch will run its lanes, so the relay hands back run times measured in the SAME mode
    * (`DispatchMode`). Absent from `dispatch_lanes`, which runs nothing.
    */
   mode?: DispatchMode | undefined;
   /** A routing spec to run as its own one-lane view instead of the ladder (`dispatch`'s `model`). */
   model?: string | undefined;
 }) => Promise<DispatchView>;
+
+/** A lane's traffic as the relay daemon reports it. */
+export interface LaneTraffic {
+  /** Requests with the lane's tag the daemon is serving now. */
+  inFlight: number;
+  /** Epoch ms of the tag's last request start, response write or request end. */
+  lastActivityAt: number;
+}
 
 export interface McpServerDeps {
   config: Config;
@@ -128,6 +138,11 @@ export interface McpServerDeps {
   allowedRoots?: readonly string[];
   /** Reads `git status` for the tree delta (`tree-delta.ts`); defaults to the real git reader. */
   treeSnapshot?: TreeSnapshotReader;
+  /**
+   * Reads a lane's live traffic from the relay daemon (`GET /dispatch/activity`, `lane-activity.ts`).
+   * Absent, or null for a tag, means no signal from the daemon — never "idle".
+   */
+  readLaneActivity?: (tag: string) => Promise<LaneTraffic | null>;
   /** The platform whose environment rules the lane launcher applies; defaults to `process.platform`. */
   platform?: NodeJS.Platform;
   maxDepth?: number;
@@ -209,7 +224,7 @@ export const MCP_INSTRUCTIONS =
   "Desktop rejects that child model before reaching the relay and ignores its custom provider. " +
   "Call dispatch instead. If this MCP server is unavailable, run `llm-relay dispatch " +
   "--next-command -t <task>` and follow its returned command or target; do not guess from the host.\n\n" +
-  "Let dispatch choose the lane. If a lane is slow or silent, dispatch moves to the next one " +
+  "Let dispatch choose the lane. If a lane stops showing activity, dispatch moves to the next one " +
   "itself and prefers the lane that answered on your next call. Follow the advice at the end of a " +
   "reply: when it says a lane was stopped while it was still working, dispatch again with that " +
   "lane named so it can finish; when it says every lane ran and failed, do the work here — " +
@@ -240,8 +255,8 @@ const TOOLS: ToolDefinition[] = [
       "default lane spends none of this session's subscription quota and saves its context. " +
       "Pass model to run one specific model (a routing spec such as deepseek/deepseek-flash or " +
       "pool/high) as its own lane, with no walk. Otherwise it picks the lane from " +
-      "the configured ladder unless you name one, and WALKS that ladder for you: a lane that does " +
-      "not answer inside its budget is stopped and the next one is started, and the lane that " +
+      "the configured ladder unless you name one, and WALKS that ladder for you: a lane that shows " +
+      "no activity for a while is stopped and the next one is started, and the lane that " +
       "answers is preferred next time. Runs the lane correctly — working directory, " +
       "environment and idle timeouts are handled here, so you never build a command line. If the " +
       "lane is still running, returns a jobId to poll with dispatch_status — it blocks at most " +
@@ -599,7 +614,10 @@ function describeJob(job: LaneJob, now: number): string {
   }
   if (job.readOnly) head.push(`read-only: ${job.readOnly.binding}`);
   if (job.launch?.length) head.push(`launch: ${job.launch.join("; ")}`);
-  if (job.extended?.length) head.push(`extended: ${job.extended.join("; ")}`);
+  if (job.status === "running" && job.lastActive) {
+    const ago = Math.max(0, Math.round((now - job.lastActive.at) / 1000));
+    head.push(`last activity: ${ago}s ago (${job.lastActive.source})`);
+  }
   // While it runs: the lane's usual time to answer, from its own completed runs, so a caller can tell
   // a slow lane from a stuck one instead of giving up (`LaneJob.expected`).
   const usually = runningTimeToAnswer(job);
@@ -661,18 +679,19 @@ export const LANE_LADDER_PARTIAL_ADVICE =
   + "work in this session.";
 
 /**
- * What a caller is told when the walk STOPPED a lane at its time budget and nothing answered after.
+ * What a caller is told when the walk STOPPED an idle lane and nothing answered after.
  *
- * ⚠ The stopped lane did not fail: it was still working when the walk moved on. So "every dispatch
- * lane has now been tried" was false there, and it ended the caller's use of dispatch for a task the
- * stopped lane would have finished (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §5). A NAMED lane
- * runs with no budget, so this names the call that lets it finish.
+ * ⚠ The stopped lane did not fail on its own: the walk stopped it because it showed no activity the
+ * relay could see. So "every dispatch lane has now been tried" is false there, and would end the
+ * caller's use of dispatch for a task the lane might still finish
+ * (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §5). A NAMED lane is never stopped for idleness,
+ * so this names the call that lets it run to its own timeout.
  */
 export function laneStoppedAdvice(laneId: string): string {
   return (
-    `The walk stopped lane "${laneId}" at its time budget while it was still working — it did not ` +
-    `fail. To let it finish, call dispatch again with lane: "${laneId}" and the same tier and mode (a ` +
-    "named lane runs with no budget, only its own timeout), or do the work in this session."
+    `The walk stopped lane "${laneId}" because it showed no activity for a while — it did not fail ` +
+    `on its own. To let it run to its own timeout, call dispatch again with lane: "${laneId}" and the ` +
+    "same tier and mode (a named lane is never stopped for idleness), or do the work in this session."
   );
 }
 
@@ -791,9 +810,9 @@ function jobAnswerBody(job: LaneJob, now: number): string {
 /**
  * Everything one dispatch WALK needs, snapshotted once so no stage re-reads `args`.
  *
- * `attemptMs` is `null` when the walk is turned off — never `Infinity`. Node's `setTimeout` clamps
- * a value above 2^31-1 to 1 ms and warns, so an "infinite" budget would abandon every lane
- * IMMEDIATELY, which is the exact opposite of what it would be claiming to do.
+ * `idleMs` is `null` when the walk is turned off — never `Infinity`. Node's `setTimeout` clamps a
+ * value above 2^31-1 to 1 ms and warns, so an "infinite" limit would stop every lane IMMEDIATELY,
+ * which is the exact opposite of what it would be claiming to do.
  */
 interface WalkOptions {
   mode: "agent" | "answer";
@@ -811,8 +830,8 @@ interface WalkOptions {
   tier: string | undefined;
   /** The lane's OWN ceiling, unchanged by this feature. */
   timeoutMs: number;
-  /** The WALK's per-lane budget, or null for no budget (walk off, or the last lane). */
-  attemptMs: number | null;
+  /** How long a lane may show no activity before the walk stops it; null when the walk is off. */
+  idleMs: number | null;
   system: string | undefined;
   schema: Record<string, unknown> | undefined;
   maxTokens: number | undefined;
@@ -824,7 +843,7 @@ interface LaneAttemptOutcome {
   run: LaneRunResult;
   relay?: RelayAnnouncements;
   semanticFailure?: string;
-  /** The walk stopped this lane at its budget so it could try the next one. */
+  /** The walk stopped this lane because it was idle, so it could try the next one. */
   abandoned: boolean;
   /**
    * The CALLER made an error no lane can fix — today only a working directory that does not exist
@@ -853,20 +872,15 @@ function failedOutcome(message: string): LaneAttemptOutcome {
  * One line saying why an attempt ended as it did, for the `lanes tried:` list. Undefined for a
  * success — the status already says everything, and repeating it would be noise.
  *
- * ⚠ The abandoned wording names the BUDGET, not the lane's own timeout. An operator reading
- * "abandoned after 90s" against a rung configured with `--timeout 2100` must be able to tell that
+ * ⚠ The abandoned wording names the IDLE limit, not the lane's own timeout. An operator reading
+ * "abandoned after 400s" against a rung configured with `--timeout 2100` must be able to tell that
  * the relay made a routing decision rather than the lane running out of its own time.
  */
-function attemptReason(
-  status: DispatchLaneStatus,
-  outcome: LaneAttemptOutcome,
-  elapsedMs: number,
-  budgetMs: number | null,
-): string | undefined {
+function attemptReason(status: DispatchLaneStatus, outcome: LaneAttemptOutcome, idleMs: number | null): string | undefined {
   if (status === "completed") return undefined;
   if (status === "abandoned") {
-    const budget = budgetMs === null ? `${Math.round(elapsedMs / 1000)}s` : `${Math.round(budgetMs / 1000)}s`;
-    return `no answer within the ${budget} walk budget, so the next lane was started`;
+    const quiet = idleMs === null ? "a long time" : `${Math.round(idleMs / 1000)}s`;
+    return `no activity for ${quiet} (no relay traffic, output or file change), so the next lane was started`;
   }
   if (outcome.semanticFailure !== undefined) return outcome.semanticFailure;
   if (status === "timed_out") return "the lane exceeded its own configured timeout";
@@ -887,16 +901,37 @@ function flagValue(args: readonly string[], flag: string): string | null {
   return joined === undefined ? null : joined.slice(flag.length + 1);
 }
 
-/**
- * How recent a lane's output or file change must be for the walk to keep it past its budget, and
- * how long each extension lasts.
- */
-export const LANE_ACTIVITY_WINDOW_MS = 60_000;
+/** How often the walk checks a running lane for activity. */
+export const IDLE_POLL_MS = 15_000;
 
-/** Resolves `{ kind: "budget" }` after `ms`, without holding the event loop open. */
-function budgetTimer(ms: number): Promise<{ kind: "budget" }> {
+/** The header line Claude Code adds to every request, from `ANTHROPIC_CUSTOM_HEADERS`. */
+function withActivityHeader(existing: string | undefined, tag: string): string {
+  const line = `${LANE_ACTIVITY_HEADER}: ${tag}`;
+  return existing === undefined || existing.trim() === "" ? line : `${existing}\n${line}`;
+}
+
+/** The newest usable activity time in `seen`, or null when none is a finite number. */
+function newestActivity(
+  seen: ReadonlyArray<{ at: number | null | undefined; source: string }>,
+): { at: number; source: string } | null {
+  let best: { at: number; source: string } | null = null;
+  for (const s of seen) {
+    if (typeof s.at === "number" && Number.isFinite(s.at) && (best === null || s.at > best.at)) {
+      best = { at: s.at, source: s.source };
+    }
+  }
+  return best;
+}
+
+/** A random lane activity tag (`lane-activity.ts`). */
+function newActivityTag(): string {
+  return randomUUID().replaceAll("-", "");
+}
+
+/** Resolves `{ kind: "poll" }` after `ms`, without holding the event loop open. */
+function pollTimer(ms: number): Promise<{ kind: "poll" }> {
   return new Promise((resolve) => {
-    const t = setTimeout(() => resolve({ kind: "budget" }), ms);
+    const t = setTimeout(() => resolve({ kind: "poll" }), ms);
     if (typeof t.unref === "function") t.unref();
   });
 }
@@ -919,7 +954,7 @@ function applyLaneEnv(base: NodeJS.ProcessEnv, deltas: Record<string, string | n
 /**
  * `inFlight` is THIS MCP server process's own live count for `lane.id` (`LaneJobStore.inFlight`) —
  * a caller-supplied number, never read here, because only the process that could spawn a job knows
- * what it is currently running. Rendered beside the attempt budget: `in flight: <n> of <max>` for a
+ * what it is currently running. Rendered beside the lane's evidence: `in flight: <n> of <max>` for a
  * capped rung (always, even at 0, so an operator sees the cap is configured before it ever binds),
  * and `in flight: <n>` for an uncapped one ONLY when `n > 0` — an uncapped rung with nothing running
  * renders exactly as it did before this field existed, which is the "byte-for-byte unchanged with
@@ -934,7 +969,6 @@ function laneSummary(lane: DispatchLane, inFlight: number): string {
   if (lane.note) bits.push(lane.note);
   // The routing memory from previous walks, on the lane rather than only in the selection reason —
   // an operator reading `dispatch_lanes` to understand an unexpected order needs to see it here.
-  if (lane.attemptBudget) bits.push(formatAttemptBudget(lane.attemptBudget));
   bits.push(...laneEvidenceBits(lane));
   if (lane.maxConcurrent !== null && lane.maxConcurrent !== undefined) {
     bits.push(`in flight: ${inFlight} of ${lane.maxConcurrent}`);
@@ -998,6 +1032,8 @@ export class McpDispatchServer {
     string,
     { cwd: string; before: TreeSnapshot; scope: readonly string[] | undefined; lastSeen?: TreeSnapshot }
   >();
+  /** The activity tag (`lane-activity.ts`) of the lane each running job has started last. */
+  private readonly activityTags = new Map<string, string>();
 
   constructor(private readonly deps: McpServerDeps) {
     this.jobs = new LaneJobStore(deps.journal ?? nullJobJournal, deps.archive ?? nullJobArchive);
@@ -1217,7 +1253,12 @@ export class McpDispatchServer {
     }
     const lines = view.ladder.map((l) => laneSummary(l, this.jobs.inFlight(l.id)));
     const next = view.next ? `\n\nnext: ${view.next.id} — ${view.reason}` : `\n\nnext: none — ${view.reason}`;
-    return textResult(`tier: ${view.tier ?? "default"}\n\n${lines.join("\n")}${next}`);
+    const walk = this.deps.config.routing?.dispatchWalk;
+    const rule =
+      walk?.enabled === true
+        ? `\nwalk: a lane is stopped after ${Math.round(walk.idleMs / 1000)}s with no activity (relay traffic, output or file change); the last lane is never stopped`
+        : "\nwalk: off — only the first lane runs";
+    return textResult(`tier: ${view.tier ?? "default"}${rule}\n\n${lines.join("\n")}${next}`);
   }
 
   /**
@@ -1368,7 +1409,7 @@ export class McpDispatchServer {
       scope: readStringArray(args, "scope"),
       tier: view.tier ?? undefined,
       timeoutMs: readNumber(args, "timeoutMs") ?? DEFAULT_LANE_TIMEOUT_MS,
-      attemptMs: walk !== null ? walk.attemptMs : null,
+      idleMs: walk !== null ? walk.idleMs : null,
       system: readString(args, "system"),
       schema: readRecord(args, "schema"),
       maxTokens: readNumber(args, "maxTokens"),
@@ -1408,11 +1449,13 @@ export class McpDispatchServer {
     // failure a lane can produce is an attempt — but the worst outcome available here is a caller
     // polling a handle that can never settle, so an unexpected throw is caught and turned into a
     // terminal failure rather than trusted not to happen.
-    const settled = this.runWalk(job.id, view, ordered, task, opts).catch(async (e: Error) => {
-      await this.recordTreeDelta(job.id);
-      this.jobs.fail(job.id, `dispatch walk failed: ${e.message}`);
-      return "done" as const;
-    });
+    const settled = this.runWalk(job.id, view, ordered, task, opts)
+      .catch(async (e: Error) => {
+        await this.recordTreeDelta(job.id);
+        this.jobs.fail(job.id, `dispatch walk failed: ${e.message}`);
+        return "done" as const;
+      })
+      .finally(() => this.activityTags.delete(job.id));
     return this.awaitOrPoll(job.id, settled, waitMs.waitMs, {
       clamp: waitMs.clamped ? { requested: waitMs.requested, ceiling, key: ceilingKey } : undefined,
       progressToken: blocking?.progress === true ? ctx.progressToken : undefined,
@@ -1425,7 +1468,7 @@ export class McpDispatchServer {
    *
    * `view.order` is the ONE definition of selection order (`dispatch.ts`). With the walk turned off
    * — or with a view that carries no order — this collapses to EXACTLY the pre-walk behaviour: the
-   * single lane the view named as `next`, tried once, with no attempt budget.
+   * single lane the view named as `next`, tried once, and never stopped for idleness.
    *
    * ⚠ The `Array.isArray` test is a VERSION SKEW guard, not defensive noise. `buildView` reaches the
    * running daemon over HTTP, and a daemon started before this field existed answers without it — an
@@ -1503,19 +1546,15 @@ export class McpDispatchServer {
       this.jobs.setCurrentLane(jobId, lane.id, lane.spec, lane.timeToAnswer);
       if (readOnly.bound !== undefined) this.jobs.noteReadOnly(jobId, lane.id, readOnly.bound.binding);
 
-      // ⚠ The LAST lane gets NO attempt budget. The budget exists to move on; with nowhere to move
-      // to, killing a lane that is still working would throw away the only answer still coming.
-      // Its own `timeoutMs` still bounds it, exactly as before this feature existed. Nor does a lane
-      // with nothing reliable after it (`budgetWithheld`), for the same reason.
+      // ⚠ A lane is stopped only when it is IDLE — no relay traffic, no output, no file change for
+      // `idleMs` (owner decision 2026-09-17) — never because it ran longer than other runs did. The
+      // LAST lane is never stopped: with nowhere to move to, stopping it throws away the only answer
+      // still coming. Nor is a lane with nothing reliable after it (`stopWithheld`). Its own
+      // `timeoutMs` still bounds every lane.
       const isLast = i === laneIds.length - 1;
-      const noBudget = this.budgetWithheld(view, laneIds, i);
+      const idleMs = this.stopWithheld(view, laneIds, i) ? null : opts.idleMs;
       const startedAt = this.now();
-      // ⚠ The lane's OWN budget when the view carries one, and it usually does: the daemon derives
-      // it from that lane's recorded history (`laneHistoryFacts` in `dispatch.ts`), because the daemon
-      // is where the history lives and this child holds none. `opts.attemptMs` is the fall-back for
-      // a view that carries no budget — a daemon older than this field, or the local fallback view.
-      const budgetMs = lane.attemptBudget?.ms ?? opts.attemptMs;
-      const outcome = await this.runOneLane(jobId, lane, task, opts, noBudget ? null : budgetMs, readOnly.bound?.invoke);
+      const outcome = await this.runOneLane(jobId, lane, task, opts, idleMs, readOnly.bound?.invoke);
       const elapsedMs = Math.max(0, this.now() - startedAt);
 
       // A cancellation that landed WHILE the attempt ran discards it whole: the caller changed its
@@ -1535,7 +1574,7 @@ export class McpDispatchServer {
         abandoned: outcome.abandoned,
         semanticFailure: outcome.semanticFailure,
       });
-      const reason = attemptReason(status, outcome, elapsedMs, noBudget ? null : budgetMs);
+      const reason = attemptReason(status, outcome, idleMs);
       this.jobs.recordAttempt(jobId, {
         laneId: lane.id,
         spec: lane.spec,
@@ -1636,15 +1675,15 @@ export class McpDispatchServer {
   }
 
   /**
-   * Does the lane at position `i` run with NO attempt budget? The last lane does — there is nowhere
-   * to move to. So does a lane whose later lanes are all unlikely to answer: each is on a streak of
-   * `LANE_UNRELIABLE_STREAK` own failures or more, or marked `failing`. Stopping a lane that may
-   * still answer in order to reach those trades an answer for a near-certain failure — measured
-   * 2026-09-10, when the walk stopped `free-pool` at 90 s to try lanes that had answered 0 of 12,
+   * Is the lane at position `i` never stopped, even when idle? The last lane is not — there is
+   * nowhere to move to. Nor is a lane whose later lanes are all unlikely to answer: each is on a
+   * streak of `LANE_UNRELIABLE_STREAK` own failures or more, or marked `failing`. Stopping a lane
+   * that may still answer in order to reach those trades an answer for a near-certain failure —
+   * measured 2026-09-10, when the walk stopped `free-pool` to try lanes that had answered 0 of 12,
    * 0 of 34 and 0 of 21 runs (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §1). A lane with no
    * record counts as reliable: unmeasured is no opinion, never a failure.
    */
-  private budgetWithheld(view: DispatchView, laneIds: readonly string[], i: number): boolean {
+  private stopWithheld(view: DispatchView, laneIds: readonly string[], i: number): boolean {
     return !laneIds.slice(i + 1).some((id) => {
       const later = view.ladder.find((l) => l.id === id);
       return later !== undefined && later.failing === undefined && (later.recentFailures ?? 0) < LANE_UNRELIABLE_STREAK;
@@ -1708,30 +1747,41 @@ export class McpDispatchServer {
   }
 
   /**
-   * Is the running lane still WORKING? A reason string when it is, else null. Evidence, in order: the
-   * lane wrote output inside `LANE_ACTIVITY_WINDOW_MS`; its git tree changed since the last reading;
-   * a dirty file changed inside the window. `claude -p` buffers its whole answer until exit, so for
-   * the free pool the tree is the only evidence there is. No evidence (answer mode, a cwd outside a
-   * git tree) means not working, and the budget applies as before.
+   * The running lane's most recent ACTIVITY, or null when nothing was seen. Evidence: a request with
+   * the lane's tag in flight at the relay daemon (that is activity NOW), the daemon's last traffic
+   * for the tag, the lane's own last output, and its git working tree (a change since the last
+   * reading is activity now; otherwise the newest dirty file's mtime). `claude -p` holds its output
+   * until exit, so for a pool lane the daemon's traffic is the signal that matters. The tree is read
+   * only when nothing newer than one poll was seen, because each reading runs `git status`.
    */
-  private async laneStillWorking(jobId: string): Promise<string | null> {
+  private async latestActivity(jobId: string): Promise<{ at: number; source: string } | null> {
     const now = this.now();
-    const lastOutput = this.jobs.get(jobId)?.activity?.lastOutputAt;
-    if (typeof lastOutput === "number" && now - lastOutput <= LANE_ACTIVITY_WINDOW_MS) {
-      return `it wrote output ${Math.round((now - lastOutput) / 1000)}s ago`;
+    const seen: Array<{ at: number | null | undefined; source: string }> = [
+      { at: this.jobs.get(jobId)?.activity?.lastOutputAt, source: "lane output" },
+    ];
+    const tag = this.activityTags.get(jobId);
+    if (tag !== undefined && this.deps.readLaneActivity !== undefined) {
+      const traffic = await this.deps.readLaneActivity(tag).catch(() => null);
+      seen.push(
+        traffic !== null && traffic.inFlight > 0
+          ? { at: now, source: "a request in flight at the relay" }
+          : { at: traffic?.lastActivityAt, source: "relay traffic" },
+      );
     }
+    const early = newestActivity(seen);
+    if (early !== null && now - early.at < IDLE_POLL_MS) return early;
     const tree = this.trees.get(jobId);
-    if (tree === undefined) return null;
-    const reading = await this.readTree(tree.cwd);
-    if (reading === null) return null;
-    const previous = tree.lastSeen ?? tree.before;
-    tree.lastSeen = reading;
-    if (!sameTree(previous, reading)) return "its working tree changed";
-    const newest = newestChangeMs(tree.cwd, reading);
-    if (newest !== null && now - newest <= LANE_ACTIVITY_WINDOW_MS) {
-      return `a file in its working tree changed ${Math.max(0, Math.round((now - newest) / 1000))}s ago`;
+    const reading = tree === undefined ? null : await this.readTree(tree.cwd);
+    if (tree !== undefined && reading !== null) {
+      const previous = tree.lastSeen ?? tree.before;
+      tree.lastSeen = reading;
+      seen.push(
+        sameTree(previous, reading)
+          ? { at: newestChangeMs(tree.cwd, reading), source: "a file change" }
+          : { at: now, source: "a working tree change" },
+      );
     }
-    return null;
+    return newestActivity(seen);
   }
 
   /**
@@ -1767,11 +1817,12 @@ export class McpDispatchServer {
   }
 
   /**
-   * Run ONE lane, optionally bounded by an attempt budget. Returns what happened; never throws.
+   * Run ONE lane. Returns what happened; never throws.
    *
-   * With `budgetMs === null` the lane is simply awaited — its own `timeoutMs` is the only bound.
-   * With a budget, the lane races a timer: if the timer wins, the lane is KILLED and reported as
-   * `abandoned`.
+   * With `idleMs === null` the lane is simply awaited — its own `timeoutMs` is the only bound.
+   * Otherwise the walk checks the lane every `IDLE_POLL_MS`, and when it has shown no activity
+   * (`latestActivity`) for `idleMs`, the lane is KILLED and reported as `abandoned`. How long the
+   * lane has run does not matter: a slow lane that still works is never stopped.
    *
    * ⚠ It kills rather than hedges. The HTTP request path hedges — it starts a second attempt
    * beside the first — and that is deliberate there, bounded to free deployments by an owner
@@ -1784,9 +1835,10 @@ export class McpDispatchServer {
     lane: DispatchLane,
     task: string,
     opts: WalkOptions,
-    budgetMs: number | null,
+    idleMs: number | null,
     invoke?: LaneInvocation,
   ): Promise<LaneAttemptOutcome> {
+    const attemptStart = this.now();
     const started = this.startLane(jobId, lane, task, opts, invoke);
     if ("refusal" in started) return { run: emptyRun(), abandoned: false, refusal: started.refusal };
     // ⚠ `registerProcess`, never the bare kill callback: the handle carries the pids this
@@ -1803,31 +1855,26 @@ export class McpDispatchServer {
         semanticFailure: e.message,
       }),
     );
-    if (budgetMs === null) return guarded;
+    if (idleMs === null) return guarded;
 
     const settled = guarded.then((o) => ({ kind: "settled" as const, outcome: o }));
-    // ⚠ A lane that is still WORKING when its budget passes is not stopped (2026-09-16: `free-pool`
-    // was stopped at its 789 s p80 with +203 lines written and its tests half done). The budget is
-    // extended in `LANE_ACTIVITY_WINDOW_MS` steps while the lane shows activity, up to its own
-    // `timeoutMs`, which still ends it. The job names the extension.
-    let waitMs = budgetMs;
+    // The lane counts as active at its start, so a lane is never stopped before `idleMs` has passed.
+    let lastActive = attemptStart;
     for (;;) {
-      const raced = await Promise.race([settled, budgetTimer(waitMs)]);
+      const raced = await Promise.race([settled, pollTimer(Math.min(IDLE_POLL_MS, idleMs))]);
       if (raced.kind === "settled") return raced.outcome;
       if (this.jobs.get(jobId)?.status !== "running") break;
-      const working = await this.laneStillWorking(jobId);
-      if (working === null) break;
-      this.jobs.noteExtension(
-        jobId,
-        lane.id,
-        `${lane.id} kept past its ${Math.round(budgetMs / 1000)}s budget because ${working}`,
-      );
-      waitMs = LANE_ACTIVITY_WINDOW_MS;
+      const seen = await this.latestActivity(jobId);
+      if (seen !== null && seen.at > lastActive) {
+        lastActive = seen.at;
+        this.jobs.noteLastActivity(jobId, seen.at, seen.source);
+      }
+      if (this.now() - lastActive >= idleMs) break;
     }
 
-    // The budget passed and another lane remains. Kill this one and move on. `guarded` never
-    // rejects, so the killed child's late settlement needs no further handler — it resolves into a
-    // value nobody reads.
+    // The lane was idle for `idleMs` and another lane remains. Kill this one and move on. `guarded`
+    // never rejects, so the killed child's late settlement needs no further handler — it resolves
+    // into a value nobody reads.
     started.kill();
     return { run: emptyRun(), abandoned: true };
   }
@@ -1865,7 +1912,9 @@ export class McpDispatchServer {
       // AbortSignal.timeout self-cleans and needs no manual clearTimeout; `AbortSignal.any`
       // composes it with the cancel/abandon handle without either seam knowing about the other.
       const signal = AbortSignal.any([AbortSignal.timeout(opts.timeoutMs), controller.signal]);
-      const result = this.runAnswerFetch(lane.spec, task, opts, signal).then((o): LaneAttemptOutcome => {
+      const tag = newActivityTag();
+      this.activityTags.set(jobId, tag);
+      const result = this.runAnswerFetch(lane.spec, task, opts, signal, tag).then((o): LaneAttemptOutcome => {
         // ⚠ The content-empty check applies HERE too, not only on the spawned path. HTTP 200 with
         // a lone `#` is the same known lane failure as exit 0 with one, and reading it as a
         // successful empty answer would also PIN the lane that produced it.
@@ -1910,6 +1959,11 @@ export class McpDispatchServer {
     const expansion = expandEnvReferences(applyLaneEnv(process.env, invoke.env), this.deps.platform);
     const env = expansion.env;
     env[DEPTH_ENV] = String(opts.depth + 1);
+    // Every model request a Claude Code lane sends carries this lane's tag, so the relay daemon can
+    // say whether the lane is active (`lane-activity.ts`). Other CLIs ignore the variable.
+    const tag = newActivityTag();
+    this.activityTags.set(jobId, tag);
+    env["ANTHROPIC_CUSTOM_HEADERS"] = withActivityHeader(env["ANTHROPIC_CUSTOM_HEADERS"], tag);
     this.jobs.noteLaunch(jobId, [...expansion.notes, ...(agy === null ? [] : [agy.note])]);
     const startedAt = this.now();
     // From here the job's output figure describes THIS attempt: zero bytes, until the spawner's
@@ -2086,6 +2140,8 @@ export class McpDispatchServer {
     task: string,
     opts: { system: string | undefined; schema: Record<string, unknown> | undefined; maxTokens: number | undefined },
     signal: AbortSignal,
+    /** The lane's activity tag: while the relay serves this call, the walk sees it as active. */
+    activityTag: string,
   ): Promise<{ run: LaneRunResult; semanticFailure?: string; relay?: RelayAnnouncements }> {
     const url = relayLoopbackUrl(this.deps.config, "/v1/messages");
     const body: Record<string, unknown> = {
@@ -2109,6 +2165,7 @@ export class McpDispatchServer {
           // Not a real credential: the relay authenticates to whichever backend with ITS OWN
           // configured credentials, never the caller's — this header only needs to be present.
           "x-api-key": "dummy",
+          [LANE_ACTIVITY_HEADER]: activityTag,
         },
         body: JSON.stringify(body),
         signal,

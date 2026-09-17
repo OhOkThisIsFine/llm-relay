@@ -281,7 +281,6 @@ export function isArchivedJob(value: unknown): value is ArchivedJob {
     optString("label") &&
     optString("treeDelta") &&
     optStrings("launch") &&
-    optStrings("extended") &&
     (value["process"] === undefined || isProcessReport(value["process"])) &&
     (value["dispatchSource"] === undefined || value["dispatchSource"] === "daemon" || value["dispatchSource"] === "fallback") &&
     (value["relay"] === undefined || isRecord(value["relay"])) &&
