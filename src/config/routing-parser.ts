@@ -33,6 +33,7 @@
  */
 
 import {
+  DEFAULT_MCP_BLOCKING_WAIT_MS,
   DEFAULT_MCP_MAX_WAIT_MS,
   EFFORT_LEVELS,
   type CliLaneTemplate,
@@ -384,6 +385,8 @@ export function parseRouting(
  * is never a duration even when it spells one. Absent fills the default rather than staying
  * absent, so a present-but-silent block still declares the ceiling the server enforces.
  */
+const MCP_SETTINGS_KEYS: readonly string[] = ["allowedRoots", "maxWaitMs", "blockingWaitMs"] satisfies (keyof McpSettings)[];
+
 function parseMcpSettings(raw: unknown, warnings: string[] = []): McpSettings | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (typeof raw !== "object" || Array.isArray(raw)) {
@@ -391,8 +394,8 @@ function parseMcpSettings(raw: unknown, warnings: string[] = []): McpSettings | 
   }
   const o = raw as Record<string, unknown>;
   for (const key of Object.keys(o)) {
-    if (key !== "allowedRoots" && key !== "maxWaitMs") {
-      throw new Error(`config.routing.mcp.${key} is not a recognized key (allowedRoots, maxWaitMs)`);
+    if (!MCP_SETTINGS_KEYS.includes(key)) {
+      throw new Error(`config.routing.mcp.${key} is not a recognized key (${MCP_SETTINGS_KEYS.join(", ")})`);
     }
   }
   const out: McpSettings = {};
@@ -434,7 +437,20 @@ function parseMcpSettings(raw: unknown, warnings: string[] = []): McpSettings | 
   } else {
     out.maxWaitMs = o.maxWaitMs;
   }
+  out.blockingWaitMs = parseBlockingWaitMs(o.blockingWaitMs);
   return out;
+}
+
+/**
+ * `blockingWaitMs` applies only to a host that tolerates a long call (see `McpSettings`), so it is
+ * NOT clamped to `maxWaitMs`. `0` is legal and means "never block past maxWaitMs".
+ */
+function parseBlockingWaitMs(raw: unknown): number {
+  if (raw === undefined) return DEFAULT_MCP_BLOCKING_WAIT_MS;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) {
+    throw new Error(`config.routing.mcp.blockingWaitMs must be a non-negative integer (milliseconds; 0 turns it off)`);
+  }
+  return raw;
 }
 
 export const DEFAULT_LANE_PROBE: LaneProbeSettings = {

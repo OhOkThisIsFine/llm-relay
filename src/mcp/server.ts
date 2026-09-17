@@ -21,7 +21,7 @@
  * discipline as `lane-quota-probe.ts` and `availability-snapshot.ts`.
  */
 import type { Config } from "../config.js";
-import { DEFAULT_MCP_MAX_WAIT_MS } from "../config-types.js";
+import { DEFAULT_MCP_BLOCKING_WAIT_MS, DEFAULT_MCP_MAX_WAIT_MS } from "../config-types.js";
 import type { AssistantMessage, ContentBlock, ToolUseBlock } from "../anthropic.js";
 import { isToolUseBlock } from "../anthropic.js";
 import type { DispatchLane, DispatchView } from "../dispatch.js";
@@ -232,7 +232,8 @@ const TOOLS: ToolDefinition[] = [
       "environment and idle timeouts are handled here, so you never build a command line. If the " +
       "lane is still running, returns a jobId to poll with dispatch_status — it blocks at most " +
       "routing.mcp.maxWaitMs first, so a slow lane degrades to polling instead of hitting the " +
-      "host's tool timeout. In Codex " +
+      "host's tool timeout. In Claude Code, a call that carries a progress token instead waits " +
+      "for the answer (up to routing.mcp.blockingWaitMs) and reports progress. In Codex " +
       "Desktop, use this instead of a pool/* collaboration child, which the ChatGPT launcher " +
       "rejects before the custom provider or relay is reached. Set mode to \"answer\" for a " +
       "question, draft, summary, or second opinion that needs no file access — it posts straight " +
@@ -292,8 +293,9 @@ const TOOLS: ToolDefinition[] = [
         waitMs: {
           type: "number",
           description:
-            "How long to block before returning a jobId instead (default routing.mcp.maxWaitMs; " +
-            "a larger waitMs is clamped to that ceiling and the clamp is announced in the reply).",
+            "How long to block before returning a jobId instead (default routing.mcp.maxWaitMs, or " +
+            "routing.mcp.blockingWaitMs for a Claude Code call that asked for progress; a larger " +
+            "waitMs is clamped to that ceiling and the clamp is announced in the reply).",
         },
         timeoutMs: {
           type: "number",
@@ -881,6 +883,28 @@ function laneSummary(lane: DispatchLane, inFlight: number): string {
   return bits.join(" ");
 }
 
+/**
+ * MCP clients (`initialize` `clientInfo.name`) measured to survive a long tool call, so `dispatch`
+ * may wait for the answer the way the host's own subagent does, up to `routing.mcp.blockingWaitMs`.
+ *
+ * Measured 2026-09-17 (`docs/mcp-host-timeouts-2026-09-17.md`): Claude Code 2.1.237 (`claude-code`)
+ * completed a 240 s tool call headless, with and without progress. Two hosts are deliberately NOT
+ * here: the Claude desktop chat client (`claude-ai`) cancelled at exactly 60 s, and Codex runs a
+ * call inside a code-mode `exec` that yields at 31 s. An unknown client keeps `maxWaitMs`.
+ */
+export const BLOCKING_WAIT_CLIENTS: readonly string[] = ["claude-code"];
+
+/** How often a blocking `dispatch` sends `notifications/progress`. */
+export const PROGRESS_INTERVAL_MS = 30_000;
+
+/** What one `tools/call` carries beyond its arguments. */
+interface CallContext {
+  /** The caller's `_meta.progressToken`, when it asked for progress. */
+  progressToken: string | number | undefined;
+  /** Aborted when the host sends `notifications/cancelled` for this request. */
+  signal: AbortSignal;
+}
+
 export class McpDispatchServer {
   private readonly jobs: LaneJobStore;
   private readonly spawn: LaneSpawner;
@@ -889,6 +913,10 @@ export class McpDispatchServer {
   private readonly cwd: () => string;
   private readonly maxDepth: number;
   private buffer = "";
+  /** `clientInfo.name` from `initialize`; undefined until the host sends it. */
+  private clientName: string | undefined;
+  /** In-flight `tools/call` requests the host may cancel, by request id. */
+  private readonly cancellable = new Map<string | number, AbortController>();
 
   constructor(private readonly deps: McpServerDeps) {
     this.jobs = new LaneJobStore(deps.journal ?? nullJobJournal, deps.archive ?? nullJobArchive);
@@ -972,11 +1000,19 @@ export class McpDispatchServer {
     // ⚠ A notification carries no id and must never be answered. `notifications/initialized` is
     // the one every client sends; replying to it is a protocol violation that some clients treat
     // as fatal.
-    if (isJsonRpcNotification(parsed)) return;
+    if (isJsonRpcNotification(parsed)) {
+      if (parsed.method === "notifications/cancelled") this.cancelRequest(parsed.params);
+      return;
+    }
     if (!isJsonRpcRequest(parsed)) return;
 
+    const abort = new AbortController();
+    if (parsed.method === "tools/call") this.cancellable.set(parsed.id, abort);
     try {
-      const result = await this.route(parsed.method, parsed.params);
+      const result = await this.route(parsed.method, parsed.params, abort.signal);
+      // The MCP specification: a receiver SHOULD NOT answer a request the sender cancelled. The job
+      // itself keeps running; `dispatch_status` with no jobId lists it.
+      if (abort.signal.aborted) return;
       if (result === undefined) {
         this.send(errorResponse(parsed.id, RPC_METHOD_NOT_FOUND, `unknown method: ${parsed.method}`));
         return;
@@ -985,10 +1021,19 @@ export class McpDispatchServer {
     } catch (e) {
       // A handler must never take the connection down. Report and stay up.
       this.send(errorResponse(parsed.id, RPC_INTERNAL_ERROR, (e as Error).message));
+    } finally {
+      if (this.cancellable.get(parsed.id) === abort) this.cancellable.delete(parsed.id);
     }
   }
 
-  private async route(method: string, params: unknown): Promise<unknown | undefined> {
+  private cancelRequest(params: unknown): void {
+    if (typeof params !== "object" || params === null) return;
+    const id = (params as Record<string, unknown>)["requestId"];
+    if (typeof id !== "string" && typeof id !== "number") return;
+    this.cancellable.get(id)?.abort();
+  }
+
+  private async route(method: string, params: unknown, signal: AbortSignal): Promise<unknown | undefined> {
     switch (method) {
       case "initialize":
         return this.initialize(params);
@@ -997,7 +1042,7 @@ export class McpDispatchServer {
       case "tools/list":
         return { tools: TOOLS };
       case "tools/call":
-        return this.callTool(params);
+        return this.callTool(params, signal);
       default:
         return undefined;
     }
@@ -1005,6 +1050,9 @@ export class McpDispatchServer {
 
   private initialize(params: unknown): unknown {
     const p = (typeof params === "object" && params !== null ? params : {}) as Record<string, unknown>;
+    const info = p["clientInfo"];
+    const name = typeof info === "object" && info !== null ? (info as Record<string, unknown>)["name"] : undefined;
+    this.clientName = typeof name === "string" ? name : undefined;
     return {
       protocolVersion: negotiateProtocolVersion(p["protocolVersion"]),
       capabilities: { tools: { listChanged: false } },
@@ -1013,7 +1061,7 @@ export class McpDispatchServer {
     };
   }
 
-  private async callTool(params: unknown): Promise<unknown> {
+  private async callTool(params: unknown, signal: AbortSignal): Promise<unknown> {
     const p = (typeof params === "object" && params !== null ? params : {}) as Record<string, unknown>;
     const name = p["name"];
     const args = (typeof p["arguments"] === "object" && p["arguments"] !== null
@@ -1022,13 +1070,19 @@ export class McpDispatchServer {
     if (typeof name !== "string") {
       throw Object.assign(new Error("tools/call requires a tool name"), { code: RPC_INVALID_PARAMS });
     }
-    return this.withVersionNotice(await this.runTool(name, args));
+    const meta = p["_meta"];
+    const token = typeof meta === "object" && meta !== null ? (meta as Record<string, unknown>)["progressToken"] : undefined;
+    const ctx: CallContext = {
+      progressToken: typeof token === "string" || typeof token === "number" ? token : undefined,
+      signal,
+    };
+    return this.withVersionNotice(await this.runTool(name, args, ctx));
   }
 
-  private async runTool(name: string, args: Record<string, unknown>): Promise<unknown> {
+  private async runTool(name: string, args: Record<string, unknown>, ctx: CallContext): Promise<unknown> {
     switch (name) {
       case "dispatch":
-        return this.toolDispatch(args);
+        return this.toolDispatch(args, ctx);
       case "dispatch_status":
         return this.toolStatus(args);
       case "dispatch_result":
@@ -1156,7 +1210,20 @@ export class McpDispatchServer {
     return textResult(cancelled ? `cancelled ${jobId}` : `${jobId} was already ${job.status}`);
   }
 
-  private async toolDispatch(args: Record<string, unknown>): Promise<unknown> {
+  /**
+   * The blocking-wait cap for this call, or null when the call gets the ordinary `maxWaitMs`.
+   * Three conditions: the host is one measured to survive a long call, the call asked for progress
+   * (so the host shows the wait and, per its documentation, resets its idle timer), and the
+   * operator did not turn the blocking wait off.
+   */
+  private blockingWaitFor(ctx: CallContext, maxWaitMs: number): number | null {
+    if (ctx.progressToken === undefined) return null;
+    if (this.clientName === undefined || !BLOCKING_WAIT_CLIENTS.includes(this.clientName)) return null;
+    const cap = this.deps.config.routing?.mcp?.blockingWaitMs ?? DEFAULT_MCP_BLOCKING_WAIT_MS;
+    return cap > 0 ? Math.max(cap, maxWaitMs) : null;
+  }
+
+  private async toolDispatch(args: Record<string, unknown>, ctx: CallContext): Promise<unknown> {
     const task = readString(args, "task");
     if (!task) return textResult("dispatch requires a non-empty task", true);
 
@@ -1235,7 +1302,10 @@ export class McpDispatchServer {
     // ask alone: above ~45 s the host fails the call AND destroys the job handle. `?.` on
     // `routing` for the same partial-config reason the walk lookup states above; an absent
     // ceiling means the default.
-    const ceiling = this.deps.config.routing?.mcp?.maxWaitMs ?? DEFAULT_MCP_MAX_WAIT_MS;
+    const maxWaitMs = this.deps.config.routing?.mcp?.maxWaitMs ?? DEFAULT_MCP_MAX_WAIT_MS;
+    const blocking = this.blockingWaitFor(ctx, maxWaitMs);
+    const ceiling = blocking ?? maxWaitMs;
+    const ceilingKey = blocking === null ? "routing.mcp.maxWaitMs" : "routing.mcp.blockingWaitMs";
     const waitMs = resolveWaitMs(args["waitMs"], ceiling);
     // A `waitMs` the server cannot honour is refused BEFORE anything spawns — the refusal must
     // cost no lane run, exactly like the recursion bound above.
@@ -1248,12 +1318,11 @@ export class McpDispatchServer {
       this.jobs.fail(job.id, `dispatch walk failed: ${e.message}`);
       return "done" as const;
     });
-    return this.awaitOrPoll(
-      job.id,
-      settled,
-      waitMs.waitMs,
-      waitMs.clamped ? { requested: waitMs.requested, ceiling } : undefined,
-    );
+    return this.awaitOrPoll(job.id, settled, waitMs.waitMs, {
+      clamp: waitMs.clamped ? { requested: waitMs.requested, ceiling, key: ceilingKey } : undefined,
+      progressToken: blocking === null ? undefined : ctx.progressToken,
+      signal: ctx.signal,
+    });
   }
 
   /**
@@ -1906,16 +1975,36 @@ export class McpDispatchServer {
     jobId: string,
     settled: Promise<"done">,
     waitMs: number,
-    clamp?: { requested: number; ceiling: number },
+    opts: {
+      clamp?: { requested: number; ceiling: number; key: string } | undefined;
+      /** Set only for a blocking wait: send `notifications/progress` with this token. */
+      progressToken?: string | number | undefined;
+      signal?: AbortSignal | undefined;
+    } = {},
   ): Promise<unknown> {
-    const raced = await Promise.race([
-      settled,
-      new Promise<"pending">((resolve) => {
-        const t = setTimeout(() => resolve("pending"), waitMs);
-        // Do not hold the event loop open on the wait timer alone.
-        if (typeof t.unref === "function") t.unref();
-      }),
-    ]);
+    const { clamp, progressToken, signal } = opts;
+    const timers: Array<ReturnType<typeof setTimeout>> = [];
+    const startedAt = this.now();
+    if (progressToken !== undefined) {
+      const tick = setInterval(() => this.sendProgress(jobId, progressToken, startedAt), PROGRESS_INTERVAL_MS);
+      if (typeof tick.unref === "function") tick.unref();
+      timers.push(tick);
+    }
+    let raced: "done" | "pending";
+    try {
+      raced = await Promise.race([
+        settled,
+        new Promise<"pending">((resolve) => {
+          const t = setTimeout(() => resolve("pending"), waitMs);
+          // Do not hold the event loop open on the wait timer alone.
+          if (typeof t.unref === "function") t.unref();
+          timers.push(t);
+          signal?.addEventListener("abort", () => resolve("pending"), { once: true });
+        }),
+      ]);
+    } finally {
+      for (const t of timers) clearTimeout(t);
+    }
 
     const current = this.jobs.get(jobId);
     if (!current) return textResult(`unknown jobId: ${jobId}`, true);
@@ -1924,13 +2013,34 @@ export class McpDispatchServer {
       const announcement =
         clamp === undefined
           ? ""
-          : `waited ${waitedS} s (waitMs ${clamp.requested} clamped to routing.mcp.maxWaitMs ${clamp.ceiling})\n`;
+          : `waited ${waitedS} s (waitMs ${clamp.requested} clamped to ${clamp.key} ${clamp.ceiling})\n`;
       return textResult(
         `${describeJob(current, this.now())}\n\n${announcement}Still running after ${waitedS}s. ` +
           `Poll dispatch_status with jobId "${jobId}", then call dispatch_result.`,
       );
     }
     return textResult(jobAnswer(current, this.now()), isFailureStatus(current.status));
+  }
+
+  /**
+   * One `notifications/progress` for a blocking `dispatch`. `progress` is the elapsed whole seconds,
+   * which the specification requires to increase; `total` is omitted because nothing states it.
+   */
+  private sendProgress(jobId: string, progressToken: string | number, startedAt: number): void {
+    const job = this.jobs.get(jobId);
+    if (!job || job.status !== "running") return;
+    const elapsed = Math.max(1, Math.round((this.now() - startedAt) / 1000));
+    try {
+      this.deps.write(
+        encodeMessage({
+          jsonrpc: "2.0",
+          method: "notifications/progress",
+          params: { progressToken, progress: elapsed, message: `${jobId} running on ${job.laneId} for ${elapsed}s` },
+        }),
+      );
+    } catch (e) {
+      logStderr(`progress write failed: ${(e as Error).message}`);
+    }
   }
 }
 

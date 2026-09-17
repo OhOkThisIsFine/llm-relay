@@ -1898,6 +1898,15 @@ A `waitMs` that is negative, zero, non-finite or not a number is refused, naming
 accepted range. `dispatch_status` and `dispatch_result` are unaffected — they poll and collect
 whatever the wait handed back.
 
+**Claude Code gets the answer in one call.** When the MCP client is Claude Code (`clientInfo.name`
+`claude-code`) and the tool call carries a progress token, `dispatch` waits for the answer up to
+`routing.mcp.blockingWaitMs` (default 25 minutes) and sends a progress notification every 30 s, the
+way a native subagent answers. A 240 s call was measured to succeed there. Every other host keeps
+the 25 s ceiling: the Claude desktop chat client cancels a call at 60 s, and Codex at 31 s. Set
+`"blockingWaitMs": 0` to turn the blocking wait off. If the host cancels the call, the job keeps
+running; `dispatch_status` with no `jobId` lists it. Evidence:
+[mcp-host-timeouts-2026-09-17.md](mcp-host-timeouts-2026-09-17.md).
+
 While a job runs, `dispatch_status` also states the running lane's usual time to answer — the
 median and 80th percentile of the durations on record, in this mode when known — or says that none
 is on record, so a caller can tell a slow lane from a stuck one. Since 2026-09-10 only a completed

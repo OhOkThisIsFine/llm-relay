@@ -984,7 +984,25 @@ export interface McpSettings {
    * non-finite or non-numeric `waitMs` is refused. Absent ⇒ `DEFAULT_MCP_MAX_WAIT_MS`.
    */
   maxWaitMs?: number;
+  /**
+   * Ceiling (ms) on the blocking wait for a host that tolerates a long tool call and asked for
+   * progress (`BLOCKING_WAIT_CLIENTS` in `mcp/server.ts`). Such a host gets the answer in ONE call,
+   * the way its own subagents answer. `0` turns the blocking wait off, so every host gets
+   * `maxWaitMs`. Absent ⇒ `DEFAULT_MCP_BLOCKING_WAIT_MS`.
+   */
+  blockingWaitMs?: number;
 }
+
+/**
+ * Default `routing.mcp.blockingWaitMs` — 25 minutes.
+ *
+ * Measured and documented 2026-09-17 (`docs/mcp-host-timeouts-2026-09-17.md`): Claude Code's
+ * wall-clock tool limit (`MCP_TOOL_TIMEOUT`) defaults to about 28 hours, and a 240 s call succeeded
+ * headless with and without progress. Its stdio idle timeout is 30 minutes, and the documentation
+ * says a progress notification resets it. The default stays under 30 minutes so the call survives
+ * even if that reset does not happen. A lane still running at the cap degrades to polling.
+ */
+export const DEFAULT_MCP_BLOCKING_WAIT_MS = 1_500_000;
 
 /**
  * Default `routing.mcp.maxWaitMs` — the longest one `dispatch` tool call blocks before handing

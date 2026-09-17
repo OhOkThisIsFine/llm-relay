@@ -13,7 +13,7 @@ import {
   clientForPath,
   configStaleness,
 } from "../src/config.js";
-import { DEFAULT_MCP_MAX_WAIT_MS } from "../src/config-types.js";
+import { DEFAULT_MCP_BLOCKING_WAIT_MS, DEFAULT_MCP_MAX_WAIT_MS } from "../src/config-types.js";
 import { candidateEnvNames } from "../src/authEnv.js";
 import { addEntry, lock, type KeystoreOptions } from "../src/keystore.js";
 import type { KeyringSpawnSync } from "../src/os-keyring.js";
@@ -2120,19 +2120,34 @@ describe("loadConfig — routing.mcp.maxWaitMs", () => {
     expect(loadConfig(write("mcp-maxwait-absent.json", base())).routing.mcp).toBeUndefined();
     expect(loadConfig(write("mcp-maxwait-empty.json", mcpCfg({}))).routing.mcp).toEqual({
       maxWaitMs: 25_000,
+      blockingWaitMs: DEFAULT_MCP_BLOCKING_WAIT_MS,
     });
   });
 
   it("keeps an explicit value", () => {
     expect(
       loadConfig(write("mcp-maxwait-set.json", mcpCfg({ maxWaitMs: 10_000 }))).routing.mcp,
-    ).toEqual({ maxWaitMs: 10_000 });
+    ).toEqual({ maxWaitMs: 10_000, blockingWaitMs: DEFAULT_MCP_BLOCKING_WAIT_MS });
   });
 
   it("keeps allowedRoots beside the defaulted ceiling", () => {
     expect(
       loadConfig(write("mcp-maxwait-roots.json", mcpCfg({ allowedRoots: ["C:/Code"] }))).routing.mcp,
-    ).toEqual({ allowedRoots: ["C:/Code"], maxWaitMs: 25_000 });
+    ).toEqual({ allowedRoots: ["C:/Code"], maxWaitMs: 25_000, blockingWaitMs: DEFAULT_MCP_BLOCKING_WAIT_MS });
+  });
+
+  it("keeps blockingWaitMs as given — 0 turns it off, and it is not clamped to maxWaitMs", () => {
+    expect(loadConfig(write("mcp-block-off.json", mcpCfg({ blockingWaitMs: 0 }))).routing.mcp?.blockingWaitMs).toBe(0);
+    expect(
+      loadConfig(write("mcp-block-set.json", mcpCfg({ blockingWaitMs: 600_000 }))).routing.mcp?.blockingWaitMs,
+    ).toBe(600_000);
+    // Under the 30-minute stdio idle timeout even if a progress notification does not reset it.
+    expect(DEFAULT_MCP_BLOCKING_WAIT_MS).toBeLessThan(30 * 60_000);
+    for (const bad of [-1, 1.5, "600000"]) {
+      expect(
+        () => loadConfig(write(`mcp-block-bad-${String(bad)}.json`, mcpCfg({ blockingWaitMs: bad }))),
+      ).toThrow(/routing\.mcp\.blockingWaitMs/);
+    }
   });
 
   it("refuses 0, -1, 1.5 and \"40000\" by name — none of them bounds the blocking wait", () => {
