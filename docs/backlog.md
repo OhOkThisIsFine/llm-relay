@@ -83,3 +83,19 @@
   argument `scope: string[]` (paths or globs relative to `cwd`) tags every delta path outside it
   `OUT OF SCOPE`. Report only — the relay never refuses or reverts; the caller's own gates decide.
 
+- **No test replays a lane that outlives `waitMs` (moved from the machine backlog 2026-09-16,
+  low).** The wait-ceiling clamp (`749be44`, v0.80.0) and the `relay` agent template obligation to
+  return the job id are shipped; what is missing is the replay that pins them together.
+  **Property:** a test in `test/mcp-server.test.ts` dispatches to a fake lane that answers after
+  `waitMs` has elapsed and asserts the reply carries a `jobId`, that `dispatch_status` reports
+  `running`, and that `dispatch_result` later returns the lane's answer unchanged.
+
+- **The Codex `relay` agent can report lane provenance for its own inline review (moved from the
+  machine backlog 2026-09-16, low).** Measured 2026-09-08: the Codex-side `relay` child returned
+  an inline review while stating that dispatch was unavailable, and still printed a provenance
+  line. The Claude template (v8, `src/setup-claude.ts`) carries rule 8 (no provenance line without
+  a real `dispatch_result`); the Codex template in `scripts/install-skill.mjs` is a prompt
+  obligation with no test. **Property:** `scripts/install-skill.mjs`'s Codex template carries the
+  same rule, and a test asserts the generated `~/.codex/agents/relay.toml` text contains it, the
+  way `test/relay-agent-provenance.test.ts` pins the Claude one.
+
