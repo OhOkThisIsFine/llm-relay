@@ -294,6 +294,8 @@ export interface LaneJob {
    * previous process, and its report is exactly what that process wrote (`job-archive.ts`).
    */
   restored?: boolean;
+  /** The first line of the task, cut short (`taskLabel`), so a job can be recognised in a list. */
+  label?: string;
   /**
    * The read-only TOOL binding applied to the lane now running (`readonly-boundary.ts`
    * `readOnlyInvoke`). Replaced per lane, like `expected`; absent for an ordinary dispatch.
@@ -801,6 +803,29 @@ function readOwnedPids(handle: OwnedProcess | undefined): number[] {
   return raw.filter((pid) => Number.isSafeInteger(pid) && pid > 0);
 }
 
+/** One line of `LaneJobStore.recent`. `elsewhere` marks a job another live process runs. */
+export interface RecentJob {
+  id: string;
+  status: JobStatus;
+  laneId: string;
+  startedAt: number;
+  endedAt: number | undefined;
+  elsewhere: boolean;
+  label?: string;
+}
+
+function recentOf(job: LaneJob, elsewhere: boolean): RecentJob {
+  return {
+    id: job.id,
+    status: job.status,
+    laneId: job.laneId,
+    startedAt: job.startedAt,
+    endedAt: job.endedAt,
+    elsewhere,
+    ...(job.label === undefined ? {} : { label: job.label }),
+  };
+}
+
 /**
  * Monotonic job ids. Readable, and stable to sort. Process-global, and SEEDED from what a previous
  * process left on disk (`seedJobCounter`), so a restart never mints an id the previous process
@@ -926,7 +951,18 @@ export class LaneJobStore {
     }
   }
 
-  create(laneId: string, spec: string | undefined, cwd: string, dispatchSource?: "daemon" | "fallback"): LaneJob {
+  create(
+    laneId: string,
+    spec: string | undefined,
+    cwd: string,
+    dispatchSource?: "daemon" | "fallback",
+    label?: string,
+  ): LaneJob {
+    // ⚠ Seeded from the DISK at every mint, not only at start: another host's server mints from the
+    // same files, and two processes seeded once each handed out the same `job-NNNN`. The journal
+    // row below is written at once, so the window left between two processes is one write.
+    seedJobCounter(this.archive.lastSeqOnDisk());
+    seedJobCounter(this.journal.maxSeqOnDisk());
     const job: LaneJob = {
       id: nextJobId(),
       status: "running",
@@ -942,6 +978,7 @@ export class LaneJobStore {
       error: undefined,
       attempts: [],
       ...(dispatchSource !== undefined ? { dispatchSource } : {}),
+      ...(label ? { label } : {}),
     };
     this.jobs.set(job.id, job);
     const seq = jobSeqOf(job.id);
@@ -955,6 +992,7 @@ export class LaneJobStore {
       ...(job.spec === undefined ? {} : { spec: job.spec }),
       cwd: job.cwd,
       startedAt: job.startedAt,
+      ...(job.label === undefined ? {} : { label: job.label }),
     });
     return job;
   }
@@ -1161,8 +1199,69 @@ export class LaneJobStore {
     return count;
   }
 
+  /** A job THIS store holds. The walk reads this; it never needs another process's job. */
   get(id: string): LaneJob | undefined {
     return this.jobs.get(id);
+  }
+
+  /**
+   * A job for a CALLER: one this store holds, else one another `llm-relay mcp` process finished and
+   * archived after this store started (kept from then on, marked `restored`), else undefined.
+   *
+   * ⚠ Why a caller needs more than `get`. Claude Desktop and Codex Desktop each start their own
+   * server, and a session can poll through a different connection than the one that dispatched —
+   * observed 2026-09-16 as `unknown jobId` for a job that had finished. The archive is shared on
+   * disk, so the answer exists; it was read only once, at start.
+   */
+  find(id: string): LaneJob | undefined {
+    const held = this.jobs.get(id);
+    if (held !== undefined) return held;
+    const archived = this.archive.lookup(id);
+    if (archived === undefined) return undefined;
+    const row: LaneJob = { ...archived, restored: true };
+    this.jobs.set(id, row);
+    return row;
+  }
+
+  /**
+   * The newest `limit` jobs this machine knows: this store's, every finished job on disk, and every
+   * job another live process is running. Newest start first.
+   */
+  recent(limit: number): RecentJob[] {
+    const byId = new Map<string, RecentJob>();
+    const add = (row: RecentJob): void => {
+      if (!byId.has(row.id)) byId.set(row.id, row);
+    };
+    for (const job of this.jobs.values()) add(recentOf(job, false));
+    for (const job of this.archive.all()) add(recentOf(job, false));
+    for (const row of this.journal.foreignRows()) {
+      add({
+        id: row.jobId,
+        status: "running",
+        laneId: row.laneId,
+        startedAt: row.startedAt,
+        endedAt: undefined,
+        elsewhere: true,
+        ...(row.label === undefined ? {} : { label: row.label }),
+      });
+    }
+    return [...byId.values()].sort((a, b) => b.startedAt - a.startedAt).slice(0, Math.max(0, limit));
+  }
+
+  /**
+   * The journal row for a job another LIVE `llm-relay mcp` process is running now, or undefined.
+   * Nothing about it can be read here except that it runs; its answer reaches `find` once it ends.
+   */
+  runningElsewhere(id: string): { laneId: string; spec?: string; startedAt: number; pid: number } | undefined {
+    if (this.jobs.has(id)) return undefined;
+    const row = this.journal.foreign(id);
+    if (row?.owner === undefined) return undefined;
+    return {
+      laneId: row.laneId,
+      ...(row.spec === undefined ? {} : { spec: row.spec }),
+      startedAt: row.startedAt,
+      pid: row.owner.pid,
+    };
   }
 
   list(): LaneJob[] {

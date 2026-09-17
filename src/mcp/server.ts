@@ -80,6 +80,9 @@ export const MCP_SERVER_NAME = "llm-relay";
 /** `max_tokens` for an answer-mode call when the caller names none. */
 export const DEFAULT_ANSWER_MAX_TOKENS = 4096;
 
+/** How many jobs `dispatch_status` lists when it is called without a jobId. */
+export const RECENT_JOBS_LISTED = 20;
+
 /**
  * How a dispatch view is obtained. Injected rather than imported so this module never decides
  * whether to consult the running relay — the caller owns that, exactly as `buildDispatch` takes
@@ -319,12 +322,15 @@ const TOOLS: ToolDefinition[] = [
     name: "dispatch_status",
     title: "Check a dispatched job",
     description:
-      "Report whether a dispatched lane is still running, and for how long. Poll this after " +
-      "dispatch returned a jobId. Wait at least a few seconds between polls.",
+      "Report a dispatched job. While it runs: its lane, elapsed time and output so far. Once it " +
+      "has ended: its full answer, exactly as dispatch_result returns it. Wait at least a few " +
+      "seconds between polls. Without jobId: list the recent jobs of every llm-relay MCP server " +
+      "on this machine, so a lost jobId can be found again.",
     inputSchema: {
       type: "object",
-      properties: { jobId: { type: "string", description: "The jobId dispatch returned." } },
-      required: ["jobId"],
+      properties: {
+        jobId: { type: "string", description: "The jobId dispatch returned. Omit it to list recent jobs." },
+      },
       additionalProperties: false,
     },
   },
@@ -543,7 +549,11 @@ function describeJob(job: LaneJob, now: number): string {
   if (job.relay?.latencyDemoted) head.push(`latency-demoted: ${job.relay.latencyDemoted}`);
   if (job.relay?.degraded) head.push(`degraded: ${job.relay.degraded}`);
   if (job.dispatchSource === "fallback") head.push("dispatch-source: local-fallback (daemon unreachable)");
-  if (job.restored === true) head.push("record: restored from disk — this job ended before the llm-relay MCP server last restarted");
+  if (job.restored === true) {
+    head.push(
+      "record: restored from disk — this job ended in an earlier llm-relay MCP server process or in another host's one",
+    );
+  }
   if (job.readOnly) head.push(`read-only: ${job.readOnly.binding}`);
   // While it runs: the lane's usual time to answer, from its own completed runs, so a caller can tell
   // a slow lane from a stuck one instead of giving up (`LaneJob.expected`).
@@ -1075,27 +1085,73 @@ export class McpDispatchServer {
     return textResult(`tier: ${view.tier ?? "default"}\n\n${lines.join("\n")}${next}`);
   }
 
+  /**
+   * ⚠ A TERMINAL job's status IS its result. A native subagent hands its answer back the moment it
+   * ends; a caller that polls `dispatch_status` and never thinks to call `dispatch_result` was
+   * measured polling one finished job 2,023 times over 71 minutes (2026-09-16). So the first poll
+   * that sees the job end already holds the answer; a running job keeps the short form.
+   */
   private toolStatus(args: Record<string, unknown>): unknown {
     const jobId = readString(args, "jobId");
-    if (!jobId) return textResult("dispatch_status requires jobId", true);
-    const job = this.jobs.get(jobId);
-    if (!job) return textResult(`unknown jobId: ${jobId}`, true);
-    return textResult(describeJob(job, this.now()));
+    if (!jobId) return textResult(this.recentJobs());
+    const job = this.jobs.find(jobId);
+    if (!job) return this.unknownJob(jobId);
+    if (job.status === "running") return textResult(describeJob(job, this.now()));
+    return textResult(jobAnswer(job, this.now()), isFailureStatus(job.status));
   }
 
   private toolResult(args: Record<string, unknown>): unknown {
     const jobId = readString(args, "jobId");
     if (!jobId) return textResult("dispatch_result requires jobId", true);
-    const job = this.jobs.get(jobId);
-    if (!job) return textResult(`unknown jobId: ${jobId}`, true);
+    const job = this.jobs.find(jobId);
+    if (!job) return this.unknownJob(jobId);
     return textResult(jobAnswer(job, this.now()), isFailureStatus(job.status));
+  }
+
+  /**
+   * The newest jobs this machine's llm-relay MCP servers know, one line each, newest first — the
+   * list a caller reads when it lost a jobId (a host that timed a call out destroys the handle).
+   */
+  private recentJobs(): string {
+    const now = this.now();
+    const rows = this.jobs.recent(RECENT_JOBS_LISTED);
+    if (rows.length === 0) return "No dispatched jobs are recorded on this machine.";
+    const lines = rows.map((r) => {
+      const seconds = Math.max(0, Math.round(((r.endedAt ?? now) - r.startedAt) / 1000));
+      const where = r.elsewhere ? " [another MCP server process]" : "";
+      const label = r.label ? ` — ${r.label}` : "";
+      return `${r.id}  ${r.status}  ${seconds}s  ${r.laneId}${where}${label}`;
+    });
+    return `recent jobs (newest first):\n${lines.join("\n")}\n\nPass a jobId to read one.`;
+  }
+
+  /**
+   * The reply for a job id this process cannot answer for. A job another host's server is still
+   * running is NAMED as such — `unknown jobId` there sent callers to re-dispatch work that was in
+   * progress. Not an error: the job exists, and its answer appears here once it ends.
+   */
+  private unknownJob(jobId: string): unknown {
+    const elsewhere = this.jobs.runningElsewhere(jobId);
+    if (elsewhere === undefined) return textResult(`unknown jobId: ${jobId}`, true);
+    const elapsed = Math.max(0, Math.round((this.now() - elsewhere.startedAt) / 1000));
+    return textResult(
+      [
+        `job: ${jobId}`,
+        `lane: ${elsewhere.laneId}${elsewhere.spec ? ` (${elsewhere.spec})` : ""}`,
+        "status: running",
+        `elapsed: ${elapsed}s`,
+        `record: running in another llm-relay MCP server process (pid ${elsewhere.pid})`,
+      ].join("\n") +
+        "\n\nThis process cannot report its progress or cancel it. Poll again: its answer appears " +
+        "here once it ends.",
+    );
   }
 
   private toolCancel(args: Record<string, unknown>): unknown {
     const jobId = readString(args, "jobId");
     if (!jobId) return textResult("dispatch_cancel requires jobId", true);
-    const job = this.jobs.get(jobId);
-    if (!job) return textResult(`unknown jobId: ${jobId}`, true);
+    const job = this.jobs.find(jobId);
+    if (!job) return this.unknownJob(jobId);
     const cancelled = this.jobs.cancel(jobId);
     return textResult(cancelled ? `cancelled ${jobId}` : `${jobId} was already ${job.status}`);
   }
@@ -1171,7 +1227,7 @@ export class McpDispatchServer {
     if (!readOnlyVerdictResult.ok) return textResult(readOnlyVerdictResult.refusal, true);
 
     const first = view.ladder.find((l) => l.id === ordered[0]) ?? view.next;
-    const job = this.jobs.create(first.id, first.spec, opts.cwd, opts.dispatchSource);
+    const job = this.jobs.create(first.id, first.spec, opts.cwd, opts.dispatchSource, taskLabel(task));
     // What this dispatch was allowed to reach. Both halves gate the terminal advice below: it may
     // claim the ladder was exhausted only when a walk actually ran and nothing was left untried.
     this.jobs.noteWalkScope(job.id, { enabled: walk !== null, lanesNotTried: notTried, forced });
@@ -1876,6 +1932,12 @@ export class McpDispatchServer {
     }
     return textResult(jobAnswer(current, this.now()), isFailureStatus(current.status));
   }
+}
+
+/** The first non-empty line of a task, cut to 80 characters — enough to recognise a job in a list. */
+export function taskLabel(task: string): string {
+  const line = task.split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0) ?? "";
+  return line.length > 80 ? `${line.slice(0, 77)}...` : line;
 }
 
 /**

@@ -502,12 +502,14 @@ describe("async job path", () => {
     }
   });
 
-  it("requires a jobId on every job tool", async () => {
+  it("requires a jobId on dispatch_result and dispatch_cancel; dispatch_status without one lists jobs", async () => {
     const h = new Harness();
-    for (const tool of ["dispatch_status", "dispatch_result", "dispatch_cancel"]) {
+    for (const tool of ["dispatch_result", "dispatch_cancel"]) {
       const { isError } = await h.tool(tool, {});
       expect(isError, tool).toBe(true);
     }
+    const status = await h.tool("dispatch_status", {});
+    expect(status.isError).toBe(false);
   });
 
   it("reports semantic AGY quota failure once before result and status exposure", async () => {

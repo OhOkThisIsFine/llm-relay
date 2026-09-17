@@ -28,6 +28,20 @@ export interface JournalRow {
   spec?: string;
   cwd: string;
   startedAt: number;
+  /** The task's first line, cut short, so another process can list the job recognisably. */
+  label?: string;
+  /**
+   * The process and the journal instance that own the row. Absent on a row written before
+   * 2026-09-17, which is read exactly as before: an orphan.
+   *
+   * ⚠ Why both exist. Two hosts run their own `llm-relay mcp` process at the same time (Claude
+   * Desktop and Codex Desktop, measured), and both write this one file. Before the owner was
+   * recorded, the second process to start read the first one's LIVE jobs as orphans and reported
+   * them killed, and every write by either process erased the other's rows. The pid says whether
+   * the owner can still be running; the instance token tells two journals inside one process apart,
+   * which is how the suite simulates a restart without a second process.
+   */
+  owner?: { pid: number; instance: string };
 }
 
 export interface JournalFile {
@@ -61,8 +75,17 @@ export interface JobJournal {
   note(row: JournalRow): void;
   /** Remove a job that reached a terminal state, or one that never started. */
   clear(jobId: string): void;
-  /** Rows present at STARTUP — i.e. jobs a previous process died holding. */
+  /** Rows present at STARTUP whose owner is gone — i.e. jobs a previous process died holding. */
   orphans(): JournalRow[];
+  /**
+   * The row for `jobId` if ANOTHER live process owns it right now, read from disk at call time.
+   * This is how one host's server answers for a job another host's server is still running.
+   */
+  foreign(jobId: string): JournalRow | undefined;
+  /** Every row another live process owns now. */
+  foreignRows(): JournalRow[];
+  /** The highest `job-NNNN` sequence any row on disk carries, read at call time; 0 when none. */
+  maxSeqOnDisk(): number;
 }
 
 /** A journal that records nothing. The default under vitest, and for an embedder that declines one. */
@@ -70,7 +93,29 @@ export const nullJobJournal: JobJournal = {
   note: () => {},
   clear: () => {},
   orphans: () => [],
+  foreign: () => undefined,
+  foreignRows: () => [],
+  maxSeqOnDisk: () => 0,
 };
+
+/** How a journal decides who owns a row. Injected so the suite can prove both branches. */
+export interface JobJournalOptions {
+  /** This process's pid. */
+  pid?: number;
+  /** Does `pid` still name a running process? `process.kill(pid, 0)` by default. */
+  isAlive?: (pid: number) => boolean;
+}
+
+function defaultIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+let instanceCounter = 0;
 
 /**
  * The real journal: a small JSON file rewritten on every change, read ONCE at construction.
@@ -84,30 +129,65 @@ export const nullJobJournal: JobJournal = {
  * the strength of an unparseable file would invent deaths, which is the same fail-safe direction
  * `lane-manifest.ts` takes on a corrupt manifest.
  */
-export function createJobJournal(path: string = jobJournalPath()): JobJournal {
+export function createJobJournal(path: string = jobJournalPath(), options: JobJournalOptions = {}): JobJournal {
+  const pid = options.pid ?? process.pid;
+  const isAlive = options.isAlive ?? defaultIsAlive;
+  instanceCounter += 1;
+  const instance = `${pid}-${Date.now().toString(36)}-${instanceCounter}`;
   const rows = new Map<string, JournalRow>();
   let loaded = false;
   let startupOrphans: JournalRow[] = [];
 
-  const readOnce = (): void => {
-    if (loaded) return;
-    loaded = true;
-    // ⚠ The option is spelled `validator`, and it was written as `validate` first — a misspelling
-    // that made the guard INERT, so a wrong-version file loaded as if it had passed. `safeReadJson`
-    // had no such option, so the call silently read whatever JSON was there. `test/mcp-restart-
-    // report.test.ts` caught it (the corrupt-JSON case passed regardless — `JSON.parse` throws on
-    // its own — and only the version-99 case distinguished); `tsc` reports it too, as TS2561.
+  // ⚠ The option is spelled `validator`, and it was written as `validate` first — a misspelling
+  // that made the guard INERT, so a wrong-version file loaded as if it had passed. `safeReadJson`
+  // had no such option, so the call silently read whatever JSON was there. `test/mcp-restart-
+  // report.test.ts` caught it (the corrupt-JSON case passed regardless — `JSON.parse` throws on
+  // its own — and only the version-99 case distinguished); `tsc` reports it too, as TS2561.
+  const readDisk = (): JournalRow[] | null => {
     const parsed = safeReadJsonSync<JournalFile>(path, {
       validator: (v): v is JournalFile =>
         isRecord(v) && v["version"] === JOB_JOURNAL_VERSION && Array.isArray(v["jobs"]),
     });
-    if (!parsed) return;
-    startupOrphans = parsed.jobs.filter(isJournalRow);
+    return parsed ? parsed.jobs.filter(isJournalRow) : null;
   };
 
+  /**
+   * Is the row's owner still running, other than this journal? A row with no owner predates the
+   * field and is read as before. A row carrying THIS pid but another instance was written by an
+   * earlier journal in this process, which no longer holds it. A dead pid is gone.
+   *
+   * ⚠ Stated cost: the operating system reuses pids, so a dead owner whose pid now names an
+   * unrelated process reads as alive, and its jobs are reported killed only once that pid ends too.
+   * The failure is a LATE report, never a false one about a live job.
+   */
+  const ownedElsewhere = (row: JournalRow): boolean => {
+    const owner = row.owner;
+    if (owner === undefined || owner.instance === instance) return false;
+    if (owner.pid === pid) return false;
+    return isAlive(owner.pid);
+  };
+
+  const readOnce = (): void => {
+    if (loaded) return;
+    loaded = true;
+    const disk = readDisk();
+    if (!disk) return;
+    startupOrphans = disk.filter((row) => row.owner?.instance !== instance && !ownedElsewhere(row));
+  };
+
+  /**
+   * Rewrite the file as: every row another live process owns, plus this journal's own rows. Read
+   * again at write time, because the other process writes too; the previous version wrote only its
+   * own rows and so erased the other's. The adopted orphans are dropped here, which is what stops a
+   * later start from reporting the same death twice.
+   *
+   * ⚠ Not locked: two writes in the same instant can still lose one row. The row costs one
+   * unreported death at most, the same budget the module header states for a full disk.
+   */
   const flush = (): void => {
     try {
-      atomicWriteJsonSync(path, { version: JOB_JOURNAL_VERSION, jobs: [...rows.values()] });
+      const others = (readDisk() ?? []).filter(ownedElsewhere);
+      atomicWriteJsonSync(path, { version: JOB_JOURNAL_VERSION, jobs: [...others, ...rows.values()] });
     } catch {
       // Best-effort by construction: the journal only ever IMPROVES the report of a crash, so a
       // full disk must not become a dispatch failure. The property it protects is stated in
@@ -118,7 +198,7 @@ export function createJobJournal(path: string = jobJournalPath()): JobJournal {
   return {
     note(row) {
       readOnce();
-      rows.set(row.jobId, row);
+      rows.set(row.jobId, { ...row, owner: { pid, instance } });
       flush();
     },
     clear(jobId) {
@@ -129,8 +209,26 @@ export function createJobJournal(path: string = jobJournalPath()): JobJournal {
     orphans() {
       readOnce();
       // A row this process wrote for a job it still holds is not an orphan; only rows that were
-      // already on disk when we arrived are, and they are read once, before any `note`.
+      // already on disk when we arrived, and whose owner is gone, are.
       return startupOrphans;
+    },
+    foreign(jobId) {
+      readOnce();
+      if (rows.has(jobId)) return undefined;
+      return (readDisk() ?? []).find((row) => row.jobId === jobId && ownedElsewhere(row));
+    },
+    foreignRows() {
+      readOnce();
+      return (readDisk() ?? []).filter((row) => !rows.has(row.jobId) && ownedElsewhere(row));
+    },
+    maxSeqOnDisk() {
+      let max = 0;
+      for (const row of readDisk() ?? []) {
+        const m = /^job-(\d+)$/.exec(row.jobId);
+        const n = m ? Number(m[1]) : 0;
+        if (Number.isSafeInteger(n) && n > max) max = n;
+      }
+      return max;
     },
   };
 }
@@ -146,6 +244,18 @@ function isJournalRow(value: unknown): value is JournalRow {
     typeof value["laneId"] === "string" &&
     typeof value["cwd"] === "string" &&
     typeof value["startedAt"] === "number" &&
-    (value["spec"] === undefined || typeof value["spec"] === "string")
+    (value["spec"] === undefined || typeof value["spec"] === "string") &&
+    (value["label"] === undefined || typeof value["label"] === "string") &&
+    (value["owner"] === undefined || isOwner(value["owner"]))
+  );
+}
+
+function isOwner(value: unknown): value is JournalRow["owner"] {
+  return (
+    isRecord(value) &&
+    typeof value["pid"] === "number" &&
+    Number.isSafeInteger(value["pid"]) &&
+    value["pid"] > 0 &&
+    typeof value["instance"] === "string"
   );
 }

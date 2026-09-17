@@ -1877,7 +1877,7 @@ Five tools:
 | Tool | Purpose |
 |---|---|
 | `dispatch(task, mode?, system?, schema?, maxTokens?, tier?, lane?, model?, cwd?, waitMs?, timeoutMs?, readOnly?)` | Hand a task to the best ready lane, or to one named model, and return its answer. |
-| `dispatch_status(jobId)` | Is a long lane still running? |
+| `dispatch_status(jobId?)` | Is a long lane still running? A finished job's status carries its answer. With no `jobId`, list the recent jobs. |
 | `dispatch_result(jobId)` | Collect a finished lane's answer. |
 | `dispatch_cancel(jobId)` | Stop a running lane. |
 | `dispatch_lanes(tier?)` | Show the ladder, to choose a lane deliberately. |
@@ -2010,6 +2010,15 @@ runs no shutdown handler), and read back on the next start marked `record: resto
 the highest one any previous process minted, finished or killed — a handle from before the restart
 never names a different job after it. The archive keeps the newest 100 jobs, each stream capped at
 512 KiB (tail kept, with a marker).
+
+**Several hosts share the job files.** Claude Desktop, Codex Desktop and a CLI session each start
+their own `llm-relay mcp` process, and all of them read and write the same journal and archive.
+Each journal row names the process that owns it, so a second process never reports a live job of
+the first as killed, and no write erases another process's rows. A job another process finished
+is found on disk when you ask for it; a job another process still runs is named as such
+(`record: running in another llm-relay MCP server process (pid N)`), not `unknown jobId`. Job ids
+are unique across the processes. `dispatch_status` with no `jobId` lists the newest 20 jobs from
+all of them, with the first line of each task, so a caller whose host lost the handle can find it.
 
 **A killed lane is distinguished from a failed one.** The MCP server writes a running-job journal
 under the cache directory (`mcp-jobs.json`, honouring `XDG_CACHE_HOME`); a row is removed the

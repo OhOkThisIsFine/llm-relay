@@ -75,6 +75,15 @@ export interface JobArchive {
   restore(): { jobs: ArchivedJob[]; lastSeq: number };
   /** Run any pending debounced write now — the shutdown seam. */
   flush(): void;
+  /**
+   * A finished job read from disk NOW, or undefined. This is how one host's server answers for a
+   * job that another host's server finished after this one started.
+   */
+  lookup(jobId: string): ArchivedJob | undefined;
+  /** The highest sequence number on disk now, so a fresh id cannot repeat one another process minted. */
+  lastSeqOnDisk(): number;
+  /** Every finished job on disk now. */
+  all(): ArchivedJob[];
 }
 
 /** An archive that keeps nothing. The default for an embedder that declines one. */
@@ -83,6 +92,9 @@ export const nullJobArchive: JobArchive = {
   noteSeq: () => {},
   restore: () => ({ jobs: [], lastSeq: 0 }),
   flush: () => {},
+  lookup: () => undefined,
+  lastSeqOnDisk: () => 0,
+  all: () => [],
 };
 
 /** The sequence number inside a `job-NNNN` id, or null for any other spelling. */
@@ -104,27 +116,48 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
   let loaded = false;
   const timer = new WriteBehindTimer();
 
-  const readOnce = (): void => {
-    if (loaded) return;
-    loaded = true;
+  /** The valid rows and the highest sequence on disk now; null for an absent or unusable file. */
+  const readDisk = (): { rows: ArchivedJob[]; lastSeq: number } | null => {
     const parsed = safeReadJsonSync<JobArchiveFile>(path, {
       validator: (v): v is JobArchiveFile =>
         isRecord(v) && v["version"] === JOB_ARCHIVE_VERSION && Array.isArray(v["jobs"]),
     });
-    if (!parsed) return;
-    if (typeof parsed.lastSeq === "number" && Number.isSafeInteger(parsed.lastSeq) && parsed.lastSeq > 0) {
-      lastSeq = parsed.lastSeq;
-    }
+    if (!parsed) return null;
+    let seq = typeof parsed.lastSeq === "number" && Number.isSafeInteger(parsed.lastSeq) && parsed.lastSeq > 0
+      ? parsed.lastSeq
+      : 0;
+    const valid: ArchivedJob[] = [];
     for (const row of parsed.jobs) {
       if (!isArchivedJob(row)) continue;
-      rows.set(row.id, row);
-      const seq = jobSeqOf(row.id);
-      if (seq !== null && seq > lastSeq) lastSeq = seq;
+      valid.push(row);
+      const s = jobSeqOf(row.id);
+      if (s !== null && s > seq) seq = s;
     }
+    return { rows: valid, lastSeq: seq };
   };
 
+  const readOnce = (): void => {
+    if (loaded) return;
+    loaded = true;
+    const disk = readDisk();
+    if (!disk) return;
+    lastSeq = disk.lastSeq;
+    for (const row of disk.rows) rows.set(row.id, row);
+  };
+
+  /**
+   * ⚠ Merge before every write. Another host's `llm-relay mcp` process writes this same file, and
+   * the previous version wrote only the rows this process had loaded at start, so each process
+   * erased every job the other one finished. A row this process holds wins over the disk copy of
+   * the same id. Not locked: two writes in one instant can still lose one row.
+   */
   const write = (): void => {
     try {
+      const disk = readDisk();
+      if (disk) {
+        for (const row of disk.rows) if (!rows.has(row.id)) rows.set(row.id, row);
+        if (disk.lastSeq > lastSeq) lastSeq = disk.lastSeq;
+      }
       atomicWriteJsonSync(path, { version: JOB_ARCHIVE_VERSION, lastSeq, jobs: boundedRows(rows) });
     } catch {
       // Best-effort: a full disk must not become a dispatch failure. The report still exists in
@@ -154,6 +187,15 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
     },
     flush() {
       timer.flushNow();
+    },
+    lookup(jobId) {
+      return readDisk()?.rows.find((row) => row.id === jobId);
+    },
+    lastSeqOnDisk() {
+      return readDisk()?.lastSeq ?? 0;
+    },
+    all() {
+      return readDisk()?.rows ?? [];
     },
   };
 }
@@ -232,6 +274,7 @@ export function isArchivedJob(value: unknown): value is ArchivedJob {
     optBool("walkEnabled") &&
     optBool("forcedLane") &&
     optBool("restored") &&
+    optString("label") &&
     (value["process"] === undefined || isProcessReport(value["process"])) &&
     (value["dispatchSource"] === undefined || value["dispatchSource"] === "daemon" || value["dispatchSource"] === "fallback") &&
     (value["relay"] === undefined || isRecord(value["relay"])) &&
