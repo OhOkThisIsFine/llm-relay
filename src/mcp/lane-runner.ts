@@ -1485,7 +1485,7 @@ export interface CwdCheck {
  * is offered, not imposed; that is the operator's call to make in config, not this file's.
  *
  * ⚠ **The containment test resolves BOTH sides with `path.resolve` before comparing** (closed
- * 2026-09-03, docs/audit-findings-2026-09-03.md finding 1 / DR-002). Without it a literal `..`
+ * 2026-09-03, docs/history/audit-findings-2026-09-03.md finding 1 / DR-002). Without it a literal `..`
  * segment in `cwd` — a raw string a caller sends verbatim, never normalized — satisfied a bare
  * `startsWith` prefix test while `existsSync`/`statSync` above had already resolved `..` at the
  * OS level against the REAL, escaped directory: `allowedRoots: ["C:/allowed"]` admitted

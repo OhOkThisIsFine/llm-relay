@@ -57,7 +57,7 @@ export type ReadOnlyVerdict = { ok: true; cwd: string } | { ok: false; refusal: 
  * Containment is tested on RESOLVED paths with a separator boundary, never a bare `startsWith`:
  * `C:/caller/tree-other` shares a prefix with `C:/caller/tree` and is not inside it, and a literal
  * `..` segment resolves at the OS level before the comparison — the `checkCwd` defect closed
- * 2026-09-03 (docs/audit-findings-2026-09-03.md finding 1 / DR-002), applied here in the direction
+ * 2026-09-03 (docs/history/audit-findings-2026-09-03.md finding 1 / DR-002), applied here in the direction
  * where getting it wrong would WRONGLY PERMIT a mutation.
  *
  * Answer mode is always allowed: `startLane` skips the cwd/spawn path entirely for a `relay` rung

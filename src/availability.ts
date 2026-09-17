@@ -1,5 +1,5 @@
 /**
- * Availability ladders — spec §5.1-5.3 of docs/quota-metering-spec-2026-08-16.md.
+ * Availability ladders — spec §5.1-5.3 of docs/history/quota-metering-spec-2026-08-16.md.
  *
  * `remaining` and `resetsAt` are resolved per (scope, axis, period) through fixed rungs, and
  * staleness is handled HERE, at read time, as a pure function of the caller's clock — never by a

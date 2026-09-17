@@ -5,6 +5,59 @@ config, routing, pools, offload, repair, the CLI, endpoints, and the caveats.
 
 ---
 
+## Contents
+
+- [What it does](#what-it-does)
+  - [Live demo (no external creds)](#live-demo-no-external-creds)
+- [Install & run](#install--run)
+  - [Staying current](#staying-current)
+- [Verifying a setup — two checks, two questions](#verifying-a-setup--two-checks-two-questions)
+  - [First run — the relay asks what you want](#first-run--the-relay-asks-what-you-want)
+- [Config](#config)
+  - [Where state actually lives](#where-state-actually-lives)
+  - [Provider credential fleets](#provider-credential-fleets)
+  - [Key custody](#key-custody)
+  - [Operator-declared rate limits (`limits`)](#operator-declared-rate-limits-limits)
+  - [Model addressing (split on the first `/`, first match wins)](#model-addressing-split-on-the-first--first-match-wins)
+  - [Provider wire-shape quirks (`compat`)](#provider-wire-shape-quirks-compat)
+  - [Which upstream endpoint a provider speaks (`wire`)](#which-upstream-endpoint-a-provider-speaks-wire)
+  - [Pools — static and dynamic](#pools--static-and-dynamic)
+- [Failover (both fronts, one policy)](#failover-both-fronts-one-policy)
+  - [What it measures: latency per token](#what-it-measures-latency-per-token)
+  - [Sticky sessions (opt-in)](#sticky-sessions-opt-in)
+  - [Other relay headers](#other-relay-headers)
+  - [Usage fields on repaired and translated responses](#usage-fields-on-repaired-and-translated-responses)
+  - [Context guardrail](#context-guardrail)
+  - [Quieting the onboarding nudge (`leave_me_alone`)](#quieting-the-onboarding-nudge-leave_me_alone)
+- [Repair details](#repair-details)
+  - [Destructive-tool refusal (`repair.destructiveTools`)](#destructive-tool-refusal-repairdestructivetools)
+  - [The reshaper](#the-reshaper)
+- [Offload (`routing.offload` + `routing.subagents`)](#offload-routingoffload--routingsubagents)
+  - [Hosts whose traffic never arrives](#hosts-whose-traffic-never-arrives)
+  - [What backends said about themselves: `llm-relay eligibility`](#what-backends-said-about-themselves-llm-relay-eligibility)
+  - [Provider-stated spend headroom](#provider-stated-spend-headroom)
+  - [Choosing a target: `llm-relay candidates`](#choosing-a-target-llm-relay-candidates)
+  - [Local Codex setup](#local-codex-setup)
+- [Dispatch ladder](#dispatch-ladder)
+  - [`llm-relay mcp` — dispatch as an MCP tool](#llm-relay-mcp--dispatch-as-an-mcp-tool)
+  - [`mode: "agent"` vs `mode: "answer"`](#mode-agent-vs-mode-answer)
+  - [`readOnly: true` — the read-only boundary is a mechanism, not an instruction](#readonly-true--the-read-only-boundary-is-a-mechanism-not-an-instruction)
+- [The OpenAI front and `/registry`](#the-openai-front-and-registry)
+  - [Document attachments on non-Anthropic backends](#document-attachments-on-non-anthropic-backends)
+  - [Model discovery](#model-discovery)
+  - [Local analytics dashboard](#local-analytics-dashboard)
+- [CLI reference](#cli-reference)
+  - [Clearing live cooldowns](#clearing-live-cooldowns)
+  - [Cost roll-up](#cost-roll-up)
+  - [Endpoints](#endpoints)
+- [Using it from your projects](#using-it-from-your-projects)
+  - [What Claude Code gives up behind ANY custom `ANTHROPIC_BASE_URL`](#what-claude-code-gives-up-behind-any-custom-anthropic_base_url)
+- [Logging (metadata only)](#logging-metadata-only)
+- [Composing with headroom (optional)](#composing-with-headroom-optional)
+- [Dev & release](#dev--release)
+
+---
+
 ## What it does
 
 - **Transparent passthrough** — forwards streaming and non-streaming `/v1/messages` byte-for-byte.
@@ -195,9 +248,9 @@ table, and delete the originals — the XDG path wins as soon as it exists. Back
 (`llm-relay keys export` for the credentials), because `keystore.json` is the one artifact that
 cannot be re-fetched.
 
-Before 2026-08-27 only five of these honoured a variable and the rest did not, so the directory
-split in two. That is fixed; if you are on an older version, treat `~/.llm-relay/` plus both XDG
-locations as the full backup set.
+On a version released before 2026-08-27 only some artifacts honoured these variables, so the
+directory could split in two. Treat `~/.llm-relay/` plus both XDG locations as the full backup set
+on such a version.
 
 ```jsonc
 {
@@ -602,7 +655,7 @@ automatically — new free models never need a config edit.
 those are dropped before ranking, so a 14-member pool can resolve to 7 and the config's tenth
 entry can legitimately be the one that answers. `llm-relay candidates` reports the count.
 
-### Failover (both fronts, one policy)
+## Failover (both fronts, one policy)
 
 - **429 / 5xx / 400 / 402 / 404 / 410** → recorded as a breaker failure, next candidate tried. A
   `Retry-After` sets that candidate's cooldown to what the provider asked, **bounded to 1 s–15 min**
@@ -1439,7 +1492,7 @@ That provider supports a client whose own traffic is deliberately pointed at the
 a workaround for Desktop collaboration validation. Hosted ChatGPT/Cloud tasks cannot reach a
 loopback relay — those remain separate dispatch lanes.
 
-### Dispatch ladder
+## Dispatch ladder
 
 `llm-relay dispatch` answers a different question than offload: which **lane** (peer CLI, relay
 pool, passthrough) should a host hand a whole task to, in what order. The order is config
@@ -1479,10 +1532,8 @@ lane id.
 
 #### The automatic lane walk (`routing.dispatchWalk`)
 
-Before this existed, one `dispatch` call ran exactly ONE lane. If that lane was slow, the calling
-agent had to notice, give up, and name a different lane by hand — which is what this replaces.
-
-A dispatch now WALKS the ladder:
+One `dispatch` call walks the ladder, so a slow lane does not oblige the calling agent to give up
+and name a different lane by hand:
 
 - **A lane is stopped only when it is IDLE** (owner decision 2026-09-17): when it has shown no
   activity for `idleMs` (default 5 min), the relay stops it and starts the next one. How long it has
@@ -1901,7 +1952,7 @@ relay never presents another agent's text as its own.
 limit measured on this machine is Codex's code-mode `exec`, which gives up on a script at 31 s and
 loses the job handle with it (29 of 266 first Codex dispatch calls, 2026-09-07 to 2026-09-10); an
 MCP tool call in Claude Code fails between 45 s and 100 s. So the default is 25 s, under the lowest
-measured limit rather than on it (40 s until 2026-09-10). A `waitMs` above the ceiling is clamped
+measured limit rather than on it. A `waitMs` above the ceiling is clamped
 to it, never refused, and the reply announces the clamp on its own line (`waited 25 s (waitMs 60000
 clamped to routing.mcp.maxWaitMs 25000)`); a `waitMs` at or below the ceiling is honoured exactly.
 A `waitMs` that is negative, zero, non-finite or not a number is refused, naming the ceiling and the
@@ -1917,7 +1968,7 @@ Claude Desktop app (`claude-ai`) sends no progress token; a Code tab call throug
 other host keeps the 25 s ceiling (Codex yields at 31 s). Set `"blockingWaitMs": 0` to turn both
 longer waits off. If the host cancels the call, the job keeps
 running; `dispatch_status` with no `jobId` lists it. Evidence:
-[mcp-host-timeouts-2026-09-17.md](mcp-host-timeouts-2026-09-17.md).
+[mcp-host-timeouts-2026-09-17.md](history/mcp-host-timeouts-2026-09-17.md).
 
 **The launcher corrects two things before a lane starts, and the reply names them on a `launch:`
 line.** On Windows an environment value such as `HOME=%USERPROFILE%` is expanded from the same
@@ -2281,9 +2332,8 @@ whose ledger is fully committed.
 **Unrecognized commands and stray arguments are refused, not ignored.** A command name the CLI does
 not know exits 1 naming it, rather than starting the proxy — so a typo reports itself instead of
 launching a second relay. Every command also bounds how many positional arguments it takes, so an
-argument that would have been silently discarded exits 1 before anything happens: `llm-relay cost
---window 1h 7d` no longer reports the 24h window while ignoring `7d`, and `llm-relay models nim` no
-longer lists every provider while ignoring `nim` (it is `-p nim`).
+argument that would otherwise be silently discarded exits 1 before anything happens. `llm-relay cost
+--window 1h 7d` is refused, and so is `llm-relay models nim` (the provider flag is `-p nim`).
 
 Three details worth knowing. `--help` and `--version` still short-circuit, so `llm-relay <command>
 --help` works even when the rest of the line is wrong — **except `keys` and `cooldowns`**, whose own
@@ -2304,7 +2354,7 @@ and `keys` diagnostics have always refused to echo argv for that reason.
 | `llm-relay pools <name> [--json]` / `llm-relay pools show <name> [--json]` | Show one pool's effective members |
 | `llm-relay pools <set\|add\|remove\|delete> <name> [spec...]` | Edit a pool |
 | `llm-relay routing <show\|get\|default\|tier\|subagent\|sort\|benchmark\|set\|unset\|answered>` | Edit routing. `answered` retires the first-run notice (below) without changing anything. `route` is an alias for the whole command. |
-| `llm-relay lanes [--probe]` | What each `cli` dispatch lane's own tool says it serves; `--probe` runs each lane's roster command. A roster older than 7 days is flagged `STALE` and stops counting as eviction evidence. Rosters are also refreshed by the background cadence (`routing.laneProbe`), so `--probe` is the on-demand form, no longer the only writer. |
+| `llm-relay lanes [--probe]` | What each `cli` dispatch lane's own tool says it serves; `--probe` runs each lane's roster command. A roster older than 7 days is flagged `STALE` and stops counting as eviction evidence. Rosters are also refreshed by the background cadence (`routing.laneProbe`), so `--probe` is the on-demand form. |
 | `llm-relay config <show\|get\|set\|unset> [path] [value]` | Edit any config field |
 | `llm-relay models [-p <name>] [-r]` | List live provider catalogs |
 | `llm-relay ping [-p <name>]` | Probe provider latency/health |
@@ -2657,7 +2707,7 @@ the cap (maximum 1 GiB); exactly one predecessor is retained.
 
 Run in `detect` first, measure which models trip the validator on your traffic, then decide on
 repair. `node scripts/nim-trip-rate.mjs` produces a per-model trip-rate dataset
-([nim-trip-rate.md](nim-trip-rate.md)).
+([nim-trip-rate.md](history/nim-trip-rate.md)).
 
 ---
 

@@ -4,7 +4,7 @@ import { anthropicRequestToOpenAi } from "../src/openai-request.js";
 
 /**
  * F11 — the Responses-front half. A Codex `reasoning` item has no Anthropic representation and was
- * dropped unconditionally (docs/deepseek-responses-truncation-2026-09-09.md, finding 3: the third
+ * dropped unconditionally (docs/history/deepseek-responses-truncation-2026-09-09.md, finding 3: the third
  * capture run ended at HTTP 400 "The `reasoning_content` in the thinking mode must be passed back
  * to the API" after 1-2 tool-call turns). Under the RESOLVED `reasoning: "deepseek"` option, the
  * item's own stated `summary` text is now carried onto a LEADING `thinking` block on the current

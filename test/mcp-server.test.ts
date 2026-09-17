@@ -934,7 +934,7 @@ describe("checkCwd", () => {
   });
 
   it("resolves a `..` segment before the containment test, closing a path-traversal bypass", () => {
-    // docs/audit-findings-2026-09-03.md (DR-002 / finding 1): normalizePath unified separators,
+    // docs/history/audit-findings-2026-09-03.md (DR-002 / finding 1): normalizePath unified separators,
     // trimmed trailing slashes and lowercased, but never called path.resolve, so a literal `..`
     // segment in the candidate satisfied a bare `startsWith` prefix test while existsSync/statSync
     // above it had already resolved `..` at the OS level against the REAL, escaped directory.

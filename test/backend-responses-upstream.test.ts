@@ -11,7 +11,7 @@ import type { Config, ProviderConfig } from "../src/config.js";
 /**
  * The `wire: "responses"` OpenAI-Responses UPSTREAM speaker (backlog item 11 — OpenCode Zen's
  * contributor SKUs, Muse Spark 1.3 included, answer HTTP 500 on `/chat/completions` and 200 only
- * on `/responses`; docs/muse-spark-1.3-opencode-zen-2026-09-04.md rows 3, 6-8, §3 route B).
+ * on `/responses`; docs/history/muse-spark-1.3-opencode-zen-2026-09-04.md rows 3, 6-8, §3 route B).
  *
  * ⚠ Every walk test uses >=2 candidates: with one candidate "fails over correctly" and "cannot
  * fail over at all" are the same observation (`test/pool-failover.test.ts`'s own standing rule).

@@ -10,7 +10,7 @@
  * the same reasoning as an unset `${ENV}` disabling one provider instead of aborting startup.
  *
  * Design (fork-validated in freellmapi's process-safety-net, adopted 2026-08-13 — see
- * docs/freellmapi-adoption-review-2026-08-13.md §1.3): swallow ONLY a closed allowlist of
+ * docs/history/freellmapi-adoption-review-2026-08-13.md §1.3): swallow ONLY a closed allowlist of
  * transport error codes plus a short list of Node/undici-authored message shapes, and
  * preserve Node's default fail-fast exit(1) for everything else, so genuine bugs still crash
  * loudly. The classifier is a pure function so it is unit-testable without touching global

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Calibrate `routing.hedge.msPerInputToken` — the size-scaled half of the hedge floor (owner
-// direction 2026-09-04, see src/hedge-trigger.ts and docs/hedged-attempts-design-2026-08-30.md).
+// direction 2026-09-04, see src/hedge-trigger.ts and docs/history/hedged-attempts-design-2026-08-30.md).
 //
 // The hedge floor is `max(minFloorMs, msPerInputToken x estimatedInputTokens)`, so a large prompt
 // is not hedged against the time it simply takes a HEALTHY deployment to read it. This script

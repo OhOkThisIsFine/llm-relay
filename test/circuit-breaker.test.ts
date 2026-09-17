@@ -338,7 +338,7 @@ describe("CircuitBreaker — credential-cell isolation", () => {
  * attempts, each costing the full 120000 ms provider timeout, while its breaker read `closed` every
  * time. The charging path was correct all along — the 60 s constant was simply smaller than the
  * 120 s failure it punished, and requests arrived 78-139 s apart, so the cell was always closed
- * again by the next walk. Evidence: `docs/latency-demotion-regression-2026-08-30.md` §3.
+ * again by the next walk. Evidence: `docs/history/latency-demotion-regression-2026-08-30.md` §3.
  */
 describe("CircuitBreaker — a slow failure cools for at least as long as it wasted", () => {
   const t: ProviderTargetIdentity = {

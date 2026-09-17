@@ -246,7 +246,7 @@ export function normalizeRefusalMessage(body: string): string {
   // relay's `openai backend HTTP <n>: …` wrapper, whose tail is the provider's (possibly
   // truncated) payload. One extraction round used to stop at the wrapper, so the SAME provider
   // condition normalized differently per lane and needed two accepts — the lane-split defect
-  // (docs/eligibility-triage-2026-08-29.md finding 1). Three real layers exist; the bound is a
+  // (docs/history/eligibility-triage-2026-08-29.md finding 1). Three real layers exist; the bound is a
   // formality against a pathological body.
   for (let round = 0; round < 4; round++) {
     const next = stripRelayWrapper(extractMessage(text) ?? text);

@@ -212,7 +212,7 @@ describe("latency demotion — absolute fallback", () => {
    * different things. The per-token guard cannot cover it, because per-token engages only at
    * `minSamples` REQUEST samples — so every deployment passes through a window where a probe-
    * calibrated ceiling judges generation latency. Evidence:
-   * `docs/latency-demotion-regression-2026-08-30.md`.
+   * `docs/history/latency-demotion-regression-2026-08-30.md`.
    */
   it("does NOTHING when a healthy deployment's own long ANSWER exceeds the probe ceiling", () => {
     // The live case, with its real figures. `nemotron-3-ultra` had served 59 of 62 successful

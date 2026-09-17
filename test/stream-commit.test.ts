@@ -243,7 +243,7 @@ describe("final-wire stream commit probe", () => {
 /**
  * CLONE-07. The rule "did the relay author these bytes" used to be spelled twice, once per front,
  * against each front's own passthrough condition. The two spellings never disagreed — the truth
- * table in `docs/reviews/clone-07-clone-26-evidence-2026-09-05.md` proves it over all six reachable
+ * table in `docs/history/reviews/clone-07-clone-26-evidence-2026-09-05.md` proves it over all six reachable
  * combinations — so naming it once is behaviour-preserving by construction, and this table is what
  * makes that checkable rather than asserted.
  *

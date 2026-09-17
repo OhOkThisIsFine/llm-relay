@@ -2533,7 +2533,7 @@ export function renderCommand(
  * ⚠ `--probe` spawns lane commands as an explicit operator action — same precedent as
  * `pools --probe` sending real completions. The request path reads the cached manifest and never
  * spawns anything; outside it the only OTHER spawn site is the relay's background lane cadence
- * (owner decision 2026-08-29, docs/quota-reprobe-design-2026-08-29.md). Without `--probe` this
+ * (owner decision 2026-08-29, docs/history/quota-reprobe-design-2026-08-29.md). Without `--probe` this
  * just prints the cache.
  */
 export async function runLanes(): Promise<void> {
@@ -2664,7 +2664,7 @@ export async function resolveDispatchView(opts: {
   qs.set("host", "bypassed");
   // ⚠ This view is for the MCP server, which has no `Agent` tool: a pass-through rung it cannot run
   // must come back `unreachable`, never as a lane the walk tries and fails in 0 s
-  // (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §4). A daemon older than this parameter ignores
+  // (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §4). A daemon older than this parameter ignores
   // it, and `McpDispatchServer` filters such a rung itself for exactly that case.
   qs.set("requester", "mcp");
 

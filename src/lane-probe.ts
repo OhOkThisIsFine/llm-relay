@@ -13,7 +13,7 @@ import {
 /**
  * `llm-relay lanes --probe` — ask each `cli` lane's own tool what it serves.
  *
- * ⚠ The spawn boundary (amended by owner decision 2026-08-29, docs/quota-reprobe-design-2026-08-29.md):
+ * ⚠ The spawn boundary (amended by owner decision 2026-08-29, docs/history/quota-reprobe-design-2026-08-29.md):
  * the REQUEST PATH never runs a `cli` lane's command — a lane's quota is client-bound, it runs its
  * own tool loop, and it returns only final text, so a relay that shelled out mid-request could
  * never return the `tool_use` blocks an HTTP turn owes its caller. Outside the request path there
@@ -22,7 +22,7 @@ import {
  * metadata polling is the relay's job, exactly as the ping loop already does for HTTP. Nothing
  * here is reachable from `handle()`, and the request path reads only the CACHED manifest.
  *
- * Discovery is not symmetric (docs/lane-discovery.md):
+ * Discovery is not symmetric (docs/history/lane-discovery.md):
  *   codex — `codex debug models` returns JSON including per-model `supported_reasoning_levels`,
  *           so both the id and the effort argument are validated with no API call spent.
  *   agy   — `agy models` returns `id<TAB>label` and states nothing about flags, so its argument

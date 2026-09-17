@@ -17,7 +17,7 @@ describe("openaiResponsesRequestToAnthropic", () => {
 
   it("maps a plain string input to one user turn, carrying NO max_tokens when the caller stated none", () => {
     // Until 2026-09-09 this carried llm-bridge's flat 1024 unconditionally — an invented cap that
-    // reached DeepSeek as a real ceiling on every request (docs/deepseek-responses-truncation-2026-09-09.md).
+    // reached DeepSeek as a real ceiling on every request (docs/history/deepseek-responses-truncation-2026-09-09.md).
     const out = openaiResponsesRequestToAnthropic({ model: "m", input: "hi" });
     expect(out).toEqual({
       model: "m",
@@ -191,7 +191,7 @@ describe("openaiResponsesRequestToAnthropic", () => {
 
   it("names the call_id and says the string was cut when a truncated argument string fails to parse", () => {
     // The refusal a harness needs to REPAIR the turn instead of replaying the same cut string
-    // forever (docs/deepseek-responses-truncation-2026-09-09.md — the mechanism this packet closes).
+    // forever (docs/history/deepseek-responses-truncation-2026-09-09.md — the mechanism this packet closes).
     expect(() => openaiResponsesRequestToAnthropic({
       model: "m",
       input: [{ type: "function_call", call_id: "call_abc", name: "exec_command", arguments: '{"cmd": "ls -la' }],

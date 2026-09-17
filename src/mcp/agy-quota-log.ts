@@ -1,7 +1,7 @@
 /**
  * AGY's own statement that a lane's quota is spent, read from AGY's log.
  *
- * WHY THIS EXISTS (2026-09-10, `docs/dispatch-giveup-diagnosis-2026-09-10.md` §4). When an AGY
+ * WHY THIS EXISTS (2026-09-10, `docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §4). When an AGY
  * model's quota is spent, AGY retries the call with back-off for about ten minutes and prints
  * NOTHING to stdout while it does. The statement lives only in AGY's log:
  *

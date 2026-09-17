@@ -384,7 +384,7 @@ function outcomeCode(outcome: {
  * ladder: a `Retry-After`, a 429 escalation and a 402 all still win where they applied before.
  *
  * Pure, so it is pinned directly rather than through the breaker's state machine.
- * Evidence: `docs/latency-demotion-regression-2026-08-30.md` §3.
+ * Evidence: `docs/history/latency-demotion-regression-2026-08-30.md` §3.
  */
 export function failureCooldown(elapsedMs: number): { ms: number; source: CooldownSource } {
   const wasted = Number.isFinite(elapsedMs) ? Math.min(MAX_RETRY_AFTER_MS, Math.max(0, elapsedMs)) : 0;

@@ -9,7 +9,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
     named `llm-relay`, which hid the Code tab's own server, and Desktop calls as `claude-ai` with a
     60 s limit on that path. v0.83.2 gives `claude-ai` a 50 s wait and renames the Desktop entry to
     `llm-relay-desktop` (setup was re-run on this machine). Evidence:
-    `docs/mcp-host-timeouts-2026-09-17.md`.
+    `docs/history/mcp-host-timeouts-2026-09-17.md`.
   - v0.84.0 (owner decision): the walk stops a lane only when it is IDLE for
     `routing.dispatchWalk.idleMs` (300 s): no tagged relay traffic, no output, no file change. New
     `src/lane-activity.ts` and `GET /dispatch/activity`. Verified live on the restarted daemon: a
@@ -24,7 +24,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
     returns the full answer (`85a7ba2`).
   - Claude Code gets the answer in ONE call: for `clientInfo.name` `claude-code` the server waits
     until the job ends and sends `notifications/progress`. Other hosts keep the 25 s ceiling. A
-    1,500 s call passed. Evidence: `docs/mcp-host-timeouts-2026-09-17.md` (`62c7dbf`, `9f341da`).
+    1,500 s call passed. Evidence: `docs/history/mcp-host-timeouts-2026-09-17.md` (`62c7dbf`, `9f341da`).
   - The lane launcher expands `%VAR%` environment values (or removes one that does not resolve),
     and an AGY lane gets `--add-dir <cwd>`. The job shows both on a `launch:` line (`9f341da`).
   - An agent-mode answer ends with a `tree delta` block: what the lane changed in `git status`,
@@ -34,7 +34,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   - The Codex `relay` agent template writes provenance only from a real dispatch result
     (`05db5b8`), and a test replays a lane that outlives `waitMs` (`d984b87`).
 - **The work queue is planned (2026-09-17, planning lap, no source change).**
-  [docs/stabilization-plan-2026-09-17.md](docs/stabilization-plan-2026-09-17.md) splits every open
+  [docs/history/stabilization-plan-2026-09-17.md](docs/history/stabilization-plan-2026-09-17.md) splits every open
   backlog entry, the stated residues and the findings of a live survey into packets for cheap
   models, in waves. Start with packet W0-1: the package ceiling has room for two more entries.
 - **Owner correction (2026-09-17 closeout): do NOT hand-set a rung's `capability`.** The value
@@ -115,7 +115,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 ### 0.3 Prior lap (2026-09-10, v0.81.0)
 
 - **What that lap shipped — the dispatch give-up fixes.** Diagnosis:
-  [docs/dispatch-giveup-diagnosis-2026-09-10.md](docs/dispatch-giveup-diagnosis-2026-09-10.md).
+  [docs/history/dispatch-giveup-diagnosis-2026-09-10.md](docs/history/dispatch-giveup-diagnosis-2026-09-10.md).
   Agents gave up on `dispatch` because the walk stopped the one working lane (`free-pool`) at a
   90 s budget that its own window could never raise, walked on through lanes that could not
   answer, ended on the `anthropic` pass-through that the MCP server cannot run, and then told the
@@ -183,14 +183,14 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   credential fault survives for its five-minute window (owner-accepted); every outcome dirties
   the file, bounded by `WriteBehindTimer`. Residue: the logon-started daemon dies by
   `TerminateProcess`, so the flush never runs there (backlog). Evidence:
-  [docs/breaker-persistence-audit-2026-09-08.md](docs/breaker-persistence-audit-2026-09-08.md).
+  [docs/history/breaker-persistence-audit-2026-09-08.md](docs/history/breaker-persistence-audit-2026-09-08.md).
 - **v0.74.0–v0.76.0, the dispatch lane walk and its safety review.** `dispatch` walks the
   ladder, pins the lane that answered, demotes the one that did not, and budgets each lane from
   its own p80. Three defects fixed in review: a demotion did not retract the pin; the budget
   measured itself; a clamped budget was labelled `history`. ⚠ Review coverage was PARTIAL — 24 of
   33 second-pass findings are UNVERIFIED, two filed in the backlog. ⚠ The demotion is EVIDENCE,
   not a calibrated statistic; never point the HTTP path's numbers at a lane. Full record:
-  [docs/lane-walk-safety-review-2026-09-08.md](docs/lane-walk-safety-review-2026-09-08.md).
+  [docs/history/lane-walk-safety-review-2026-09-08.md](docs/history/lane-walk-safety-review-2026-09-08.md).
 
 ### 0.5 Offload, measured
 
@@ -234,7 +234,7 @@ These were **not** removed and are load-bearing. Do not relax them:
 
 The invariant recalibration is applied and authoritative in `CLAUDE.md` §Invariants and
 `docs/project-goals.md`; the retired rules and their replacements are recorded in
-[docs/rubric-recalibration-2026-08-16.md](docs/rubric-recalibration-2026-08-16.md) §2 and in git
+[docs/history/rubric-recalibration-2026-08-16.md](docs/history/rubric-recalibration-2026-08-16.md) §2 and in git
 history - do not reintroduce them.
 
 ## 2. Where to read
@@ -242,18 +242,18 @@ history - do not reintroduce them.
 | Document | For |
 |---|---|
 | `CLAUDE.md` | Architecture map, file-to-responsibility table, gotchas. Invariants are authoritative there. |
-| `docs/metering-reconciliation-2026-08-22.md` | Implemented vs open against the quota-metering spec: gap/stage/decision tables. |
-| `docs/rubric-recalibration-2026-08-16.md` | What went wrong, the revised invariants (copy-ready), 55 re-adjudicated rejections. |
-| `docs/credential-fleet-design-2026-08-16.md` | Custody, pooling, cost accounting: components, staged build order. |
-| `docs/quota-metering-spec-2026-08-16.md` | The metering pipeline: metrics, collection sites, storage, stages. |
-| `docs/spa-dashboard-design-2026-08-20.md` | Read-only Analytics SPA design, protocol, contract, staged gates. |
-| `docs/rejection-ledger-2026-08-16.md` | Every past rejection and its reason, grouped by reason-kind. |
+| `docs/history/metering-reconciliation-2026-08-22.md` | Implemented vs open against the quota-metering spec: gap/stage/decision tables. |
+| `docs/history/rubric-recalibration-2026-08-16.md` | What went wrong, the revised invariants (copy-ready), 55 re-adjudicated rejections. |
+| `docs/history/credential-fleet-design-2026-08-16.md` | Custody, pooling, cost accounting: components, staged build order. |
+| `docs/history/quota-metering-spec-2026-08-16.md` | The metering pipeline: metrics, collection sites, storage, stages. |
+| `docs/history/spa-dashboard-design-2026-08-20.md` | Read-only Analytics SPA design, protocol, contract, staged gates. |
+| `docs/history/rejection-ledger-2026-08-16.md` | Every past rejection and its reason, grouped by reason-kind. |
 | `docs/reference.md` | Full user-facing reference: credential fleets, protected diagnostic surfaces. |
-| `docs/three-axis-assessment-2026-08-28.md` | The owner's three-axis capability assessment: verdicts per axis, the live-signal finding. |
-| `docs/advisory-findings-verification-2026-08-28.md` | The 32 advisory findings: the closed-vocabulary bug class and all eight instances. |
-| `docs/documentation-pass-2026-08-27.md` | The doc-vs-source pass: what was wrong, in what classes, what was deliberately left. |
-| `docs/dispatch-integration-review-2026-08-27.md` | Historical cross-CLI dispatch review; its AGY focus-safety conclusion is superseded by the next row. |
-| `docs/dispatch-smoothness-2026-08-31.md` | Current per-agent routing matrix, MCP spawn guarantees, PowerShell/OpenCode repairs. |
+| `docs/history/three-axis-assessment-2026-08-28.md` | The owner's three-axis capability assessment: verdicts per axis, the live-signal finding. |
+| `docs/history/advisory-findings-verification-2026-08-28.md` | The 32 advisory findings: the closed-vocabulary bug class and all eight instances. |
+| `docs/history/documentation-pass-2026-08-27.md` | The doc-vs-source pass: what was wrong, in what classes, what was deliberately left. |
+| `docs/history/dispatch-integration-review-2026-08-27.md` | Historical cross-CLI dispatch review; its AGY focus-safety conclusion is superseded by the next row. |
+| `docs/history/dispatch-smoothness-2026-08-31.md` | Current per-agent routing matrix, MCP spawn guarantees, PowerShell/OpenCode repairs. |
 
 ## 3. Verification — the one gate
 
@@ -320,7 +320,7 @@ Everything here is a settled trade kept for its reason, not work; the queue is `
    closed: its mechanism was a four-character leak-check needle colliding with base64 ciphertext,
    and the shared worker-default path only made the haystack longer; both halves fixed in
    `test/keystore.test.ts`.) Plan:
-   [docs/custody-sprint-plan-2026-08-24.md](docs/custody-sprint-plan-2026-08-24.md).
+   [docs/history/custody-sprint-plan-2026-08-24.md](docs/history/custody-sprint-plan-2026-08-24.md).
 2. **SPA and test nits standing:** the flat 30 s poll with no failure backoff (mitigated by
    abort-on-hide/offline), the CSS-structure test mirroring styles.css, a few wall-clock-sleep
    tests, dashboard fixtures cast via `as unknown as`, `aria-description` support patchier than
@@ -340,8 +340,8 @@ Everything here is a settled trade kept for its reason, not work; the queue is `
    `test/dynamic-pools.test.ts`'s existing fixture convention.
 4. **Where every other settled decision lives:** the owner decisions of 2026-09-04 (`freeOnly`
    stays `false`; contributor SKUs route automatically) in the `dynamic-pools.ts` row of
-   `CLAUDE.md` and `docs/muse-spark-1.3-opencode-zen-2026-09-04.md`; the Class B deferrals, the
+   `CLAUDE.md` and `docs/history/muse-spark-1.3-opencode-zen-2026-09-04.md`; the Class B deferrals, the
    type-level 7 keep and the WITHDRAWN currency-per-week spend ceiling in
-   `docs/advisory-findings-verification-2026-08-28.md`; the dropped Gaps 15/16/P4 and the accepted
-   streaming usage parity in `docs/metering-reconciliation-2026-08-22.md` §7; the uncovered-areas
-   verdicts in `docs/uncovered-areas-review-2026-08-26.md`.
+   `docs/history/advisory-findings-verification-2026-08-28.md`; the dropped Gaps 15/16/P4 and the accepted
+   streaming usage parity in `docs/history/metering-reconciliation-2026-08-22.md` §7; the uncovered-areas
+   verdicts in `docs/history/uncovered-areas-review-2026-08-26.md`.

@@ -9,7 +9,7 @@ import {
 
 /**
  * The safety net exists so a late socket reset from a discarded failover body cannot kill
- * the proxy that fronts every session (docs/freellmapi-adoption-review-2026-08-13.md §1.3).
+ * the proxy that fronts every session (docs/history/freellmapi-adoption-review-2026-08-13.md §1.3).
  * The classifier must swallow ONLY the closed transport allowlist — everything else keeps
  * Node's fail-fast exit(1), so a genuine bug still crashes loudly.
  */

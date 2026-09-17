@@ -295,7 +295,7 @@ export interface DispatchLane {
      *
      * ⚠ It exists because an abandoned run leaves no duration sample, so a window fed only by runs
      * that finished inside the budget can never show that the lane needed longer — the floor lock
-     * measured on 2026-09-10 (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3b). Each abandonment
+     * measured on 2026-09-10 (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §3b). Each abandonment
      * doubles the next budget, capped at `MAX_ATTEMPT_BUDGET_MS`; one success resets the count.
      */
     raisedBy?: number;
@@ -428,7 +428,7 @@ export interface DispatchOptions {
    * WHO is asking, when that changes what can run. `"mcp"` is the `llm-relay mcp` server: it runs
    * lanes itself and has no `Agent` tool, so a pass-through relay rung — one that forwards the
    * caller's own Anthropic credential — can never run there. It comes back `unreachable`, never as a
-   * lane the walk tries and fails in 0 s (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §4).
+   * lane the walk tries and fails in 0 s (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §4).
    * Absent ⇒ exactly the behaviour before this existed.
    */
   requester?: "mcp";
@@ -442,7 +442,7 @@ export interface DispatchOptions {
    * instead of the ladder. Validated against the configured providers and pools: an unknown spec
    * yields no lane and a reason. `dispatch` could not name a model before 2026-09-10, so agents that
    * had to use DeepSeek wrote their own HTTP calls to the relay
-   * (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §7).
+   * (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §7).
    */
   model?: string;
 }
@@ -1418,7 +1418,7 @@ function laneWindows(cfg: Config, laneId: string, tier: string | null, mode: Dis
  *   (`DispatchWalkSettings.agentAttemptMs` for why there are two).
  * - Each abandonment since the last success DOUBLES the budget, up to `MAX_ATTEMPT_BUDGET_MS`. An
  *   abandoned run leaves no sample, so without the raise the window could never show that the lane
- *   needed longer (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3b).
+ *   needed longer (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §3b).
  */
 function laneHistoryFacts(
   cfg: Config,

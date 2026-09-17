@@ -169,7 +169,7 @@ export function withStallWatchdog(response: Response, controller: AbortControlle
  * Calibrated 2026-09-09, on the `latency-demotion.ts` precedent: 4 x `DEFAULT_LATENCY_MS_PER_TOKEN`
  * (250 ms/token, itself measured over 68 real requests on 2026-08-30 — see that file's own
  * comment). A crawl abort hands the client a failure it must retry — measured in
- * `docs/post-commit-stall-measurement-2026-09-09.md`: Claude Code retries once, downgraded to a
+ * `docs/history/post-commit-stall-measurement-2026-09-09.md`: Claude Code retries once, downgraded to a
  * NON-STREAMING request; Codex retries up to five times, staying streaming, in all four measured
  * cells — so the bar must sit far above the demotion threshold, or a deployment merely slow enough
  * to be latency-demoted would also be aborted mid-response. 250 ms/token is itself ~3.5x the

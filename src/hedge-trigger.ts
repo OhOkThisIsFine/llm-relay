@@ -12,7 +12,7 @@
  * ⚠ **Hedging DUPLICATES, it does not reorder** — the first behaviour in this relay that does. The
  * `CLAUDE.md` invariant reads *"Acting on counts is optional, always announced, and may only
  * reorder"*, so the duplication is bounded three ways, all of them owner decisions recorded in
- * `docs/hedged-attempts-design-2026-08-30.md` §7: it is confined to deployments `assessCost()`
+ * `docs/history/hedged-attempts-design-2026-08-30.md` §7: it is confined to deployments `assessCost()`
  * calls FREE (D1), the loser is aborted the moment a winner commits, and the response announces it.
  *
  * WHY IT EXISTS. Measured 2026-08-30: `nim/deepseek-ai/deepseek-v4-flash-0731` hung on 43

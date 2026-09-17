@@ -19,7 +19,7 @@ import type { Config, ProviderConfig } from "../src/config.js";
  * "destructive tool calls are refused, never fabricated" bound only inside `repair()`, and a
  * WELL-FORMED destructive call the relay reconstructed out of assistant prose reached the client
  * unfiltered. Claude Code declares `Bash`; that output may run under
- * `--dangerously-skip-permissions`. Design: docs/dialect-rescue-destructive-refusal-2026-08-24.md.
+ * `--dangerously-skip-permissions`. Design: docs/history/dialect-rescue-destructive-refusal-2026-08-24.md.
  *
  * There are FOUR rescue commit points, not the two the original review named — buffered and
  * streamed, on each of the Anthropic-translated and direct-Chat lanes. Every one is exercised

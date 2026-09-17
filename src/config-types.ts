@@ -113,7 +113,7 @@ export type ThoughtSignatureMode = "none" | "sentinel";
  *    `thinking: {type:"disabled"}` — DeepSeek's thinking mode requires the prior turn's
  *    `reasoning_content` to be replayed on a multi-turn conversation (HTTP 400 otherwise), and
  *    this relay deliberately holds no store to round-trip it (see
- *    docs/deepseek-responses-truncation-2026-09-09.md), so the default must not think.
+ *    docs/history/deepseek-responses-truncation-2026-09-09.md), so the default must not think.
  */
 export type ReasoningMode = "none" | "deepseek";
 
@@ -143,7 +143,7 @@ export interface ProviderCompatConfig {
  *
  * OpenCode Zen's contributor SKUs — Muse Spark 1.3 included — answer HTTP 500 on
  * `/chat/completions` and on Zen's Anthropic-shaped `/messages`, and 200 only on `/responses`
- * (measured 2026-09-04, `docs/muse-spark-1.3-opencode-zen-2026-09-04.md` rows 3 and 6-8). A third
+ * (measured 2026-09-04, `docs/history/muse-spark-1.3-opencode-zen-2026-09-04.md` rows 3 and 6-8). A third
  * `Kind` value for this would touch roughly 55 `kind === "openai"` sites across 19 files (same
  * doc, §3 route B); this narrower option forks only the request/response builders `src/backend.ts`
  * selects on, leaving discovery, catalog and key-check paths unchanged. Declaring it on an
@@ -355,7 +355,7 @@ export interface Routing {
   latency?: LatencyDemotionConfig;
   /**
    * Hedged attempts (owner proposal + decisions 2026-08-30,
-   * docs/hedged-attempts-design-2026-08-30.md §7). **Default ON**, and confined to deployments
+   * docs/history/hedged-attempts-design-2026-08-30.md §7). **Default ON**, and confined to deployments
    * `assessCost()` calls FREE.
    *
    * ⚠ This is the FIRST behaviour here that does not merely reorder — it DUPLICATES a request onto
@@ -392,7 +392,7 @@ export interface Routing {
   pacing?: PacingConfig;
   /**
    * Post-commit CRAWL abort (backlog item 18, built 2026-09-09 after
-   * `docs/post-commit-stall-measurement-2026-09-09.md` measured that both Claude Code and Codex
+   * `docs/history/post-commit-stall-measurement-2026-09-09.md` measured that both Claude Code and Codex
    * retry a stream that goes bad after content has already arrived — Claude Code once, downgraded
    * to non-streaming; Codex up to five times, staying streaming). A silent stall after commit is
    * already caught by `withStallWatchdog` at `stallTimeoutMs`; this catches the case nothing else
@@ -407,7 +407,7 @@ export interface Routing {
   crawl?: CrawlWatchdogConfig;
   /**
    * Background lane re-probing (owner decision 2026-08-29,
-   * docs/quota-reprobe-design-2026-08-29.md): keeping lane metadata fresh is the relay's own
+   * docs/history/quota-reprobe-design-2026-08-29.md): keeping lane metadata fresh is the relay's own
    * job, the way the ping loop already does for HTTP. **Default ON** — catalog probes are
    * metadata commands that spend no quota, and quota probes fire only for buckets carrying an
    * ACTIVE recorded death (an alive lane is re-tested by real use for free). Boolean shorthand
@@ -417,7 +417,7 @@ export interface Routing {
   laneProbe?: LaneProbeSettings;
   /**
    * The automatic dispatch lane WALK (owner request 2026-09-06,
-   * docs/dispatch-lane-walk-design-2026-09-06.md). **Default ON.**
+   * docs/history/dispatch-lane-walk-design-2026-09-06.md). **Default ON.**
    *
    * Before it, `dispatch` ran ONE lane and reported a failure when that lane was slow; the calling
    * agent then picked the next lane by hand, which is the friction the owner reported. With it,
@@ -526,7 +526,7 @@ export interface LatencyDemotionConfig {
 /**
  * `routing.hedge` — start the NEXT candidate beside a slow in-flight attempt, instead of after it
  * (owner proposal 2026-08-30; the four decisions are in
- * `docs/hedged-attempts-design-2026-08-30.md` §7).
+ * `docs/history/hedged-attempts-design-2026-08-30.md` §7).
  *
  * **Default ON, free deployments only.** That is owner decision D1, taken against the
  * recommendation of off-by-default. `assessCost()` treats an UNKNOWN price as paid, so the rule is
@@ -908,7 +908,7 @@ export interface DispatchWalkSettings {
    * answer-mode call. Default 600000 (10 minutes).
    *
    * ⚠ Two floors because the two modes are two different populations
-   * (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3): an answer-mode call is one HTTP round trip
+   * (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §3): an answer-mode call is one HTTP round trip
    * that answers in seconds, while an agent-mode lane runs a whole tool loop for minutes. One floor
    * fitted to both stopped every real agent task on `free-pool` at 90 s, because a burst of short
    * answer-mode calls had set the lane's p80 to 39.5 s. Like `attemptMs` it is an operator budget,
@@ -1012,7 +1012,7 @@ export interface McpSettings {
 /**
  * Default `routing.mcp.blockingWaitMs` — 25 minutes.
  *
- * Measured and documented 2026-09-17 (`docs/mcp-host-timeouts-2026-09-17.md`): Claude Code's
+ * Measured and documented 2026-09-17 (`docs/history/mcp-host-timeouts-2026-09-17.md`): Claude Code's
  * wall-clock tool limit (`MCP_TOOL_TIMEOUT`) defaults to about 28 hours, and a 240 s call succeeded
  * headless with and without progress. Its stdio idle timeout is 30 minutes, and the documentation
  * says a progress notification resets it. The default stays under 30 minutes so the call survives
@@ -1029,7 +1029,7 @@ export const DEFAULT_MCP_BLOCKING_WAIT_MS = 1_500_000;
  * somewhere between 45 s and 100 s, and Codex's code-mode `exec` tool yields its script at 31.0 s
  * with empty output ("Script running with cell ID N / Wall time 31.0 seconds"). The 2026-09-10
  * transcript sweep counted 29 of 266 first Codex dispatch calls that lost their job id that way
- * while this default was 40 s (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §8). 25 s sits under
+ * while this default was 40 s (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §8). 25 s sits under
  * both. The tool description names the config key rather than this figure, so an operator override
  * never leaves the text stale.
  */

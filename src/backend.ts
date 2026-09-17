@@ -53,7 +53,7 @@ export class DialectUnparseableError extends Error {
  * fine. It is a config decision, so it is carried as a LOCAL failure — the walk must not fail over
  * (re-asking N models to produce the same refused action) and the deployment must not be charged,
  * the same rule under which a hard cap "never registers on the breaker — it is config, not
- * health". See docs/dialect-rescue-destructive-refusal-2026-08-24.md.
+ * health". See docs/history/dialect-rescue-destructive-refusal-2026-08-24.md.
  */
 export class DialectDestructiveError extends Error {
   constructor(public readonly dialect: string, public readonly refused: string[]) {
@@ -696,7 +696,7 @@ async function fetchOpenAiBackend(
   invokeFetch: typeof fetch,
 ): Promise<Response> {
   // A `wire: "responses"` target (OpenCode Zen's contributor SKUs; see
-  // docs/muse-spark-1.3-opencode-zen-2026-09-04.md) speaks the OpenAI Responses API, not Chat
+  // docs/history/muse-spark-1.3-opencode-zen-2026-09-04.md) speaks the OpenAI Responses API, not Chat
   // Completions, so it needs its own request/response mapping and its own upstream path. Kept as
   // an early dispatch rather than threading `wire` through every branch below, so the existing
   // (far more common) Chat Completions path is untouched byte for byte.
@@ -973,7 +973,7 @@ async function fetchOpenAiBackend(
  *
  * OpenCode Zen serves its contributor SKUs (Meta Muse Spark 1.3 included) on `POST /responses`
  * only — `/chat/completions` and Zen's Anthropic-shaped `/messages` both answer HTTP 500 for them
- * (measured 2026-08-04, `docs/muse-spark-1.3-opencode-zen-2026-09-04.md` rows 3, 6-8). Until this
+ * (measured 2026-08-04, `docs/history/muse-spark-1.3-opencode-zen-2026-09-04.md` rows 3, 6-8). Until this
  * section, `Kind` was `"anthropic" | "openai"` and every `openai`-kind target spoke Chat
  * Completions; a `wire: "responses"` target instead speaks the OpenAI Responses API, and this is
  * the mirror of the existing `openai`-kind (Chat) machinery above: a request mapper
@@ -1443,7 +1443,7 @@ function measuredResponsesCacheTokens(v: unknown): number | undefined {
  * OpenAI Responses `usage` -> Anthropic's `usage` shape.
  *
  * ⚠ Inclusion semantics, verified from the doc rather than guessed: Responses' `input_tokens` is
- * documented (row 12 of `docs/muse-spark-1.3-opencode-zen-2026-09-04.md`) alongside
+ * documented (row 12 of `docs/history/muse-spark-1.3-opencode-zen-2026-09-04.md`) alongside
  * `input_tokens_details.cached_tokens` using the SAME `<total>_details.<subset>_tokens` naming
  * convention Chat Completions uses for `prompt_tokens`/`prompt_tokens_details.cached_tokens` — a
  * convention `src/backend.ts`'s own `openAiUsage`/`openAiPromptUsageToAnthropic` pair already
@@ -2577,7 +2577,7 @@ function formatOpenAiChatCompletion(
  * (`incompleteReason === "max_output_tokens"`). Until 2026-09-09 this builder hardcoded
  * `status: "completed"` regardless, so a cap landing mid tool-call-argument JSON reached the
  * caller labelled as a finished answer — the mechanism behind
- * docs/deepseek-responses-truncation-2026-09-09.md's Codex replay loop. Every other stop reason
+ * docs/history/deepseek-responses-truncation-2026-09-09.md's Codex replay loop. Every other stop reason
  * is unchanged.
  */
 function formatOpenAiResponses(

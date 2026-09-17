@@ -54,7 +54,7 @@ import type { ReasoningMode } from "./config-types.js";
  *     `openai-request.ts` dropping `thinking`. Dropping is neutral for turn merging, so an
  *     assistant turn split by a `reasoning` item still merges into one.
  *     ⚠ ONE opt-in exception, since 2026-09-10 (F11,
- *     docs/deepseek-responses-truncation-2026-09-09.md): under a RESOLVED `reasoning: "deepseek"`
+ *     docs/history/deepseek-responses-truncation-2026-09-09.md): under a RESOLVED `reasoning: "deepseek"`
  *     option (the `openai-request.ts` `compat.reasoning` precedent — a decision this module is
  *     handed, never a provider name it sniffs), the item's own stated `summary` text is carried
  *     onto a LEADING `thinking` block on the current assistant turn, byte for byte and only when
@@ -71,7 +71,7 @@ import type { ReasoningMode } from "./config-types.js";
  *     silently would drop the whole conversation prefix it names.
  *   - `max_output_tokens` → `max_tokens`, carried ONLY when the caller stated one. Absent is carried
  *     as absent — never llm-bridge's old flat 1024, which this relay was inventing and sending to
- *     every backend as a real ceiling (docs/deepseek-responses-truncation-2026-09-09.md: 20 of 68
+ *     every backend as a real ceiling (docs/history/deepseek-responses-truncation-2026-09-09.md: 20 of 68
  *     captured DeepSeek answers hit that exact invented cap mid-answer, and the Responses front
  *     labelled every one of them `"status":"completed"` regardless — a token-capped answer reaching
  *     a harness labelled complete). `openai-request.ts` already omits an absent `max_tokens` from
@@ -109,7 +109,7 @@ type Rec = Record<string, unknown>;
  * A TUNABLE DEFAULT, never a provider figure — the provenance invariant this whole module already
  * follows. Until 2026-09-09 this module substituted llm-bridge's flat 1024 here UNCONDITIONALLY,
  * even for an `openai`-kind target's outbound Chat body, where the field is genuinely optional.
- * Measured against DeepSeek (docs/deepseek-responses-truncation-2026-09-09.md): 20 of 68 captured
+ * Measured against DeepSeek (docs/history/deepseek-responses-truncation-2026-09-09.md): 20 of 68 captured
  * upstream answers ended `finish_reason: "length"` at EXACTLY `completion_tokens: 1024` — the
  * relay's own invented cap, not anything the caller or the provider asked for — and every one of
  * the 44 emitted `response.completed` events still carried `"status":"completed"`, so a cap
@@ -258,7 +258,7 @@ function systemTextOf(content: unknown): string {
  * never declared and the model would read the invention back as its own prior call.
  *
  * ⚠ The invalid-JSON refusal NAMES the `call_id` and says the string was CUT — the most likely
- * cause is an output-token cap landing mid-argument (docs/deepseek-responses-truncation-2026-09-09.md),
+ * cause is an output-token cap landing mid-argument (docs/history/deepseek-responses-truncation-2026-09-09.md),
  * and a harness replaying the same malformed call forever cannot tell that from any other
  * malformed-JSON cause without this. A harness reading the message can instead repair or drop that
  * one item and retry, rather than looping.

@@ -85,7 +85,7 @@ const sharedRules = {
 
   // ── Advisory: worth reading, never blocking ───────────────────────────────────────────────
   // Restructuring `server.ts`/`config.ts` to satisfy this is the enterprise-shaped refactor
-  // docs/suggestion-review-2026-08-04.md rejected against the project's own rubric. Kept as a
+  // docs/history/suggestion-review-2026-08-04.md rejected against the project's own rubric. Kept as a
   // warning so a NEW hotspot is still visible.
   'sonarjs/cognitive-complexity': ['warn', 15],
   // All current hits are on operator-authored config and vendor version strings, not on request

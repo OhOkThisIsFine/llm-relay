@@ -202,9 +202,9 @@ for (const s of SCENARIOS) byScenario[s.id] = agg(records.filter((r) => r.scenar
 
 const stamp = process.env.RP_STAMP || "live-run";
 const dataset = { generated: stamp, base: BASE, reshaper: RESHAPER_MODEL, trials: TRIALS, scenarios: SCENARIOS.map((s) => ({ id: s.id, difficulty: s.difficulty })), liveModels, unavailable, records, aggregates: { byModel, byScenario } };
-const jsonlPath = "docs/nim-trip-rate.jsonl";
+const jsonlPath = "docs/history/nim-trip-rate.jsonl";
 writeFileSync(jsonlPath, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
-writeFileSync("docs/nim-trip-rate.json", JSON.stringify(dataset, null, 2));
+writeFileSync("docs/history/nim-trip-rate.json", JSON.stringify(dataset, null, 2));
 
 // Markdown report
 const rows = liveModels.map((m) => {
@@ -247,11 +247,11 @@ A \`timeout\` here means slow/cold-start, not confirmed-absent — re-probe with
 - **trip rate high, repair-fix rate low** → the failures are semantic (bad intent), not form — outside this proxy's remit.
 - **many no-tool-call / api errors** → the model isn't a viable tool backend on this account.
 `;
-writeFileSync("docs/nim-trip-rate.md", md);
+writeFileSync("docs/history/nim-trip-rate.md", md);
 
 console.log("Per-model aggregates:");
 for (const m of liveModels) {
   const a = byModel[m];
   console.log(" ", m.padEnd(42), `trip=${a.trip_rate ?? "—"} repairFix=${a.repair_fix_rate ?? "—"} (calls ${a.tool_calls}/${a.trials}, noTool ${a.no_tool_call}, err ${a.errors})`);
 }
-console.log(`\nWrote docs/nim-trip-rate.md, docs/nim-trip-rate.json, ${jsonlPath}`);
+console.log(`\nWrote docs/history/nim-trip-rate.md, docs/history/nim-trip-rate.json, ${jsonlPath}`);

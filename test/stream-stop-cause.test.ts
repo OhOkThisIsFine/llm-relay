@@ -69,7 +69,7 @@ describe("probe: a stated stop reason names the cause", () => {
    * frame first.
    *
    * ⚠ The reasoning deltas are EMPTY here (`reasoning_content: null`), which is what the recorded
-   * capture actually ends with — see `docs/deepseek-responses-truncation-2026-09-09.md`. A
+   * capture actually ends with — see `docs/history/deepseek-responses-truncation-2026-09-09.md`. A
    * non-empty `reasoning_content` delta legitimately COMMITS a stream under this module's existing
    * rules, and that behaviour is deliberately unchanged, so a fixture with reasoning prose would
    * be testing the ready path rather than this one.

@@ -249,7 +249,7 @@ function isDeepSeekHost(base: string): boolean {
  * labelled provider fact in `src/` only while config can override it. DeepSeek's own API states its
  * thinking/reasoning vocabulary (thinking ON by default; `thinking: {type:"disabled"}` /
  * `reasoning_effort: low|high|max`; first-party evidence in
- * docs/deepseek-responses-truncation-2026-09-09.md), so `api.deepseek.com` defaults to `"deepseek"`
+ * docs/history/deepseek-responses-truncation-2026-09-09.md), so `api.deepseek.com` defaults to `"deepseek"`
  * and every other host to `"none"`. An explicit `compat.reasoning` wins in BOTH directions —
  * `"none"` on deepseek, `"deepseek"` on anything else.
  */

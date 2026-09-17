@@ -1,5 +1,5 @@
 /**
- * The MCP half of the 2026-09-10 dispatch fixes (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §9):
+ * The MCP half of the 2026-09-10 dispatch fixes (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §9):
  * F1 a working lane is never traded for lanes that cannot answer; F3 a pass-through lane never runs
  * in the MCP walk; F4 an honest last message; F5 a caller-named model; F6 the quota death AGY states
  * only in its log; F8 the usual time to answer on a poll; F9 a stale process says so; and the

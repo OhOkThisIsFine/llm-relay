@@ -1,5 +1,5 @@
 /**
- * The dispatch-view half of two 2026-09-10 fixes (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §9):
+ * The dispatch-view half of two 2026-09-10 fixes (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §9):
  *
  * - F5: `dispatch` can name a MODEL. Until then it could only name a ladder rung, so an agent that
  *   had to use DeepSeek wrote its own HTTP calls to the relay (§7). `buildDispatch` now builds ONE

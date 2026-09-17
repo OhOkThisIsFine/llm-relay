@@ -15,7 +15,7 @@ import {
 } from "../src/refusal-interpretation.js";
 
 /**
- * The lane-split defect (2026-08-29 triage, docs/eligibility-triage-2026-08-29.md finding 1):
+ * The lane-split defect (2026-08-29 triage, docs/history/eligibility-triage-2026-08-29.md finding 1):
  * ONE provider condition produced TWO signatures depending on which lane observed it.
  *
  * A pool walk on an openai-kind target sees the relay's own synthesized error — the anthropic

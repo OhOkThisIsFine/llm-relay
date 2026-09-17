@@ -1,7 +1,7 @@
 /**
  * The background lane cadence — the relay's own re-probe loop for `cli` lanes.
  *
- * Owner decision 2026-08-29 (docs/quota-reprobe-design-2026-08-29.md): keeping lane metadata
+ * Owner decision 2026-08-29 (docs/history/quota-reprobe-design-2026-08-29.md): keeping lane metadata
  * fresh is the relay's job, the way `PingLoop` already keeps HTTP health fresh — not a host
  * scheduled task's, and never the nightly maintenance run's (that belongs to another repo).
  * This closes the property the backlog demanded: a recorded quota death either expires on a

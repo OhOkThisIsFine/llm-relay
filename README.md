@@ -65,10 +65,17 @@ at login.
 ## Learn more
 
 - [docs/reference.md](docs/reference.md) — full reference: config, routing, pools, offload,
-  repair, CLI, endpoints, and every caveat.
+  repair, CLI, endpoints, and every caveat. It opens with a table of contents.
+- [docs/architecture.md](docs/architecture.md) — a map of the code, for a person who wants to
+  change it.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to set up, how to prove a change, and how to report a
+  problem without leaking a credential.
 - [docs/subagent-routing.md](docs/subagent-routing.md) — offload design and wire evidence.
 - [docs/pool-failover.md](docs/pool-failover.md) — how failover and health tracking behave.
 - [docs/capability-sources.md](docs/capability-sources.md) — where capability scores come from.
 - [docs/project-goals.md](docs/project-goals.md) — what this project is and is not.
 
-`llm-relay help` lists the main commands. [CLAUDE.md](CLAUDE.md) maps the source for contributors.
+`llm-relay help` lists the main commands. To contribute, start at
+[CONTRIBUTING.md](CONTRIBUTING.md) and [docs/architecture.md](docs/architecture.md).
+[CLAUDE.md](CLAUDE.md) holds the same source map in full detail, written for an AI coding
+assistant.

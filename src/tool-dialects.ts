@@ -35,7 +35,7 @@ interface SchemaLike {
  * upstream. An in-band error is provenance `upstream` by default and therefore retriable, which
  * would let a streamed pre-commit refusal reroll onto the next candidate while the buffered lanes
  * treat the same refusal as terminal — two paths, one policy. See
- * docs/dialect-rescue-destructive-refusal-2026-08-24.md §3.
+ * docs/history/dialect-rescue-destructive-refusal-2026-08-24.md §3.
  */
 export const DIALECT_REFUSED_DESTRUCTIVE_CODE = "tool_dialect_refused_destructive";
 

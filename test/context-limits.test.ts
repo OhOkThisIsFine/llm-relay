@@ -260,7 +260,7 @@ describe("learning a ceiling from a real backend rejection", () => {
   });
 });
 
-// ── The max-output half (docs/max-output-caps-design-2026-08-29.md) ────────────────────────────
+// ── The max-output half (docs/history/max-output-caps-design-2026-08-29.md) ────────────────────────────
 
 describe("parsing a STATED max_tokens ceiling out of an error body", () => {
   it.each([

@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
  * validated it. Measured 2026-08-08: the ladder handed an agent
  * `agy --model claude-opus-5 --effort medium`, in which BOTH halves were wrong independently —
  * AGY serves no Claude 5 at all, and `--effort` is rejected outright for its Claude models. The
- * lane looked healthy and completed nothing. See docs/lane-discovery.md.
+ * lane looked healthy and completed nothing. See docs/history/lane-discovery.md.
  *
  * ⚠ A model the vendor does not serve is `not-servable` — an EXISTENCE fact, so the rung is
  * REMOVED, not demoted. `target-facts.ts` already draws that line: `allowance-exhausted` demotes

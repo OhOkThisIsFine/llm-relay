@@ -55,7 +55,7 @@ export type DispatchLaneStatus = (typeof DISPATCH_LANE_STATUSES)[number];
  * ⚠ It keys the lane-stats window since 2026-09-10, because the two are different populations: a
  * burst of short answer-mode calls set `free-pool`'s p80 to 39.5 s, and that one shared window then
  * cut every agent-mode task on the same lane at the 90 s floor
- * (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3). One `as const` array, the type indexed from
+ * (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §3). One `as const` array, the type indexed from
  * it and the parser validating against it — the closed-union rule.
  */
 export const DISPATCH_MODES = Object.freeze(["agent", "answer"] as const);
@@ -469,7 +469,7 @@ export function recordLaneRun(cfg: Config, report: DispatchedTelemetryReport, no
   // ⚠ Since 2026-09-10 only a COMPLETED run adds a sample. A failure's or a timeout's wall clock is
   // time to FAILURE, not time to answer: six 900 s timeouts made `opencode-muse-spark`'s budget 900 s
   // while it answered 0 of 12, so the walk waited longest on the lane that answered least
-  // (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3c). The abandoned rule above still holds.
+  // (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §3c). The abandoned rule above still holds.
   if (report.status === "completed") {
     entry.wallClockMs.push(report.wallClockMs);
     entry.wallClockAt.push(new Date(now).toISOString());

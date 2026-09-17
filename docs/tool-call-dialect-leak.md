@@ -19,7 +19,7 @@ it — those runs did 474–1571 s of real work before leaking.
 > naming a tool in `repair.destructiveTools`. Rescue is the relay deciding that model text IS a
 > tool call, and doing that for `Bash`/`Write`/`Edit` is the fabrication "refused, never
 > fabricated" forbids. A backend that emits native `tool_calls` is untouched. See
-> [dialect-rescue-destructive-refusal-2026-08-24.md](dialect-rescue-destructive-refusal-2026-08-24.md).
+> [dialect-rescue-destructive-refusal-2026-08-24.md](history/dialect-rescue-destructive-refusal-2026-08-24.md).
 
 
 ## The report

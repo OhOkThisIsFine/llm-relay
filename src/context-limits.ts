@@ -175,7 +175,7 @@ export function observedContextLimit(
 // repeated on every walk that landed there. Same store, same TTL convention, same fail-safe:
 // only an EXPLICITLY stated maximum is recorded, a miss learns nothing, and the fact is
 // DISPLAY-ONLY — nothing clamps, refuses or routes on it
-// (docs/max-output-caps-design-2026-08-29.md).
+// (docs/history/max-output-caps-design-2026-08-29.md).
 
 /** Retained for callers and docs that name the output ceiling's staleness window (30 days). */
 export const OBSERVED_MAX_OUTPUT_TTL_MS = FACT_TTL_MS["max-output"];

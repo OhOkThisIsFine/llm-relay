@@ -101,7 +101,7 @@ optional, always announced, and may only reorder.
 
 ⚠ **One narrow exception, added by owner amendment 2026-08-30: a HEDGE may also DUPLICATE** — start
 the next candidate beside a slow in-flight attempt rather than after it
-([hedged-attempts-design-2026-08-30.md](hedged-attempts-design-2026-08-30.md) §7). It is bounded
+([hedged-attempts-design-2026-08-30.md](history/hedged-attempts-design-2026-08-30.md) §7). It is bounded
 three ways, all owner decisions: free deployments only (`assessCost()`), the loser aborted the
 moment a winner commits, and the response announcing it. The amendment covers hedging and nothing
 else; a later term that wants to duplicate must be argued on its own merits.
@@ -136,7 +136,7 @@ Every thread from the discussion closed the same day, shipped as 0.16.0:
 - **Kernel**: owner signed off on deletion; only the adopted attempt lifecycle remains.
 - **Harvests**: all four landed (freeOnly guard, earliest-reset Retry-After, dispatch outcome
   split, estimator unification). The rejected remainder is documented with reasons in
-  [suggestion-review-2026-08-04.md](suggestion-review-2026-08-04.md).
+  [suggestion-review-2026-08-04.md](history/suggestion-review-2026-08-04.md).
 - **Codex ladder**: owner confirmed xhigh-on-three-tiers was intent, not drift; the missing
   effort flags were added to the personal config (not the package).
 - **Docs**: CLAUDE.md re-centered on the traffic-control-plane mission; README friend-passed

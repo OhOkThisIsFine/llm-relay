@@ -69,7 +69,7 @@
  * succeeding, inside a window every deployment passes through on its way to being measured.
  * ⚠ A request sample with NO token count therefore reaches NEITHER statistic. That is deliberate:
  * it is a generation of unknown length, so it is not normalisable and not what `p95Ms` describes.
- * Evidence: `docs/latency-demotion-regression-2026-08-30.md`.
+ * Evidence: `docs/history/latency-demotion-regression-2026-08-30.md`.
  *
  * ⚠ **NO breaker cooldown is registered, and that is the design, not an omission.** Quota demotion
  * can register one because its evidence STATES a `resetsAt`. Latency states no reset, and this

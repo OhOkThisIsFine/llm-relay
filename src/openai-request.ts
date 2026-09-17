@@ -34,7 +34,7 @@ import type { ThoughtSignatureMode, ToolCallIdMode, ReasoningMode, EffortLevel }
  * assistant message's `reasoning_content` (see `assistantMessage`) — byte for byte, and only when
  * nonempty. It never fabricates a `reasoning_content` or an effort nobody stated.
  *
- * ⚠ CORRECTED 2026-09-10 (F10/F11, docs/deepseek-responses-truncation-2026-09-09.md): this
+ * ⚠ CORRECTED 2026-09-10 (F10/F11, docs/history/deepseek-responses-truncation-2026-09-09.md): this
  * paragraph used to end "The default with no thinking control is `thinking:{type:"disabled"}`, so
  * a multi-turn DeepSeek lane cannot hit the ... 400" — false for POOL traffic, and never measured
  * against it before that date. A `pool/*` resolution stamps an effort band on the target on nearly
@@ -628,7 +628,7 @@ function stopSequences(raw: unknown): string[] | null {
 /**
  * The effort spellings this mapper may translate onto a `"deepseek"` target, closed over the ONE
  * value set DeepSeek states (`thinking: {type:"disabled"}` / `reasoning_effort: low|high|max`,
- * first-party evidence in docs/deepseek-responses-truncation-2026-09-09.md). The keys are the
+ * first-party evidence in docs/history/deepseek-responses-truncation-2026-09-09.md). The keys are the
  * union of the caller's effort spellings (`none|low|high|max` — Anthropic's `output_config.effort`
  * / `reasoning.effort`) and the routed pool's bands (`low|medium|high|xhigh`) — a cross-vendor
  * vocabulary, so the lookup is deliberately a table, not an enum: a spelling outside it falls
@@ -672,7 +672,7 @@ function deepSeekEffortSpec(level: string): Rec | undefined {
  * applied (`forcesToolChoice`, `hasUnreplayableReasoningTurn`).
  *
  * 1. `thinking: {type:"disabled"}` is forwarded VERBATIM — the caller's own words, and the field
- *    the 36k-token probe in docs/deepseek-responses-truncation-2026-09-09.md showed the Anthropic
+ *    the 36k-token probe in docs/history/deepseek-responses-truncation-2026-09-09.md showed the Anthropic
  *    path dropping (all 32,000 output tokens were reasoning, no answer).
  * 2. An explicit effort (`output_config.effort` / `reasoning.effort`) maps to `reasoning_effort`.
  * 3. ⚠ The routed pool's effort band maps to `reasoning_effort` — checked BEFORE rule 5, and that

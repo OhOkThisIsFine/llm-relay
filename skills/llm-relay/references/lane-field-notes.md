@@ -47,7 +47,7 @@ and quota; never copy a dated roster out of prose.
   30 s. llm-relay blocks 25 s by default since v0.81.0 and then hands back a job id.
   Since v0.83.x the server waits longer only for hosts measured to survive it: Claude Code with a
   progress token gets the answer in one call, Claude Desktop gets 50 s, every other host keeps the
-  ceiling (llm-relay `docs/mcp-host-timeouts-2026-09-17.md`).
+  ceiling (llm-relay `docs/history/mcp-host-timeouts-2026-09-17.md`).
 - **An MCP server restart KILLS every lane it was running (2026-09-06, re-measured 2026-09-17).**
   The old symptom — `unknown jobId` for every job, numbering restarted at `job-0001`, nothing on
   disk — is fixed: the running-job journal reports each such job as `killed` (v0.80.0) and the job

@@ -6,7 +6,7 @@
  * (`clientInfo.name` "claude-code") was measured completing a 240 s call, so there `dispatch` now
  * waits for the answer and sends `notifications/progress` while it waits. Every other host, and a
  * Claude Code call that asked for no progress, keeps the 25 s ceiling.
- * Evidence: docs/mcp-host-timeouts-2026-09-17.md.
+ * Evidence: docs/history/mcp-host-timeouts-2026-09-17.md.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HOST_WAIT_CEILING_MS, McpDispatchServer, PROGRESS_INTERVAL_MS } from "../src/mcp/server.js";

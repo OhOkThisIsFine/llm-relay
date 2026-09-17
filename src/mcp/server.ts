@@ -684,7 +684,7 @@ export const LANE_LADDER_PARTIAL_ADVICE =
  * ⚠ The stopped lane did not fail on its own: the walk stopped it because it showed no activity the
  * relay could see. So "every dispatch lane has now been tried" is false there, and would end the
  * caller's use of dispatch for a task the lane might still finish
- * (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §5). A NAMED lane is never stopped for idleness,
+ * (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §5). A NAMED lane is never stopped for idleness,
  * so this names the call that lets it run to its own timeout.
  */
 export function laneStoppedAdvice(laneId: string): string {
@@ -986,7 +986,7 @@ function laneSummary(lane: DispatchLane, inFlight: number): string {
  * MCP clients (`initialize` `clientInfo.name`) measured to survive a long tool call, so `dispatch`
  * may wait for the answer the way the host's own subagent does, up to `routing.mcp.blockingWaitMs`.
  *
- * Measured 2026-09-17 (`docs/mcp-host-timeouts-2026-09-17.md`): Claude Code 2.1.237 (`claude-code`)
+ * Measured 2026-09-17 (`docs/history/mcp-host-timeouts-2026-09-17.md`): Claude Code 2.1.237 (`claude-code`)
  * completed a 240 s tool call headless, with and without progress. Two hosts are deliberately NOT
  * here: the Claude desktop chat client (`claude-ai`) cancelled at exactly 60 s, and Codex runs a
  * call inside a code-mode `exec` that yields at 31 s. An unknown client keeps `maxWaitMs`.
@@ -1680,7 +1680,7 @@ export class McpDispatchServer {
    * streak of `LANE_UNRELIABLE_STREAK` own failures or more, or marked `failing`. Stopping a lane
    * that may still answer in order to reach those trades an answer for a near-certain failure —
    * measured 2026-09-10, when the walk stopped `free-pool` to try lanes that had answered 0 of 12,
-   * 0 of 34 and 0 of 21 runs (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §1). A lane with no
+   * 0 of 34 and 0 of 21 runs (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §1). A lane with no
    * record counts as reliable: unmeasured is no opinion, never a failure.
    */
   private stopWithheld(view: DispatchView, laneIds: readonly string[], i: number): boolean {
@@ -2035,7 +2035,7 @@ export class McpDispatchServer {
    * The quota death an AGY lane stated only in AGY's own log (`agy-quota-log.ts`). AGY retries a
    * spent quota in silence, so a lane stopped by the walk or by its own timeout printed nothing, and
    * the death reached the relay only when a run happened to last its whole length
-   * (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §4). Undefined unless the lane is AGY, names its
+   * (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §4). Undefined unless the lane is AGY, names its
    * model, and the log is provably this run's — `agyQuotaStatement` refuses everything else.
    */
   private agyLogReport(

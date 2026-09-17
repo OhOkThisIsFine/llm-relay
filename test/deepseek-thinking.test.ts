@@ -9,7 +9,7 @@ import { resolveReasoningMode, loadConfig, resolveTargets } from "../src/config.
  * The Anthropic-path caller's reasoning/thinking intent, carried onto DeepSeek's own vocabulary
  * under the RESOLVED `compat.reasoning: "deepseek"` mode (defaulting from `api.deepseek.com`).
  *
- * FIRST-PARTY EVIDENCE (docs/deepseek-responses-truncation-2026-09-09.md): DeepSeek is thinking ON
+ * FIRST-PARTY EVIDENCE (docs/history/deepseek-responses-truncation-2026-09-09.md): DeepSeek is thinking ON
  * by default; its OpenAI-format controls are `thinking: {type:"disabled"}` / `reasoning_effort:
  * low|high|max`. The same 36k-token probe showed the Anthropic path dropping `thinking:
  * {type:"disabled"}` and burning all 32,000 output tokens on reasoning — no answer. And a multi-turn

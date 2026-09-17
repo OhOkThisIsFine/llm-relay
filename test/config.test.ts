@@ -1627,7 +1627,7 @@ describe("loadConfig — provider compat (thought signature)", () => {
 /**
  * `providers.<name>.wire` — which upstream endpoint an openai-kind provider speaks
  * (backlog item 11: OpenCode Zen's contributor SKUs, Muse Spark 1.3 included, answer 500 on
- * `/chat/completions` and 200 only on `/responses`; docs/muse-spark-1.3-opencode-zen-2026-09-04.md
+ * `/chat/completions` and 200 only on `/responses`; docs/history/muse-spark-1.3-opencode-zen-2026-09-04.md
  * rows 3, 6-8). Resolved onto `ResolvedTarget.wire` exactly like `toolCallIds`/`thoughtSignature`.
  */
 describe("loadConfig — provider wire (Responses vs. Chat upstream)", () => {

@@ -6,7 +6,7 @@ on any provider: current state, what still binds, and where to read next.
 The 2026-08-16 invariant recalibration is **applied**. `CLAUDE.md` §Invariants and
 `docs/project-goals.md` are authoritative — read them as written. The retired rules and their
 replacements are recorded in
-[docs/rubric-recalibration-2026-08-16.md](docs/rubric-recalibration-2026-08-16.md) §2 and in git
+[docs/history/rubric-recalibration-2026-08-16.md](docs/history/rubric-recalibration-2026-08-16.md) §2 and in git
 history; do not reintroduce them.
 
 <!-- audit-code:begin -->

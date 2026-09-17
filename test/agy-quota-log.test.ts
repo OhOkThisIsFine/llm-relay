@@ -7,7 +7,7 @@ import { agyQuotaStatement, parseGoDurationMs, readAgyLog } from "../src/mcp/agy
 /**
  * `agy-quota-log.ts` reads AGY's own quota statement from AGY's log, because AGY retries a spent
  * quota in silence and the dispatch walk stops the lane before AGY prints anything
- * (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §4). The lines below are the real shapes from
+ * (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §4). The lines below are the real shapes from
  * `~/.gemini/antigravity-cli/cli.log`, 2026-09-10.
  */
 const MODEL = "claude-opus-4-6-thinking";

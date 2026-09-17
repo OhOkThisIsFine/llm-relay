@@ -94,7 +94,7 @@ describe("setup-claude", () => {
   });
 
   it("moves the entry this command wrote as \"llm-relay\" to the Desktop-only name", () => {
-    // The old name hid a Code tab session's own "llm-relay" server (docs/mcp-host-timeouts-2026-09-17.md).
+    // The old name hid a Code tab session's own "llm-relay" server (docs/history/mcp-host-timeouts-2026-09-17.md).
     const target = join(dir, "renamed.json");
     writeFileSync(target, JSON.stringify({ mcpServers: { "llm-relay": { command: "llm-relay", args: ["mcp"] } } }));
     expect(setupClaudeDesktop({ targetPath: target, homeDir: dir }).success).toBe(true);

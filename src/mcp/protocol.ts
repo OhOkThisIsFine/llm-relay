@@ -9,7 +9,7 @@
  *
  * ⚠ The known cost, stated so it is not rediscovered: hand-rolling means owning a spec that moves.
  * The mitigation is that this file implements only the stable core. Extensions (Tasks, Apps,
- * sampling) are deliberately absent — see `docs/mcp-dispatch-prior-art-2026-08-30.md` §3.1, which
+ * sampling) are deliberately absent — see `docs/history/mcp-dispatch-prior-art-2026-08-30.md` §3.1, which
  * measured that no client ships Tasks support today.
  *
  * TRANSPORT. MCP stdio framing is one JSON message per line. A message therefore must not contain

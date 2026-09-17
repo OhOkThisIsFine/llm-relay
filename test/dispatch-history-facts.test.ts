@@ -1,7 +1,7 @@
 /**
  * Each lane's history columns on the dispatch view (`laneHistoryFacts` in `src/dispatch.ts`,
  * 2026-09-10): the walk budget per MODE, the raise after abandoned runs, the usual time to answer,
- * and the streak of own failures — `docs/dispatch-giveup-diagnosis-2026-09-10.md` §3 and §9 (F2, F6,
+ * and the streak of own failures — `docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §3 and §9 (F2, F6,
  * F8).
  *
  * The three budget defects that section measured: agent-mode and answer-mode runs shared one window

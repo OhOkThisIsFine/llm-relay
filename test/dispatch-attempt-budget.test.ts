@@ -168,7 +168,7 @@ describe("per-lane attempt budget", () => {
     expect(after?.basis).toBe(before?.basis);
     // ⚠ And since 2026-09-10 the budget RISES rather than standing still. An abandoned run leaves
     // no sample, so a window fed only by runs that finished inside the budget could never show that
-    // the lane needed longer — the floor lock (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3b).
+    // the lane needed longer — the floor lock (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §3b).
     // Each abandonment since the last success doubles it, capped at MAX_ATTEMPT_BUDGET_MS.
     expect(after?.raisedBy).toBe(10);
     expect(after?.ms).toBe(Math.min(MAX_ATTEMPT_BUDGET_MS, (before?.ms ?? 0) * 2 ** 10));

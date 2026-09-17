@@ -118,7 +118,7 @@ describe("keys lifecycle CLI", () => {
 
   it("keeps keys add threat-boundary output byte-for-byte with design §2.3", () => {
     const design = readFileSync(
-      join(process.cwd(), "docs", "credential-fleet-design-2026-08-16.md"),
+      join(process.cwd(), "docs", "history", "credential-fleet-design-2026-08-16.md"),
       "utf8",
     ).split(/\r?\n/u);
     const findBullet = (leadingText: string): string => {

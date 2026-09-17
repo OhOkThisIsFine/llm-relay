@@ -81,7 +81,7 @@ describe("buildDispatch lane stats columns", () => {
     recordLaneRun(cfg, second.report, second.now);
     // ⚠ A FAILED run is counted and adds NO duration (2026-09-10): the window is the lane's time to
     // ANSWER, and a run that did not answer measures nothing about that
-    // (`docs/dispatch-giveup-diagnosis-2026-09-10.md` §3). So the median and p95 below come from the
+    // (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §3). So the median and p95 below come from the
     // two completed runs alone, and the failed run's 50 s appears in neither.
     const third = report("codex-sol", "failed", 50_000, 1_700_000_060_000);
     recordLaneRun(cfg, third.report, third.now);

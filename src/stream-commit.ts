@@ -113,7 +113,7 @@ export type FrontProtocol = "anthropic-messages" | "chat" | "responses";
  * passthrough condition — `openai`-kind means translated on the Anthropic front, while on the
  * OpenAI front only `openai`-kind PLUS `chat` is a passthrough. The two spellings never disagreed:
  * a truth table over all six reachable combinations is in
- * `docs/reviews/clone-07-clone-26-evidence-2026-09-05.md`, and `test/stream-commit.test.ts` pins
+ * `docs/history/reviews/clone-07-clone-26-evidence-2026-09-05.md`, and `test/stream-commit.test.ts` pins
  * every row. Naming it once is what stops a fifth call site inventing a seventh row, because a new
  * front or a new protocol currently has two places to get right and no compiler help.
  */

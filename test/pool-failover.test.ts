@@ -2273,7 +2273,7 @@ describe("probation band — untested free members lead to gather data", () => {
  * outbound Chat body, must announce a token-capped answer as `status: "incomplete"` (buffered AND
  * streamed), and must refuse a truncated `function_call` `arguments` string by NAME so a harness
  * can repair the turn instead of replaying it forever.
- * (docs/deepseek-responses-truncation-2026-09-09.md — the measurement this packet closes.)
+ * (docs/history/deepseek-responses-truncation-2026-09-09.md — the measurement this packet closes.)
  *
  * Every walk here uses >=2 candidates, per this file's own standing rule.
  */
@@ -2484,7 +2484,7 @@ describe("Responses front — no invented cap, and a capped answer announces its
 /**
  * Post-commit crawl watchdog (backlog item 18) — abort a candidate that committed real content
  * and then crawled, cool it, and confirm the CLIENT's own retry (measured in
- * `docs/post-commit-stall-measurement-2026-09-09.md`: Claude Code retries non-streaming, Codex
+ * `docs/history/post-commit-stall-measurement-2026-09-09.md`: Claude Code retries non-streaming, Codex
  * retries streaming) lands on the second, healthy candidate. ≥2 candidates throughout — the
  * standing rule that a single-candidate walk proves nothing about failover.
  *
@@ -2722,7 +2722,7 @@ describe("post-commit crawl watchdog — abort, cool, and let the client's own r
  *   a committed stream that the relay's own watchdog aborts logs the same attempt status and
  *   the same `errorKinds` member on both fronts, pinned by one test that drives both.
  *
- * The mechanism (measured in `docs/post-commit-stall-measurement-2026-09-09.md`, confirmed here
+ * The mechanism (measured in `docs/history/post-commit-stall-measurement-2026-09-09.md`, confirmed here
  * by reading `node_modules/llm-bridge/dist/index.mjs`): the Anthropic front is a direct
  * passthrough for an `anthropic`-kind target, so `withStallWatchdog`/`withCrawlWatchdog` wrap the
  * RAW backend fetch stream, and the relay's own `controller.abort()` makes that stream's reader
@@ -2929,7 +2929,7 @@ describe("post-commit STALL watchdog on a TRANSLATED stream — the Responses (a
 });
 
 /**
- * F10/F11 (2026-09-10, docs/deepseek-responses-truncation-2026-09-09.md): a `"deepseek"`-compat
+ * F10/F11 (2026-09-10, docs/history/deepseek-responses-truncation-2026-09-09.md): a `"deepseek"`-compat
  * candidate's outbound thinking/reasoning decision must reach the wire correctly AND must not leak
  * onto a sibling candidate of the SAME walk. Every case here uses TWO candidates — the
  * deepseek-compat one first (scripted to fail, so the walk reaches the plain one) — per this
