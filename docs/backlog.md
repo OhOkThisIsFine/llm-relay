@@ -59,3 +59,27 @@
   tier, sends the operator-entered control token on `POST /dispatch`, and re-reads the ladder after
   the response; the token is never persisted by the page and never appears in the snapshot.
 
+- **A terminal `dispatch_status` does not carry the answer (2026-09-16, medium).** `toolStatus`
+  in `src/mcp/server.ts` returns `describeJob` in every state; the answer body is reachable only
+  through `dispatch_result`. A caller that polls status and never calls result can poll a finished
+  job indefinitely — measured on this machine: one wrapper polled a job 2,023 times over 71 minutes
+  and returned nothing, though the lane had answered. **Property:** once `job.status` leaves
+  `running`, `dispatch_status` returns the same text `dispatch_result` returns (`jobAnswer`), so
+  the first poll that sees a finished job already holds the answer; a running job keeps the short
+  form; `dispatch_result` is unchanged. Also verify while there: whether `dispatch_result` from a
+  second MCP connection finds a job the first connection dispatched, now that `job-archive.ts` is
+  on disk (v0.82.0) — a 2026-09-16 observation says it did not.
+
+- **An agent-mode lane's result does not say what the lane wrote (2026-09-16, medium).** The
+  runner checks that `cwd` exists and sits inside `routing.mcp.allowedRoots` (`checkCwd`) and binds
+  read-only tool flags when asked (`readonly-boundary.ts`), but never compares the tree before and
+  after the run. A caller learns what changed only by running `git status` itself, and a cancelled
+  lane leaves files behind the same way a completed one does — measured: a lane asked to audit
+  wrote an unrequested deliverable into a repository root and nothing reported it. **Property:**
+  for an agent-mode job whose `cwd` is inside a git work tree, `lane-runner.ts` records
+  `git status --porcelain --untracked-files=all` at start and at every terminal state (completed,
+  failed, timed out, cancelled, killed); `jobAnswer` appends a `tree delta (<cwd>):` block listing
+  paths that appeared, changed status or vanished, or `tree delta: none`; an optional `dispatch`
+  argument `scope: string[]` (paths or globs relative to `cwd`) tags every delta path outside it
+  `OUT OF SCOPE`. Report only — the relay never refuses or reverts; the caller's own gates decide.
+

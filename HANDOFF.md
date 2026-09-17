@@ -2,9 +2,23 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-16 (unreleased, on top of v0.81.0)
+## 0. State as of 2026-09-17 (on top of v0.82.1)
 
-- **What this lap shipped — the backlog-clearing lap.** Owner instruction: clear up everything from
+- **What the 2026-09-17 lap shipped — the relay agent's model line (v8).** Owner direction
+  2026-09-16: the generated `~/.claude/agents/relay.md` must never run on the calling session's
+  model ("there is absolutely no reason for Fable to be running a dispatch like that"). `llm-relay
+  setup` now writes `model: haiku` (`DEFAULT_RELAY_AGENT_MODEL`), accepts `--relay-model <alias>`,
+  and refuses `inherit` by name at the CLI and in `installRelayAgent` (`relayAgentModelRefusal`).
+  This reverses the v4 (2026-09-04) direction "do not hard-code a model name"; both measurements
+  are recorded above `DEFAULT_RELAY_AGENT_MODEL` in `src/setup-claude.ts` — `haiku` failed the
+  echo test on the v1 template and passed it on v7 (2026-09-16, two tool calls, verbatim answer,
+  real provenance line). The Codex agent file has no model key and is untouched. **Immediate
+  next:** none from this lap. ⚠ An installed `relay.md` is read by Claude Code once per session:
+  after `llm-relay setup` regenerates it, a new session is needed before the v8 marker shows.
+
+### 0.1 Prior lap (2026-09-16, v0.82.0 and v0.82.1)
+
+- **What that lap shipped — the backlog-clearing lap.** Owner instruction: clear up everything from
   the backlog and open bugs, orchestrated through parallel relay-agent dispatches. Eight pieces
   landed, each independently gate-verified (typecheck, full suite, dashboard checks, package
   checks) after merge, not just trusted from the dispatching agent's own report:
@@ -52,7 +66,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   blocked on something outside this repo (a vendor, the owner's own keyboard, or a follow-up SPA
   change nobody has started).
 
-### 0.1 Prior lap (2026-09-10, v0.81.0)
+### 0.2 Prior lap (2026-09-10, v0.81.0)
 
 - **What that lap shipped — the dispatch give-up fixes.** Diagnosis:
   [docs/dispatch-giveup-diagnosis-2026-09-10.md](docs/dispatch-giveup-diagnosis-2026-09-10.md).
@@ -104,7 +118,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   says never to reject it). The three DeepSeek request-shape refusals in the queue are the
   F10/F11 defects this lap fixed; they should stop once the daemon runs v0.81.0.
 
-### 0.2 Previous laps
+### 0.3 Previous laps
 
 - **v0.78.0–v0.80.0 (2026-09-09/10).** The 27-items lap closed every backlog entry open at
   `3abbafd` (route B `wire: "responses"`, the probation band, the first-byte deadline, the crawl
@@ -132,7 +146,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   not a calibrated statistic; never point the HTTP path's numbers at a lane. Full record:
   [docs/lane-walk-safety-review-2026-09-08.md](docs/lane-walk-safety-review-2026-09-08.md).
 
-### 0.3 Offload, measured
+### 0.4 Offload, measured
 
 Free lanes CANNOT do open-ended reconnaissance here — 7 of 7 packets fabricated on 2026-09-05.
 They CAN review a concrete diff against a stated claim, and they carry a mechanical rewrite with
@@ -151,7 +165,7 @@ running and reading: one lane's test passed with its fix removed, one lane's six
 silently changed a legacy rule, one lane's threshold triple could never fire, and one lane wrote
 the DeepSeek key literal into a scratch launcher despite a brief that forbade it.
 
-### 0.4 Earlier releases
+### 0.5 Earlier releases
 
 Earlier releases are deliberately not restated here. `git log --oneline`, the tags, and the dated
 documents under `docs/` are the trail; what survived each release lives in the `CLAUDE.md` rows

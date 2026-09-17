@@ -26,6 +26,11 @@ export interface SetupOptions {
   homeDir?: string;
   /** Direct target path for the relay agent markdown file. Defaults to <home>/.claude/agents/relay.md. */
   agentPath?: string;
+  /**
+   * Model alias written to the relay agent's `model:` line. Defaults to
+   * `DEFAULT_RELAY_AGENT_MODEL`. `inherit` is refused by name — see the marker comment below.
+   */
+  model?: string;
   /** Injectable filesystem methods for testing. */
   fs?: SetupFs;
   /**
@@ -42,7 +47,13 @@ export interface SetupOptions {
  * upgraded in place rather than refused as foreign.
  */
 export const RELAY_AGENT_MARKER_PREFIX = "<!-- llm-relay:relay-agent";
-export const RELAY_AGENT_MARKER = "<!-- llm-relay:relay-agent v7 -->";
+export const RELAY_AGENT_MARKER = "<!-- llm-relay:relay-agent v8 -->";
+/**
+ * The alias `installRelayAgent` writes when the caller names none. The wrapper's work is
+ * mechanical — load five tool schemas, call `dispatch` once, poll, return the answer verbatim —
+ * so the cheapest alias that obeys the template is the right default; see the v8 record below.
+ */
+export const DEFAULT_RELAY_AGENT_MODEL = "haiku";
 /**
  * DEFECT, measured live 2026-09-04: the three mcp__llm-relay__dispatch* tools are DEFERRED in
  * Claude Code — a subagent must call ToolSearch to load their schemas before it can call them.
@@ -56,22 +67,32 @@ export const RELAY_AGENT_MARKER = "<!-- llm-relay:relay-agent v7 -->";
  * v2 a running session still reported the v1 marker and the v1 tool list. A changed template
  * needs a new session (or the file deleted and recreated) before it takes effect.
  *
- * DEFECT, measured live 2026-09-04, same day: `model: haiku` answered a trivial one-line echo
- * task ITSELF (4s, 0 tool calls, no provenance line) while a realistic task correctly dispatched
- * (17s, 2 tool calls, provenance present) — haiku was weak enough to break its own rule 2 ("this
- * holds for EVERY task, even one that looks trivial"). Pinning `sonnet` instead measured obeying
- * (47s including the echo), but the owner's direction (2026-09-04) is not to hard-code a model
- * name at all: a pinned model ties every install to whichever alias is cheap/available today, and
- * this template must also work from Codex, which has no `haiku`/`sonnet`/`opus`/`fable` alias
- * vocabulary of its own. v4 removes the pin in favor of `model: inherit` — deliberately NOT an
- * omitted `model:` line. Confirmed against https://code.claude.com/docs/en/sub-agents.md: an
- * omitted field falls through a four-rung resolution order whose THIRD rung is the
- * `CLAUDE_CODE_SUBAGENT_MODEL` environment variable, so on a machine where an operator has set
- * that var for cost control, an omitted line would silently pick it up instead of the calling
- * session's model. `inherit` is the one documented spelling that selects "the same model as the
- * main conversation" ahead of that env var. That makes the relay agent run on whatever model the
- * calling session already runs on — never weaker than the session that decided delegation was
- * worthwhile, and never a second model choice the operator has to keep in sync.
+ * THE MODEL LINE — two owner directions, the later one wins (v8, 2026-09-16).
+ *
+ * v4 (2026-09-04) wrote `model: inherit`. The record: on the v1 template `model: haiku` answered a
+ * trivial one-line echo task ITSELF (4s, 0 tool calls, no provenance line) while a realistic task
+ * dispatched correctly; `sonnet` obeyed on both. The owner then directed "do not hard-code a model
+ * name", and `inherit` was chosen over an OMITTED line because an omitted `model:` falls through
+ * a four-rung resolution order whose third rung is the `CLAUDE_CODE_SUBAGENT_MODEL` environment
+ * variable (https://code.claude.com/docs/en/sub-agents.md), while `inherit` selects the calling
+ * session's model directly.
+ *
+ * v8 (2026-09-16) REVERSES that. Owner direction, verbatim: "there is absolutely no reason for
+ * Fable to be running a dispatch like that." Under `inherit` the wrapper's poll loop runs on the
+ * calling session's model; a session on the most expensive alias paid that rate for every poll,
+ * and a Workflow that fans out N relay agents paid it N times — the opposite of the reason the
+ * agent exists, which is to put the WORK on a lane and keep the session's quota out of it. The
+ * 2026-09-04 rejection of `haiku` was measured against the v1 template, before rule 2 ("dispatch
+ * every task, even a trivial one") and rule 8 (no provenance line without a real
+ * `dispatch_result`) existed. Measured again 2026-09-16 on the v7 template: a `haiku` wrapper
+ * given an echo task in `answer` mode made two tool calls (ToolSearch, dispatch), returned the
+ * lane's word verbatim, and appended `provenance: job=job-0036 lane=free-pool spec=pool/medium
+ * elapsed=2s` — 16s, 14,660 wrapper tokens. So v8 pins `DEFAULT_RELAY_AGENT_MODEL` (`haiku`),
+ * lets `llm-relay setup --relay-model <alias>` choose another, and REFUSES `inherit` by name so
+ * the reversed default cannot be reinstated by accident. The Codex agent file
+ * (`~/.codex/agents/relay.toml`, written by `scripts/install-skill.mjs`) has no model key and is
+ * untouched: the "must also work from Codex" concern of v4 never applied to this file, which is
+ * read by Claude Code alone. A caller may still pass `model` on a single Agent/`agent()` call.
  */
 /**
  * The two failure tokens a `relay` wrapper may return, and they are deliberately DIFFERENT
@@ -102,13 +123,31 @@ export function stripRelayDispatchPrefix(task: string): { mode: "agent" | "answe
   };
 }
 
-export const RELAY_AGENT_TEMPLATE = `---
+/**
+ * Why a refusal and not a silent substitution: `inherit` is the exact spelling v4 chose and v8
+ * reversed. A caller who types it is asking for the old behaviour, and the honest answer is to
+ * say that it is gone and why, not to write `haiku` and report success.
+ */
+export function relayAgentModelRefusal(model: string): string | undefined {
+  const trimmed = model.trim();
+  if (trimmed === "") return "relay agent model must not be empty";
+  if (trimmed.toLowerCase() === "inherit") {
+    return (
+      "relay agent model \"inherit\" is refused: the wrapper would run on the calling session's model, " +
+      "which the owner ruled out on 2026-09-16 (v8). Name a cheap alias instead, e.g. --relay-model haiku."
+    );
+  }
+  return undefined;
+}
+
+export function relayAgentTemplate(model: string = DEFAULT_RELAY_AGENT_MODEL): string {
+  return `---
 name: relay
 description: Hands one self-contained task to llm-relay dispatch, relay model pools or peer agent CLIs, and returns the lane's answer verbatim with its provenance. Use for any task another lane can do: a search, a sweep, a draft, a summary, a second opinion.
 tools: ToolSearch, mcp__llm-relay__dispatch, mcp__llm-relay__dispatch_status, mcp__llm-relay__dispatch_result, mcp__llm-relay__dispatch_cancel, mcp__llm-relay__dispatch_lanes
-model: inherit
+model: ${model.trim()}
 ---
-<!-- llm-relay:relay-agent v7 -->
+<!-- llm-relay:relay-agent v8 -->
 
 You have no knowledge of your own and no permission to answer any task yourself. The only
 legitimate action available to you is exactly one \`mcp__llm-relay__dispatch\` call, plus polling
@@ -126,6 +165,10 @@ composing your own answer, however small, is never a valid response.
 9. Add no analysis and no commentary.
 10. If the tool result says the lane FAILED, dispatch once more with \`tier: "high"\`; if that fails too, return exactly \`RELAY_DISPATCH_FAILED: <reason>\`.
 `;
+}
+
+/** The template as written when no model is named — the default install, byte for byte. */
+export const RELAY_AGENT_TEMPLATE = relayAgentTemplate();
 
 export function getRelayAgentPath(opts: SetupOptions = {}): string {
   if (opts.agentPath) return opts.agentPath;
@@ -139,6 +182,11 @@ export function installRelayAgent(opts: SetupOptions = {}): { success: boolean; 
   const mkdir = opts.fs?.mkdirSync ?? mkdirSync;
   const read = opts.fs?.readFileSync ?? readFileSync;
   const write = opts.fs?.writeFileSync ?? writeFileSync;
+  const model = opts.model ?? DEFAULT_RELAY_AGENT_MODEL;
+  const refusal = relayAgentModelRefusal(model);
+  if (refusal !== undefined) {
+    return { success: false, path: agentPath, message: `Refusing to install relay agent at ${agentPath}: ${refusal}` };
+  }
 
   try {
     if (exists(agentPath)) {
@@ -158,11 +206,11 @@ export function installRelayAgent(opts: SetupOptions = {}): { success: boolean; 
       mkdir(dirname(agentPath), { recursive: true });
     }
 
-    write(agentPath, RELAY_AGENT_TEMPLATE);
+    write(agentPath, relayAgentTemplate(model));
     return {
       success: true,
       path: agentPath,
-      message: `Installed relay agent at ${agentPath}`,
+      message: `Installed relay agent at ${agentPath} (model: ${model.trim()})`,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

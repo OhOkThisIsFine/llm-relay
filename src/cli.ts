@@ -166,6 +166,7 @@ export const CANONICAL_VALUE_FLAGS = [
   // routed` was parsed as the positional lane id "routed" and reported as a missing lane.
   "--host",
   "--client",
+  "--relay-model",
   "--scope",
   "--credential",
   "--include",
@@ -372,6 +373,11 @@ ${formatTextTable([
   ["--host <state>", "Override host detection: routed|bypassed|unknown."],
   ["--next-command", "Print only the runnable command for the next lane."],
   ["--json", "Print JSON."],
+], "  ")}
+
+Setup options:
+${formatTextTable([
+  ["--relay-model <alias>", "Model line of the installed relay agent (default: haiku; inherit is refused)."],
 ], "  ")}
 
 General options:
@@ -1476,7 +1482,7 @@ type CliOptionSpec = Readonly<Record<string, readonly string[]>>;
 export const CLI_OPTIONS: CliOptionSpec = {
   proxy: ["--config", "--default", "--mode", "--listen", "--ping"],
   onboard: ["--config", "--import", "--force"],
-  setup: [],
+  setup: ["--relay-model"],
   "check-keys": ["--config"],
   models: ["--config", "--provider", "--refresh"],
   ping: ["--config", "--provider", "--ping"],
@@ -4220,7 +4226,7 @@ import { probeAllPools, type MemberVerdict } from "./pool-health.js";
 import { runInteractiveOnboarding, getOnboardingStatusList } from "./onboarding.js";
 import { detectHosts } from "./installed-hosts.js";
 import { importKeysFromFile } from "./key-import.js";
-import { setupClaudeCli, setupClaudeDesktop } from "./setup-claude.js";
+import { relayAgentModelRefusal, setupClaudeCli, setupClaudeDesktop } from "./setup-claude.js";
 import { getTelemetryReport } from "./telemetry.js";
 import { globalCircuitBreaker } from "./circuit-breaker.js";
 
@@ -4402,13 +4408,21 @@ function runOnboardSubcommand(cfg: Config): void {
   });
 }
 
-function runSetupSubcommand(target: string | undefined): void {
+function runSetupSubcommand(target: string | undefined, relayModel: string | undefined): void {
+  // Validated HERE as well as in `installRelayAgent`: the CLI setup path reports an agent-file
+  // refusal as one line among its output and still exits 0 (a foreign file is not the operator's
+  // mistake), but a refused alias IS the operator's own argument, so it fails the command outright.
+  if (relayModel !== undefined) {
+    const refusal = relayAgentModelRefusal(relayModel);
+    if (refusal !== undefined) configCommandError(`setup: ${refusal}`);
+  }
+  const setupOpts = relayModel === undefined ? {} : { model: relayModel };
   if (target === "claude-desktop" || target === "desktop") {
-    const res = setupClaudeDesktop();
+    const res = setupClaudeDesktop(setupOpts);
     process.stdout.write(`${res.message}\n`);
     if (!res.success) process.exit(1);
   } else if (target === undefined || target === "claude-cli" || target === "cli" || target === "claude") {
-    const res = setupClaudeCli();
+    const res = setupClaudeCli(setupOpts);
     if (!res.success) process.exit(1);
   } else {
     configCommandError(`setup: unknown target "${target}" (targets: claude-cli, claude-desktop)`);
@@ -4465,7 +4479,7 @@ function runKeysSubcommand(action: string | undefined, target: string | undefine
     return;
   }
   if (arg2 === "setup") {
-    runSetupSubcommand(arg3);
+    runSetupSubcommand(arg3, argValue("--relay-model"));
     return;
   }
   if (arg2 === "telemetry") {

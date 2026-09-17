@@ -2,7 +2,7 @@ import { describe, it, expect, afterAll } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { getClaudeDesktopConfigPath, setupClaudeDesktop, setupClaudeCli, installRelayAgent, RELAY_AGENT_MARKER, RELAY_AGENT_TEMPLATE, type SetupFs } from "../src/setup-claude.js";
+import { getClaudeDesktopConfigPath, setupClaudeDesktop, setupClaudeCli, installRelayAgent, relayAgentModelRefusal, relayAgentTemplate, DEFAULT_RELAY_AGENT_MODEL, RELAY_AGENT_MARKER, RELAY_AGENT_TEMPLATE, type SetupFs } from "../src/setup-claude.js";
 import { dirname } from "node:path";
 import { homedir } from "node:os";
 
@@ -299,14 +299,14 @@ describe("setup-claude", () => {
   // calls the pools free, because paid DeepSeek leads them (owner decision 2026-09-10: correct every
   // text that calls that lane free). Flipped here in the same commit as the source, per the
   // standing protocol.
-  it("(j) the marker is bumped to v7", () => {
-    expect(RELAY_AGENT_MARKER).toContain("v7");
-    expect(RELAY_AGENT_MARKER).not.toContain("v6");
+  it("(j) the marker is bumped to v8", () => {
+    expect(RELAY_AGENT_MARKER).toContain("v8");
+    expect(RELAY_AGENT_MARKER).not.toContain("v7");
     const injectedHome = join(dir, "injected-home-j");
     installRelayAgent({ homeDir: injectedHome });
     const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
     const content = readFileSync(agentPath, "utf8");
-    expect(content).toContain("<!-- llm-relay:relay-agent v7 -->");
+    expect(content).toContain("<!-- llm-relay:relay-agent v8 -->");
     expect(content).not.toMatch(/free model pools/i);
   });
 
@@ -343,15 +343,13 @@ describe("setup-claude", () => {
     expect(afterContent).not.toContain("relay-agent v2 -->");
   });
 
-  // --- Defect fix, 2026-09-04 (same day, found after the ToolSearch fix above): `model: haiku`
-  // answered a trivial echo task ITSELF (4s, 0 tool calls, no provenance) while a realistic task
-  // correctly dispatched (17s, 2 tool calls, provenance) — haiku was too weak to reliably obey its
-  // own rule 2. The owner's direction was not to hard-code a model name at all (the template must
-  // also work from Codex, which has no haiku/sonnet/opus alias vocabulary), so v4 removes the pin
-  // in favor of `model: inherit` rather than an omitted `model:` line — confirmed against
-  // https://code.claude.com/docs/en/sub-agents.md that an omitted field can fall through to the
-  // `CLAUDE_CODE_SUBAGENT_MODEL` environment variable before ever reaching the calling session's
-  // model, while `inherit` selects the calling session's model directly.
+  // --- The model line, two directions (the v8 record in src/setup-claude.ts holds both):
+  // v4 (2026-09-04) wrote `model: inherit` after `haiku` on the v1 template answered an echo task
+  // itself. v8 (2026-09-16) reverses it on the owner's direction — the wrapper must never run on
+  // the calling session's model — after `haiku` on the v7 template was measured obeying (two tool
+  // calls, verbatim answer, real provenance line). The upgrade tests below keep their historical
+  // fixtures (a v3 or v4 file with whatever model line it carried) because what they assert is
+  // ownership recognition, not the model line.
 
   it("(m) a file carrying the previous v3 marker is recognised as our own and upgraded to v4, not refused as foreign", () => {
     const injectedHome = join(dir, "injected-home-m");
@@ -387,16 +385,86 @@ describe("setup-claude", () => {
     expect(afterContent).not.toContain("relay-agent v4 -->");
   });
 
-  it("(p) the content pins no model alias — model: inherit selects the calling session's model, never a hardcoded model: haiku or model: sonnet", () => {
+  it("(p) the default install pins model: haiku — never model: inherit (v8, owner direction 2026-09-16)", () => {
     const injectedHome = join(dir, "injected-home-p");
-    installRelayAgent({ homeDir: injectedHome });
+    const res = installRelayAgent({ homeDir: injectedHome });
+    expect(res.success).toBe(true);
+    expect(res.message).toContain("(model: haiku)");
     const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
     const content = readFileSync(agentPath, "utf8");
     const modelLine = content.split("\n").find((line) => line.startsWith("model:"));
-    expect(modelLine).toBe("model: inherit");
-    expect(content).not.toContain("model: haiku");
-    expect(content).not.toContain("model: sonnet");
-    expect(content).not.toContain("model: opus");
+    expect(modelLine).toBe(`model: ${DEFAULT_RELAY_AGENT_MODEL}`);
+    expect(DEFAULT_RELAY_AGENT_MODEL).toBe("haiku");
+    expect(content).not.toContain("model: inherit");
+    // The exported constant is the default install, byte for byte.
+    expect(content).toBe(RELAY_AGENT_TEMPLATE);
+  });
+
+  it("(q) --relay-model chooses the alias: installRelayAgent({ model }) writes that model line, trimmed, and reports it", () => {
+    const injectedHome = join(dir, "injected-home-q");
+    const res = installRelayAgent({ homeDir: injectedHome, model: " sonnet " });
+    expect(res.success).toBe(true);
+    expect(res.message).toContain("(model: sonnet)");
+    const content = readFileSync(join(injectedHome, ".claude", "agents", "relay.md"), "utf8");
+    const modelLine = content.split("\n").find((line) => line.startsWith("model:"));
+    expect(modelLine).toBe("model: sonnet");
+    expect(content).toBe(relayAgentTemplate("sonnet"));
+    expect(content).toContain(RELAY_AGENT_MARKER);
+  });
+
+  it("(r) model: inherit is refused by name, in any case, and nothing is written; an empty alias is refused too", () => {
+    const injectedHome = join(dir, "injected-home-r");
+    const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
+    for (const model of ["inherit", "INHERIT", " Inherit "]) {
+      const res = installRelayAgent({ homeDir: injectedHome, model });
+      expect(res.success).toBe(false);
+      expect(res.message).toMatch(/"inherit" is refused/u);
+      expect(res.message).toContain("2026-09-16");
+      expect(existsSync(agentPath)).toBe(false);
+    }
+    const empty = installRelayAgent({ homeDir: injectedHome, model: "   " });
+    expect(empty.success).toBe(false);
+    expect(empty.message).toMatch(/must not be empty/u);
+    expect(existsSync(agentPath)).toBe(false);
+    expect(relayAgentModelRefusal("haiku")).toBeUndefined();
+    expect(relayAgentModelRefusal("claude-haiku-4-5-20251001")).toBeUndefined();
+  });
+
+  it("(s) a file carrying the previous v7 marker with model: inherit is recognised as our own and upgraded to v8 with the default model", () => {
+    const injectedHome = join(dir, "injected-home-s");
+    const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
+    mkdirSync(dirname(agentPath), { recursive: true });
+    const v7 =
+      "---\nname: relay\ntools: ToolSearch, mcp__llm-relay__dispatch, mcp__llm-relay__dispatch_status, mcp__llm-relay__dispatch_result, mcp__llm-relay__dispatch_cancel, mcp__llm-relay__dispatch_lanes\nmodel: inherit\n---\n<!-- llm-relay:relay-agent v7 -->\n\n1. Old rule text.\n";
+    writeFileSync(agentPath, v7);
+    const res = installRelayAgent({ homeDir: injectedHome });
+    expect(res.success).toBe(true);
+    const content = readFileSync(agentPath, "utf8");
+    expect(content).toBe(RELAY_AGENT_TEMPLATE);
+    expect(content).toContain("<!-- llm-relay:relay-agent v8 -->");
+    expect(content).not.toContain("model: inherit");
+  });
+
+  it("(t) setupClaudeCli and setupClaudeDesktop pass the model option through to the installed agent", () => {
+    const cliHome = join(dir, "injected-home-t-cli");
+    setupClaudeCli({ homeDir: cliHome, model: "sonnet", out: () => {} });
+    expect(readFileSync(join(cliHome, ".claude", "agents", "relay.md"), "utf8")).toContain("model: sonnet");
+
+    const desktopHome = join(dir, "injected-home-t-desktop");
+    const targetPath = join(desktopHome, "claude_desktop_config.json");
+    const res = setupClaudeDesktop({ homeDir: desktopHome, targetPath, model: "sonnet" });
+    expect(res.success).toBe(true);
+    expect(readFileSync(join(desktopHome, ".claude", "agents", "relay.md"), "utf8")).toContain("model: sonnet");
+
+    // A refused alias through the CLI helper: success stays true (the helper reports), the
+    // refusal line is in the output, and no agent file appears. The `llm-relay setup` command
+    // itself rejects the alias before reaching here — see cli.ts runSetupSubcommand.
+    const refusedHome = join(dir, "injected-home-t-refused");
+    const lines: string[] = [];
+    const refused = setupClaudeCli({ homeDir: refusedHome, model: "inherit", out: (line) => lines.push(line) });
+    expect(refused.success).toBe(true);
+    expect(lines.some((line) => /"inherit" is refused/u.test(line))).toBe(true);
+    expect(existsSync(join(refusedHome, ".claude", "agents", "relay.md"))).toBe(false);
   });
 });
 
