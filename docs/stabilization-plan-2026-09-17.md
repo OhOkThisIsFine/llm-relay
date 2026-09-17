@@ -55,7 +55,7 @@ again before you quote one.
 | 2 | B2a, B2b, M1a, M1b, S4 | Dispatch quality. B2 and M1 both touch `src/mcp/server.ts`: run them in sequence, not in parallel. |
 | 3 | B3a, B3b, B3c | The dashboard ladder panel. In sequence. |
 | 4 | O1 to O5 | Operator tasks. No code. The owner or an operator session does them. |
-| 5 | D1 to D4 | Each needs an owner decision or a strong-model design BEFORE a packet exists. |
+| 5 | D1 to D5 | Each needs an owner decision or a strong-model design BEFORE a packet exists. |
 
 One release after each wave is sufficient. Use the `/release` skill.
 
