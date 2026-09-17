@@ -15,8 +15,15 @@ again before you quote one.
 1. Scope: all filed items plus a live-state survey.
 2. Machine-wide llm-relay product items are included, EXCEPT "a lane that ended without an answer
    is returned as an answer" (declined 2026-09-10 and 2026-09-16; it stays out).
-3. The plan proposes a `capability` value per lane; the owner approves the values before a model
-   applies them.
+3. ~~The plan proposes a `capability` value per lane~~ — REVERSED at the closeout the same day:
+   a lane's capability must come from the synced capability data (leaderboards, OpenRouter), never
+   from a hand-set value. See D6.
+
+**Owner decisions at the closeout (AskUserQuestion, 2026-09-17).**
+- D2 hot reload: APPROVED — design `POST /reload`.
+- D3 growing cooldowns for repeated 5xx and 402: APPROVED — packet S5.
+- D4 operator-declared prices: DECLINED — DeepSeek stays "Unpriced".
+- Capability: derive it from data — design item D6 replaces operator task O1.
 
 ---
 
@@ -52,10 +59,10 @@ again before you quote one.
 |---|---|---|
 | 0 | W0-1, W0-2, W0-3 | Headroom and hygiene. W0-1 unblocks every packet that adds a file. |
 | 1 | B1a, B1b, B1c, B4a, B4b, S2, S3, R1 | Small, independent, low risk. Any order, three at a time. |
-| 2 | B2a, B2b, M1a, M1b, S4 | Dispatch quality. B2 and M1 both touch `src/mcp/server.ts`: run them in sequence, not in parallel. |
+| 2 | B2a, B2b, M1a, M1b, S4, S5 | Dispatch quality and pool health. B2 and M1 both touch `src/mcp/server.ts`: run them in sequence, not in parallel. S5 is in section 8 under D3. |
 | 3 | B3a, B3b, B3c | The dashboard ladder panel. In sequence. |
-| 4 | O1 to O5 | Operator tasks. No code. The owner or an operator session does them. |
-| 5 | D1 to D5 | Each needs an owner decision or a strong-model design BEFORE a packet exists. |
+| 4 | O2 to O5 | Operator tasks. No code. The owner or an operator session does them. O1 is withdrawn. |
+| 5 | D1, D2, D5, D6 | Each needs a strong-model design (or, for D1, the S4 measurement) BEFORE a packet exists. D3 became packet S5; D4 is declined. |
 
 One release after each wave is sufficient. Use the `/release` skill.
 
@@ -84,7 +91,7 @@ One release after each wave is sufficient. Use the `/release` skill.
 - **Proof.** `npm audit --json` shows zero high findings. `GATE` passes. `T(test/validator.test.ts)`
   passes.
 - **Not in scope.** The eight major-version lags in development dependencies (`typescript` 5 → 7,
-  `vite` 6 → 8, `vitest` 4 → 5, `tailwindcss` 3 → 4 and others). See D4.
+  `vite` 6 → 8, `vitest` 4 → 5, `tailwindcss` 3 → 4 and others). See D5.
 
 ### W0-3 [cheap] Prune lapsed rows from `dispatch-exhaustion.json`
 - **Fact.** The file holds four rows whose `until` is in the past. Restore ignores them, so there
@@ -327,21 +334,12 @@ token header is `x-llm-relay-control-token` (`CONTROL_AUTHORIZATION_HEADER`,
 
 ## 7. Wave 4 — operator tasks (no code)
 
-### O1 Approve and apply `capability` values (owner decision 3)
-Evidence is from `~/.llm-relay/dispatch-lane-stats.json` on 2026-09-17.
-
-| Lane | Calls / answered | Proposed `capability` | Evidence |
-|---|---|---|---|
-| `free-pool` | 710 / 566 | none (unbounded) | Answers on all four tiers. It is the default lane. |
-| `agy-gemini` | 215 / 202 | `high` | 94% answered. No separate `xhigh` evidence. |
-| `opencode-muse-spark` | 261 / 190 | `medium` | 27% failed or timed out. `HANDOFF.md` suggests the same. |
-| `agy-claude-sonnet` | 14 / 2 | none | No evidence in either direction. Too few calls. |
-| `agy-claude-opus` | 36 / 0 | none | Never answered. A `capability` does not fix that; see O3. |
-| `anthropic` | 24 / 0 | none | Unreachable for the MCP server by design (`requester=mcp`). The 24 failures are from before v0.81.0. |
-
-Procedure after approval: `llm-relay config set` on each rung (it can address a numbered rung
-since v0.82.0), then restart the daemon, then confirm with `llm-relay dispatch --tier xhigh` that a
-`medium` lane is skipped.
+### O1 WITHDRAWN — do not hand-set `capability` values
+The owner rejected hand-set values (2026-09-17): a lane's capability comes from the synced
+capability data. The lane statistics table this item carried measured whether a lane ANSWERS, not
+what its model can DO, which is the axis confusion `benchmarks.ts` already forbids ("telemetry
+measures whether a deployment answers, not whether the model can reason"). Do not set
+`capability` in `~/.llm-relay/config.json`. See D6.
 
 ### O2 Verify the v0.84.0 walk through a restarted MCP process (`HANDOFF.md` "Not verified yet")
 The owner restarts Claude Desktop. Then, from the Code tab: dispatch a pool task that takes more
@@ -409,6 +407,12 @@ the owner these questions.
   Objects built at startup (breaker, catalog, ping loop, stores) stay.
 - **Recommendation.** (b), designed by a strong model: the hard part is the list of what is safe to
   swap. `setOffload` already mutates the live `Config`, which is the precedent.
+- **DECISION (owner, 2026-09-17): (b) APPROVED.** Next step: a strong model writes
+  `docs/config-reload-design-<date>.md` that names, for every field of `Config`, whether a reload
+  may swap it and which startup object reads it. The design then splits into cheap packets. Until
+  then no cheap model starts this item. Two binding points for the design: `/reload` joins
+  `CONTROL_ROUTES` (the same admission as `POST /stop`), and a config that fails `loadConfig` is
+  refused whole, with the live config untouched.
 
 ### D3 A deployment that fails without end is tried on every walk
 - **True now.** `opencode/mimo-v2.5-free` has 1,221 failures in a row (HTTP 500);
@@ -422,6 +426,47 @@ the owner these questions.
   existing precedent, and the 402 rung already cools for a fixed hour.
 - **Recommendation.** (b). After the decision it is one cheap packet in `src/circuit-breaker.ts`
   with total tables over `CooldownSource`.
+- **DECISION (owner, 2026-09-17): (b) APPROVED, including "a successful health probe ends the
+  cooldown early".** The packet is S5.
+
+#### S5 [mid] Repeated 5xx and 402 failures get growing cooldowns
+- **Verified facts (`src/circuit-breaker.ts` `applyHealthOutcome`).** A 402 without `Retry-After`
+  cools a flat `QUOTA_EXHAUSTED_COOLDOWN_MS` (1 h), source `default`. Another failure without
+  `Retry-After` cools `failureCooldown(elapsedMs)` once `consecutiveFailures` reaches
+  `MAX_FAILURES_BEFORE_TRIP` (2). Any success sets `consecutiveFailures` to 0.
+  `endRateLimitCooldown` ends a cooldown early only when `PROBE_SUCCESS_ENDS_COOLDOWN` allows the
+  source AND `lastStatus` is 429. `rateLimitCoolingCells` selects cells only through
+  `REPROBE_TARGETS_COOLDOWN` and `lastStatus` 429.
+- **Edit.**
+  1. Add `FAILURE_ESCALATION_MS = [10 min, 1 h, 6 h, 24 h]` beside `RATE_LIMIT_ESCALATION_MS`.
+     The step index is `consecutiveFailures - (MAX_FAILURES_BEFORE_TRIP + 1)`, clamped to the last
+     step. An index below 0 means "no ladder step". So failures 1 and 2 behave as today, and
+     failures 3, 4, 5 and 6 get 10 min, 1 h, 6 h and 24 h. Use the existing counter, which
+     `breaker-persistence.ts` already carries; add no new counter.
+  2. Generic failure branch: cooldown = the LONGER of `failureCooldown(elapsedMs).ms` and the
+     ladder step (when there is one). Source `failure-escalation` when the ladder step wins,
+     otherwise the source `failureCooldown` returned. State the indexing in a comment.
+  3. 402 branch without `Retry-After`: cooldown = the LONGER of 1 h and the ladder step, source
+     `failure-escalation` when the ladder wins.
+  4. Add `failure-escalation` to `COOLDOWN_SOURCES`. The two total tables then fail `tsc` until
+     both have a row: `PROBE_SUCCESS_ENDS_COOLDOWN` true, `REPROBE_TARGETS_COOLDOWN` true.
+  5. `endRateLimitCooldown` and `rateLimitCoolingCells`: for source `failure-escalation`, accept a
+     `lastStatus` of 402 or 500–599 instead of 429. Rename neither function (the rename is a
+     separate cleanup). Update their doc comments.
+  6. `src/availability-snapshot.ts` maps cooldown reasons: a `failure-escalation` row with
+     `lastStatus` 402 maps to `rate_limit`, any other to `provider_error`. Find the mapping by Grep
+     for `cooldownSource`; if it is a total table, the compiler names the row.
+- **Tests (`test/circuit-breaker.test.ts`, `test/rate-limit-recovery.test.ts`,
+  `test/breaker-persistence.test.ts`).** Failures 1–2 behave as today; failures 3, 4, 5, 6 cool
+  10 min, 1 h, 6 h, 24 h; a success resets the ladder; a 402 series cools 1 h, then 1 h, then 6 h;
+  a 200 probe ends a `failure-escalation` cooldown whose last status is 500, and does NOT end one
+  whose last status is 401; `rateLimitCoolingCells` lists the escalated cell; a persisted row with
+  source `failure-escalation` restores. One failover test with two candidates on each front proves
+  the escalated member stays in the walk, behind the others.
+- **Proof.** Mutation check: add a seventh `CooldownSource` member and confirm `tsc` fails at both
+  tables; remove it. Remove step 2 and confirm the ladder tests fail.
+- **Docs.** The `circuit-breaker.ts` and `breaker-persistence.ts` rows of `CLAUDE.md`, and
+  `docs/reference.md` where it lists cooldown sources.
 
 ### D4 Paid DeepSeek traffic is 99.9% unpriced (23,217 requests in 7 days, 30 priced)
 - **True now.** DeepSeek publishes no machine-readable price, and the relay never invents one, so
@@ -433,12 +478,55 @@ the owner these questions.
   a mistake stops persistence silently) and the dashboard contract. Strong-model work with reload
   tests.
 - **Recommendation.** (b), in its own lap. It serves the founding metering goal.
+- **DECISION (owner, 2026-09-17): (a) — keep "Unpriced". No work.** Do not propose
+  operator-declared prices again unless the owner raises it.
 
 ### D5 Major development-dependency upgrades
 `typescript` 5.9 → 7.0 (also a RUNTIME dependency for `delegate-gate`), `vite` 6 → 8, `vitest`
 4 → 5, `tailwindcss` 3 → 4, `jsdom` 26 → 30, and three more. None is a defect today.
 Recommendation: one upgrade per lap, `vitest` first, each with the full gate and the package
 baseline measured again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
+
+### D6 A lane's capability must come from the synced capability data (owner correction, 2026-09-17)
+- **Owner statement.** "The capability value is supposed to be set by data scraped from
+  leaderboards, openrouter, etc." The hand-set design is therefore a defect, not a feature to fill
+  in.
+- **True now.** Commit `42b2745` (2026-09-17, an agent's design) added `LadderRung.capability` as a
+  hand-set config value: `applyRungCapability` in `src/config/routing-parser.ts` reads it,
+  `rungCapability` in `src/dispatch.ts` copies it to `DispatchLane.capability`, and
+  `skipIfBelowTier` in `src/mcp/server.ts` skips a rung below the dispatch tier. No rung on this
+  machine sets it, so the skip never fires.
+- **What already exists to derive it.** `getStrength()` (`src/benchmarks.ts`) resolves a model's
+  capability from `docs/tier-data.json` with its basis. `strengthAllowedForEffort(strength,
+  effort)` decides whether a model clears an effort tier (`EFFORT_FLOORS`, an exact SKU match and at
+  least three published signals). The effort pools already use exactly this rule. `rungModel` in
+  `src/dispatch.ts` reads a CLI rung's `--model` argument.
+- **Design (a strong model writes the details; then cheap packets).**
+  1. A pure function `derivedCapability(rung, cfg)` in `src/dispatch.ts` (or a new small module)
+     returns `{ tier: EffortLevel | null; basis; model }`:
+     - a `relay` rung whose spec is `pool/<band>`: the pool's own band (the pool already contains
+       only members that clear it);
+     - a `relay` rung whose spec is `provider/model`, and a `cli` rung with a `--model`: the
+       HIGHEST tier for which `strengthAllowedForEffort(getStrength(model), tier)` is true;
+     - anything else (no model, a model the snapshot does not match exactly, fewer than three
+       signals): `null` — unknown, which means NO limit. Unknown is never "weak".
+  2. `buildDispatch` sets `DispatchLane.capability` from that function, and a new
+     `capabilityBasis` field states the source (`snapshot`, `pool-band`, `unknown`), so
+     `dispatch_lanes` can print where the figure came from.
+  3. The hand-set key: owner to decide in the design review whether to REMOVE it (a config that
+     sets it loads with a "no effect" warning, the B1b pattern) or keep it only as an explicit
+     override that the output labels `operator-declared`. The plan recommends removal: the owner
+     said the value is "supposed to be set by data".
+  4. Model-id matching for CLI lanes is the hard part: AGY and OpenCode spell model ids their own
+     way (`gemini-3.6-flash`, `muse-spark-1.3-contributor-free`). `findTierModel` already strips a
+     price suffix and matches the last path segment; the design must list, per lane binary, which
+     ids match exactly today and which need a labelled alias. Measure it: run the function over the
+     live ladder and record the result in the design document before any packet starts.
+- **Packets after the design.** D6-a pure function plus unit table (inject `tierData`, never pin a
+  real model's band — `CLAUDE.md` gotcha); D6-b wiring in `buildDispatch` plus the rendered basis;
+  D6-c the config key's fate plus docs.
+- **Doc to correct in the same work.** `HANDOFF.md` §0 "Immediate next" tells the owner to set
+  `capability` by hand; that sentence is now wrong. (Corrected in this lap's closeout.)
 
 ---
 

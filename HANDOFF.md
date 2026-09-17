@@ -37,9 +37,12 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   [docs/stabilization-plan-2026-09-17.md](docs/stabilization-plan-2026-09-17.md) splits every open
   backlog entry, the stated residues and the findings of a live survey into packets for cheap
   models, in waves. Start with packet W0-1: the package ceiling has room for two more entries.
-- **Immediate next.** No rung in `~/.llm-relay/config.json` declares `capability` yet, so the
-  lower-tier skip does nothing on this machine until the owner sets one (for example `medium` on
-  the `opencode-muse-spark` rungs). After the owner restarts Claude Desktop: run a Code tab
+- **Owner correction (2026-09-17 closeout): do NOT hand-set a rung's `capability`.** The value
+  must come from the synced capability data (`docs/tier-data.json`), which the v0.84.0 design
+  does not do. Design item D6 of the plan above replaces it. Also decided: `POST /reload` is
+  approved for design (D2), growing cooldowns for repeated 5xx and 402 are approved (packet S5),
+  and operator-declared prices are declined (D4).
+- **Immediate next.** After the owner restarts Claude Desktop: run a Code tab
   dispatch of a pool task that takes more than 60 s, and confirm it answers in one call and that
   `last activity:` names relay traffic. Open backlog: route B, the Codex Desktop check, the
   dashboard pin control, the tree delta for a `killed` job, the unused budget code, and the idle
