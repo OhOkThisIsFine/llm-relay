@@ -2,9 +2,33 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-17 (on top of v0.82.1)
+## 0. State as of 2026-09-17 (on top of v0.82.2)
 
-- **What the 2026-09-17 lap shipped — the relay agent's model line (v8).** Owner direction
+- **What the dispatch-fidelity lap shipped (2026-09-17, lap `f8d56109`).** Goal: dispatch from
+  Claude Desktop, Codex Desktop and other hosts works as closely as possible to each host's
+  native subagent dispatch. Seven commits, `85a7ba2..42b2745`:
+  - Several `llm-relay mcp` processes share the job files, and a terminal `dispatch_status`
+    returns the full answer (`85a7ba2`).
+  - Claude Code gets the answer in ONE call: for `clientInfo.name` `claude-code` the server waits
+    until the job ends and sends `notifications/progress`. Other hosts keep the 25 s ceiling. A
+    1,500 s call passed. Evidence: `docs/mcp-host-timeouts-2026-09-17.md` (`62c7dbf`, `9f341da`).
+  - The lane launcher expands `%VAR%` environment values (or removes one that does not resolve),
+    and an AGY lane gets `--add-dir <cwd>`. The job shows both on a `launch:` line (`9f341da`).
+  - An agent-mode answer ends with a `tree delta` block: what the lane changed in `git status`,
+    with an optional `scope` that marks paths OUT OF SCOPE. Report only (`4e1899e`).
+  - The walk does not stop a lane that still works at its budget (output, or a tree change, in
+    the last 60 s), and skips a rung whose new `capability` is below the dispatch tier (`42b2745`).
+  - The Codex `relay` agent template writes provenance only from a real dispatch result
+    (`05db5b8`), and a test replays a lane that outlives `waitMs` (`d984b87`).
+- **Immediate next.** No rung in `~/.llm-relay/config.json` declares `capability` yet, so the
+  lower-tier skip does nothing on this machine until the owner sets one (for example `medium` on
+  the `opencode-muse-spark` rungs). The live Claude Code check needs a restart of the llm-relay MCP
+  connection, because the desktop app keeps the old MCP process. Open backlog: route B, the Codex
+  Desktop check, the dashboard pin control, and the tree delta for a `killed` job.
+
+### 0.1 Prior lap (2026-09-17, v0.82.2)
+
+- **What that lap shipped — the relay agent's model line (v8).** Owner direction
   2026-09-16: the generated `~/.claude/agents/relay.md` must never run on the calling session's
   model ("there is absolutely no reason for Fable to be running a dispatch like that"). `llm-relay
   setup` now writes `model: haiku` (`DEFAULT_RELAY_AGENT_MODEL`), accepts `--relay-model <alias>`,
@@ -16,7 +40,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   next:** none from this lap. ⚠ An installed `relay.md` is read by Claude Code once per session:
   after `llm-relay setup` regenerates it, a new session is needed before the v8 marker shows.
 
-### 0.1 Prior lap (2026-09-16, v0.82.0 and v0.82.1)
+### 0.2 Prior lap (2026-09-16, v0.82.0 and v0.82.1)
 
 - **What that lap shipped — the backlog-clearing lap.** Owner instruction: clear up everything from
   the backlog and open bugs, orchestrated through parallel relay-agent dispatches. Eight pieces
@@ -66,7 +90,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   blocked on something outside this repo (a vendor, the owner's own keyboard, or a follow-up SPA
   change nobody has started).
 
-### 0.2 Prior lap (2026-09-10, v0.81.0)
+### 0.3 Prior lap (2026-09-10, v0.81.0)
 
 - **What that lap shipped — the dispatch give-up fixes.** Diagnosis:
   [docs/dispatch-giveup-diagnosis-2026-09-10.md](docs/dispatch-giveup-diagnosis-2026-09-10.md).
@@ -118,7 +142,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   says never to reject it). The three DeepSeek request-shape refusals in the queue are the
   F10/F11 defects this lap fixed; they should stop once the daemon runs v0.81.0.
 
-### 0.3 Previous laps
+### 0.4 Previous laps
 
 - **v0.78.0–v0.80.0 (2026-09-09/10).** The 27-items lap closed every backlog entry open at
   `3abbafd` (route B `wire: "responses"`, the probation band, the first-byte deadline, the crawl
@@ -146,7 +170,7 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   not a calibrated statistic; never point the HTTP path's numbers at a lane. Full record:
   [docs/lane-walk-safety-review-2026-09-08.md](docs/lane-walk-safety-review-2026-09-08.md).
 
-### 0.4 Offload, measured
+### 0.5 Offload, measured
 
 Free lanes CANNOT do open-ended reconnaissance here — 7 of 7 packets fabricated on 2026-09-05.
 They CAN review a concrete diff against a stated claim, and they carry a mechanical rewrite with
@@ -165,7 +189,7 @@ running and reading: one lane's test passed with its fix removed, one lane's six
 silently changed a legacy rule, one lane's threshold triple could never fire, and one lane wrote
 the DeepSeek key literal into a scratch launcher despite a brief that forbade it.
 
-### 0.5 Earlier releases
+### 0.6 Earlier releases
 
 Earlier releases are deliberately not restated here. `git log --oneline`, the tags, and the dated
 documents under `docs/` are the trail; what survived each release lives in the `CLAUDE.md` rows
