@@ -63,3 +63,19 @@ Claude Code returned `DONE after 1500s` with `is_error: false`. The run cost USD
 So Claude Code 2.1.237 held one tool call for 25 minutes without any progress notification. The
 30-minute stdio idle timeout was not reached. The 25-minute default cap is therefore measured, not
 only documented. The progress notifications stay: they show the caller that the lane still runs.
+
+## Live check in the desktop Code tab (v0.83.1, after a desktop restart)
+
+The blocking wait did NOT start. `job-0125` (a lane told to run `sleep 120`) returned a job id at
+25 s, and it completed at 133 s.
+
+- The Code tab engine is not the cause. `claude.exe` 2.1.271 sent `clientInfo.name: "claude-code"`
+  and `_meta.progressToken` to a probe server, in `-p` mode and in `--input-format stream-json` mode.
+- The cause is the process that served the call. The job journal names owner pid 33048. The parent
+  of that process is the Claude Desktop app (`app-2.110.1\claude.exe`), not the Code tab engine.
+  `llm-relay` is in `claude_desktop_config.json` AND in `~/.claude.json`. The Code tab session
+  received the desktop-hosted server, and that server's client is the desktop app. The desktop
+  logs name that client `claude-ai`, which is not in `BLOCKING_WAIT_CLIENTS`. The engine's own
+  `llm-relay mcp` processes also run, but this session did not use them.
+- Not measured: whether the desktop app cancels a Code tab call at 60 s, as it does a chat call.
+  A probe server in `claude_desktop_config.json` and a desktop restart can measure it.
