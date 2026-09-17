@@ -4,6 +4,22 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 
 ## 0. State as of 2026-09-17 (v0.84.0)
 
+- **The documentation is now usable by a third party (2026-09-17, lap `ca8814f5`, commit
+  `cfb5420`, no source change).** Owner instruction: third-party contributors and testers are
+  coming, so everything must be clear, succinct and free of personal information.
+  - `docs/` top level holds LIVE documents only. The 73 dated records moved to `docs/history/`,
+    whose README states they are evidence and points at the live document for each subject. The
+    rule is now in `CLAUDE.md`: a dated file is WRITTEN into `docs/history/`, never moved later.
+  - Machine paths and personal identifiers are scrubbed from every tracked text file.
+  - New: `CONTRIBUTING.md` (set up, the gate, the seven invariants, four test conventions, and the
+    tester section naming the three files that hold credentials), `docs/architecture.md` (a source
+    map for a person), `docs/README.md` (the index).
+  - `docs/reference.md` gained a 48-entry table of contents. No heading TEXT changed, so every
+    existing deep link still resolves.
+  - Verified: gate green on tree `fa86cf9813ea`, CI green on `main` (run 35266840782). 404
+    relative links checked; the 4 that stay broken sit inside generated installer marker blocks and
+    are logged in `C:\Code\docs\backlog.md`, not here.
+  - **No release was cut.** The change is documentation only, so npm still shows v0.84.0's README.
 - **Later the same day (v0.83.2, v0.84.0).**
   - The desktop Code tab did not get the long wait: Desktop gave the session its own server copy,
     named `llm-relay`, which hid the Code tab's own server, and Desktop calls as `claude-ai` with a

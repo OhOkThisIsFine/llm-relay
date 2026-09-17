@@ -6,6 +6,22 @@ Read this first. It's the map; [README.md](README.md) is the short user-facing f
 (kept ~400 words for npm) and [docs/reference.md](docs/reference.md) is the full usage
 reference — user-facing detail belongs there, not in the README.
 
+⚠ **`docs/` holds LIVE documents only; a dated record goes in `docs/history/` (2026-09-17).** The
+top level had 73 dated closeouts, design notes and audits sitting beside the eight documents a
+contributor reads, so a stranger could not tell a live document from evidence. The split is now the
+rule, not a one-off tidy: **a file whose name carries a date, or which records what was true on a
+date, is written straight into `docs/history/`** — never into `docs/` and moved later. ⚠ The
+human-facing entry points are [CONTRIBUTING.md](CONTRIBUTING.md) (set up, the gate, the invariants,
+the tester redaction rules) and [docs/architecture.md](docs/architecture.md) (a source map for a
+PERSON — this file is the same map at roughly fifty times the length, for an agent); keep both
+current when you change what they describe, and [docs/README.md](docs/README.md) is the index that
+lists every live document. ⚠ **`test/doc-links.test.ts` resolves every relative documentation link
+against the GIT INDEX, not the filesystem**, so a moved or added document fails the suite until it
+is STAGED — a move done with `mv` and left unstaged reads as 99 broken links. ⚠ Machine paths are
+scrubbed to `C:\Users\<user>` throughout; do not paste a real home directory into a tracked file,
+and keep a test fixture's account name fictional (`Pat Example` in
+`test/secret-file-acl.test.ts`, whose space is load-bearing for the ACL quoting).
+
 ## What this is
 
 A standalone, **loopback-only** LLM traffic control plane: it steers one person's LLM traffic

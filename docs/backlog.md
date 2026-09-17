@@ -1,7 +1,8 @@
 # Backlog — llm-relay
 
 > The work queue. Each entry states an unmet **Property** and is deleted once that property is
-> met. Shipped work lives in git history and in the dated documents under `docs/`;
+> met. Shipped work lives in git history and in the dated documents under
+> [`history/`](history/);
 > [`../HANDOFF.md`](../HANDOFF.md) holds current state plus the immediate next; `CLAUDE.md` holds
 > invariants and rationale. Nothing here is a status log. A machine-wide item (a global hook, a
 > shared instruction file, the lap and closeout ceremony) belongs in `C:\Code\docs\backlog.md`,
