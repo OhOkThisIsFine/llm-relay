@@ -71,7 +71,7 @@ describe("setup-claude", () => {
       mcpServers: Record<string, { command: string; args: string[] }>;
       env?: Record<string, string>;
     };
-    expect(written.mcpServers["llm-relay"]).toEqual({ command: "llm-relay", args: ["mcp"] });
+    expect(written.mcpServers["llm-relay-desktop"]).toEqual({ command: "llm-relay", args: ["mcp"] });
     expect(written.env).toBeUndefined();
   });
 
@@ -89,8 +89,28 @@ describe("setup-claude", () => {
     // Unrelated settings survive, and so does an unrelated env var — this function edits a
     // file that belongs to another application, so anything it does not own must be left alone.
     expect(written.mcpServers.keepme).toBeDefined();
-    expect(written.mcpServers["llm-relay"]).toEqual({ command: "llm-relay", args: ["mcp"] });
+    expect(written.mcpServers["llm-relay-desktop"]).toEqual({ command: "llm-relay", args: ["mcp"] });
     expect(written.env.KEEP).toBe("yes");
+  });
+
+  it("moves the entry this command wrote as \"llm-relay\" to the Desktop-only name", () => {
+    // The old name hid a Code tab session's own "llm-relay" server (docs/mcp-host-timeouts-2026-09-17.md).
+    const target = join(dir, "renamed.json");
+    writeFileSync(target, JSON.stringify({ mcpServers: { "llm-relay": { command: "llm-relay", args: ["mcp"] } } }));
+    expect(setupClaudeDesktop({ targetPath: target, homeDir: dir }).success).toBe(true);
+    const written = JSON.parse(readFileSync(target, "utf8")) as { mcpServers: Record<string, unknown> };
+    // ⚠ RED before the change: the old entry stayed under its old name.
+    expect(Object.keys(written.mcpServers)).toEqual(["llm-relay-desktop"]);
+  });
+
+  it("keeps a user's own \"llm-relay\" entry that this command did not write", () => {
+    const target = join(dir, "custom.json");
+    const custom = { command: "llm-relay", args: ["mcp"], env: { X: "1" } };
+    writeFileSync(target, JSON.stringify({ mcpServers: { "llm-relay": custom } }));
+    expect(setupClaudeDesktop({ targetPath: target, homeDir: dir }).success).toBe(true);
+    const written = JSON.parse(readFileSync(target, "utf8")) as { mcpServers: Record<string, unknown> };
+    expect(written.mcpServers["llm-relay"]).toEqual(custom);
+    expect(written.mcpServers["llm-relay-desktop"]).toEqual({ command: "llm-relay", args: ["mcp"] });
   });
 
   it("removes only the exact stale environment written by the legacy Desktop setup", () => {
@@ -123,7 +143,7 @@ describe("setup-claude", () => {
       mcpServers: Record<string, unknown>;
       env: Record<string, string>;
     };
-    expect(written.mcpServers["llm-relay"]).toBeDefined();
+    expect(written.mcpServers["llm-relay-desktop"]).toBeDefined();
     expect(written.env).toEqual({ KEEP: "yes" });
   });
 
@@ -239,7 +259,7 @@ describe("setup-claude", () => {
     const written = JSON.parse(readFileSync(target, "utf8")) as {
       mcpServers: Record<string, { command: string; args: string[] }>;
     };
-    expect(written.mcpServers["llm-relay"]).toEqual({ command: "llm-relay", args: ["mcp"] });
+    expect(written.mcpServers["llm-relay-desktop"]).toEqual({ command: "llm-relay", args: ["mcp"] });
   });
 
   it("(f) setupClaudeCli with an injected fs where relay.md exists WITHOUT the marker returns success: true, refusal line among the output lines", () => {

@@ -9,7 +9,7 @@
  * Evidence: docs/mcp-host-timeouts-2026-09-17.md.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { McpDispatchServer, PROGRESS_INTERVAL_MS } from "../src/mcp/server.js";
+import { HOST_WAIT_CEILING_MS, McpDispatchServer, PROGRESS_INTERVAL_MS } from "../src/mcp/server.js";
 import type { Config } from "../src/config.js";
 import type { DispatchLane, DispatchView } from "../src/dispatch.js";
 import type { LaneRunResult, LaneSpawner } from "../src/mcp/lane-runner.js";
@@ -155,10 +155,62 @@ describe("blocking dispatch for Claude Code", () => {
   });
 });
 
+describe("the Claude Desktop app (claude-ai)", () => {
+  // The desktop app sends no progress token. A Code tab call through it has the MCP SDK's 60 s
+  // default timeout, and a chat call has 300 s, so the server waits 50 s for both.
+  for (const meta of [undefined, { progressToken: "t" }]) {
+    it(`waits past maxWaitMs up to the host ceiling (${meta ? "with" : "without"} a token)`, async () => {
+      const h = harness({ client: "claude-ai", laneMs: 40_000 });
+      await h.init();
+      const call = h.dispatch(meta);
+      // ⚠ RED before the change: the reply was a job handle at 25 s.
+      await vi.advanceTimersByTimeAsync(40_500);
+      await call.done;
+      const text = h.responseFor(call.reqId)?.result?.content[0]?.text ?? "";
+      expect(text).toContain("status: completed");
+      expect(text).toContain("the lane's answer");
+      expect(h.progress()).toHaveLength(0);
+    });
+  }
+
+  it("hands back the job at HOST_WAIT_CEILING_MS, under the 60 s desktop timeout", async () => {
+    const h = harness({ client: "claude-ai" });
+    await h.init();
+    const call = h.dispatch();
+    await vi.advanceTimersByTimeAsync((HOST_WAIT_CEILING_MS["claude-ai"] ?? 0) - 500);
+    expect(h.responseFor(call.reqId)).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await call.done;
+    expect(h.responseFor(call.reqId)?.result?.content[0]?.text).toContain("status: running");
+    expect(HOST_WAIT_CEILING_MS["claude-ai"]).toBeLessThan(60_000);
+  });
+
+  it("names the host ceiling when it clamps a larger waitMs", async () => {
+    const h = harness({ client: "claude-ai" });
+    await h.init();
+    const call = h.dispatch(undefined, { waitMs: 90_000 });
+    await vi.advanceTimersByTimeAsync(51_000);
+    await call.done;
+    expect(h.responseFor(call.reqId)?.result?.content[0]?.text).toContain(
+      "waitMs 90000 clamped to the claude-ai tool-call ceiling 50000",
+    );
+  });
+
+  it("never waits past a smaller blockingWaitMs", async () => {
+    const h = harness({ client: "claude-ai", blockingWaitMs: 30_000 });
+    await h.init();
+    const call = h.dispatch();
+    await vi.advanceTimersByTimeAsync(30_500);
+    await call.done;
+    expect(h.responseFor(call.reqId)?.result?.content[0]?.text).toContain("Still running after 30s");
+  });
+});
+
 describe("hosts that keep the 25 s ceiling", () => {
   const cases: Array<{ name: string; client?: string; meta?: Record<string, unknown>; blockingWaitMs?: number }> = [
     { name: "Claude Code without a progress token", client: "claude-code" },
-    { name: "the Claude desktop chat client", client: "claude-ai", meta: { progressToken: "t" } },
+    { name: "the Claude desktop app with blockingWaitMs 0", client: "claude-ai", blockingWaitMs: 0 },
+    { name: "a client named like a prototype key", client: "constructor", meta: { progressToken: "t" } },
     { name: "Codex", client: "codex-mcp-client", meta: { progressToken: "t" } },
     { name: "a host that sent no initialize", meta: { progressToken: "t" } },
     { name: "Claude Code with blockingWaitMs 0", client: "claude-code", meta: { progressToken: "t" }, blockingWaitMs: 0 },

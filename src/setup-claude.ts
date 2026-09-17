@@ -234,6 +234,41 @@ export function getClaudeDesktopConfigPath(): string {
   }
 }
 
+/**
+ * The Claude Desktop entry name. It differs from "llm-relay", the name a Claude Code user config
+ * carries, so that a Code tab session keeps its own engine's server (see `setupClaudeDesktop`).
+ */
+export const DESKTOP_MCP_SERVER_NAME = "llm-relay-desktop";
+const LEGACY_DESKTOP_MCP_SERVER_NAME = "llm-relay";
+
+function isGeneratedDesktopEntry(entry: unknown): boolean {
+  if (typeof entry !== "object" || entry === null) return false;
+  const e = entry as Record<string, unknown>;
+  const keys = Object.keys(e).sort().join(",");
+  return (
+    keys === "args,command" &&
+    e.command === "llm-relay" &&
+    Array.isArray(e.args) &&
+    e.args.length === 1 &&
+    e.args[0] === "mcp"
+  );
+}
+
+/**
+ * The Desktop `mcpServers` map with the llm-relay entry added. Releases through v0.83.1 named that
+ * entry "llm-relay". Desktop hands its local servers to a Code tab session under their own names,
+ * so that entry hid the Code tab engine's own "llm-relay" server, and the session got Desktop's
+ * 60 s tool-call limit instead of Claude Code's long wait. The old entry is removed only when it is
+ * exactly what this command wrote.
+ */
+function withDesktopServer(current: unknown): Record<string, unknown> {
+  const servers = typeof current === "object" && current !== null ? { ...(current as Record<string, unknown>) } : {};
+  if (isGeneratedDesktopEntry(servers[LEGACY_DESKTOP_MCP_SERVER_NAME])) {
+    delete servers[LEGACY_DESKTOP_MCP_SERVER_NAME];
+  }
+  return { ...servers, [DESKTOP_MCP_SERVER_NAME]: { command: "llm-relay", args: ["mcp"] } };
+}
+
 /** Configures Claude Desktop with the host-independent llm-relay MCP dispatch server. */
 export function setupClaudeDesktop(opts: SetupOptions = {}): { success: boolean; path: string; message: string } {
   const targetPath = opts.targetPath ?? getClaudeDesktopConfigPath();
@@ -257,14 +292,7 @@ export function setupClaudeDesktop(opts: SetupOptions = {}): { success: boolean;
       }
     }
 
-    const currentServers =
-      existingConfig.mcpServers && typeof existingConfig.mcpServers === "object"
-        ? (existingConfig.mcpServers as Record<string, unknown>)
-        : {};
-    existingConfig.mcpServers = {
-      ...currentServers,
-      "llm-relay": { command: "llm-relay", args: ["mcp"] },
-    };
+    existingConfig.mcpServers = withDesktopServer(existingConfig.mcpServers);
 
     // Releases through v0.68.4 wrote these exact values even though Desktop overrides the base
     // URL before a session starts. Remove only values this setup command can prove it authored;

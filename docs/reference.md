@@ -1224,7 +1224,11 @@ arrive. A **Claude Desktop** session's does not: the launcher pins `ANTHROPIC_BA
 switch then reports ON and nothing changes.
 
 `llm-relay setup claude-desktop` configures the working path: it registers `llm-relay mcp` in
-`claude_desktop_config.json`. When migrating a setup written through v0.68.4, it removes only the
+`claude_desktop_config.json` under the name `llm-relay-desktop`. Desktop hands its local servers to
+each Code tab session, and an entry named `llm-relay` hid the Code tab's own `llm-relay` server,
+which gets Claude Code's long `dispatch` wait. Setup therefore moves an entry it wrote as
+`llm-relay` to the new name, and it keeps an `llm-relay` entry it did not write. Restart Claude
+Desktop after setup. When migrating a setup written through v0.68.4, it removes only the
 exact stale relay proxy environment values that old command authored and preserves every unrelated
 Desktop setting. Direct API routing remains available to a terminal-launched Claude CLI.
 
@@ -1923,9 +1927,11 @@ whatever the wait handed back.
 **Claude Code gets the answer in one call.** When the MCP client is Claude Code (`clientInfo.name`
 `claude-code`) and the tool call carries a progress token, `dispatch` waits for the answer up to
 `routing.mcp.blockingWaitMs` (default 25 minutes) and sends a progress notification every 30 s, the
-way a native subagent answers. A 240 s call and a 1,500 s call were measured to succeed there. Every other host keeps
-the 25 s ceiling: the Claude desktop chat client cancels a call at 60 s, and Codex at 31 s. Set
-`"blockingWaitMs": 0` to turn the blocking wait off. If the host cancels the call, the job keeps
+way a native subagent answers. A 240 s call and a 1,500 s call were measured to succeed there. The
+Claude Desktop app (`claude-ai`) sends no progress token; a Code tab call through it times out at
+60 s and a chat call at 300 s, so `dispatch` waits up to 50 s there (`HOST_WAIT_CEILING_MS`). Every
+other host keeps the 25 s ceiling (Codex yields at 31 s). Set `"blockingWaitMs": 0` to turn both
+longer waits off. If the host cancels the call, the job keeps
 running; `dispatch_status` with no `jobId` lists it. Evidence:
 [mcp-host-timeouts-2026-09-17.md](mcp-host-timeouts-2026-09-17.md).
 

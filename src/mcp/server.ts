@@ -959,6 +959,17 @@ function laneSummary(lane: DispatchLane, inFlight: number): string {
  */
 export const BLOCKING_WAIT_CLIENTS: readonly string[] = ["claude-code"];
 
+/**
+ * MCP clients whose tool-call limit is known and above `maxWaitMs`, but which send no progress
+ * token and never reset that limit. `dispatch` waits up to this figure for them, with no progress.
+ *
+ * `claude-ai` is the Claude Desktop app (read from its 2.110.1 bundle, 2026-09-17). It calls a local
+ * server on two paths: desktop chat passes a 300 s timeout, and a Code tab session passes none, so
+ * the MCP SDK default of 60 s applies. The server cannot tell the two paths apart, so the figure
+ * stays 10 s under the smaller one. `blockingWaitMs: 0` turns this off too.
+ */
+export const HOST_WAIT_CEILING_MS: Readonly<Record<string, number>> = { "claude-ai": 50_000 };
+
 /** How often a blocking `dispatch` sends `notifications/progress`. */
 export const PROGRESS_INTERVAL_MS = 30_000;
 
@@ -1285,13 +1296,24 @@ export class McpDispatchServer {
    * The blocking-wait cap for this call, or null when the call gets the ordinary `maxWaitMs`.
    * Three conditions: the host is one measured to survive a long call, the call asked for progress
    * (so the host shows the wait and, per its documentation, resets its idle timer), and the
-   * operator did not turn the blocking wait off.
+   * operator did not turn the blocking wait off. A host in `HOST_WAIT_CEILING_MS` instead gets its
+   * known ceiling, with no progress and no token required.
    */
-  private blockingWaitFor(ctx: CallContext, maxWaitMs: number): number | null {
-    if (ctx.progressToken === undefined) return null;
-    if (this.clientName === undefined || !BLOCKING_WAIT_CLIENTS.includes(this.clientName)) return null;
+  private blockingWaitFor(
+    ctx: CallContext,
+    maxWaitMs: number,
+  ): { ms: number; progress: boolean; key: string } | null {
     const cap = this.deps.config.routing?.mcp?.blockingWaitMs ?? DEFAULT_MCP_BLOCKING_WAIT_MS;
-    return cap > 0 ? Math.max(cap, maxWaitMs) : null;
+    const client = this.clientName;
+    if (cap <= 0 || client === undefined) return null;
+    if (ctx.progressToken !== undefined && BLOCKING_WAIT_CLIENTS.includes(client)) {
+      return { ms: Math.max(cap, maxWaitMs), progress: true, key: "routing.mcp.blockingWaitMs" };
+    }
+    // `Object.hasOwn`, so a prototype key such as "constructor" names no host.
+    if (!Object.hasOwn(HOST_WAIT_CEILING_MS, client)) return null;
+    const host = HOST_WAIT_CEILING_MS[client] ?? 0;
+    if (host <= maxWaitMs) return null;
+    return { ms: Math.min(cap, host), progress: false, key: `the ${client} tool-call ceiling` };
   }
 
   private async toolDispatch(args: Record<string, unknown>, ctx: CallContext): Promise<unknown> {
@@ -1376,8 +1398,8 @@ export class McpDispatchServer {
     // ceiling means the default.
     const maxWaitMs = this.deps.config.routing?.mcp?.maxWaitMs ?? DEFAULT_MCP_MAX_WAIT_MS;
     const blocking = this.blockingWaitFor(ctx, maxWaitMs);
-    const ceiling = blocking ?? maxWaitMs;
-    const ceilingKey = blocking === null ? "routing.mcp.maxWaitMs" : "routing.mcp.blockingWaitMs";
+    const ceiling = blocking?.ms ?? maxWaitMs;
+    const ceilingKey = blocking?.key ?? "routing.mcp.maxWaitMs";
     const waitMs = resolveWaitMs(args["waitMs"], ceiling);
     // A `waitMs` the server cannot honour is refused BEFORE anything spawns — the refusal must
     // cost no lane run, exactly like the recursion bound above.
@@ -1393,7 +1415,7 @@ export class McpDispatchServer {
     });
     return this.awaitOrPoll(job.id, settled, waitMs.waitMs, {
       clamp: waitMs.clamped ? { requested: waitMs.requested, ceiling, key: ceilingKey } : undefined,
-      progressToken: blocking === null ? undefined : ctx.progressToken,
+      progressToken: blocking?.progress === true ? ctx.progressToken : undefined,
       signal: ctx.signal,
     });
   }

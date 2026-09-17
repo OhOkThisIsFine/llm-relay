@@ -77,5 +77,18 @@ The blocking wait did NOT start. `job-0125` (a lane told to run `sleep 120`) ret
   received the desktop-hosted server, and that server's client is the desktop app. The desktop
   logs name that client `claude-ai`, which is not in `BLOCKING_WAIT_CLIENTS`. The engine's own
   `llm-relay mcp` processes also run, but this session did not use them.
-- Not measured: whether the desktop app cancels a Code tab call at 60 s, as it does a chat call.
-  A probe server in `claude_desktop_config.json` and a desktop restart can measure it.
+- The desktop app's own code (the 2.110.1 `app.asar` bundle) states the limits. A Code tab call to
+  a local server (`LocalMcpServerManager.createSdkServer`) passes the options from a helper that
+  returns `undefined` unless `mcp.toolTimeoutSec` is set, so the MCP SDK default of 60 s applies,
+  with no progress handler and no reset. A chat call passes `timeout: max(300 s, setting + 60 s)`.
+  The setting (policy key `mcpToolTimeoutSec`) has scope `3p` only, and the app deletes a key whose
+  scope does not match, so a normal Claude account cannot raise it.
+
+### Fix (owner decision: fix both paths, keep the desktop entry)
+
+- `HOST_WAIT_CEILING_MS` in `src/mcp/server.ts` gives `claude-ai` a 50 s wait with no progress. The
+  server cannot tell a chat call from a Code tab call, so the figure stays under the smaller limit.
+- `llm-relay setup claude-desktop` writes the desktop entry as `llm-relay-desktop` and moves an
+  entry it wrote as `llm-relay`. A Code tab session then keeps its engine's own `llm-relay` server
+  (client `claude-code`, the 25-minute wait). The session also sees the desktop server's tools under
+  `mcp__llm-relay-desktop__*`; those tools work with the 50 s wait and polling.
