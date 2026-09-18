@@ -34,13 +34,19 @@ describe("dashboard application startup", () => {
     expect(resolveLaunchSession("fresh", browserStorage)).toBeNull(); expect(browserStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
     browserStorage.setItem(SESSION_STORAGE_KEY, "existing"); expect(resolveLaunchSession(null, browserStorage)).toBe("existing");
   });
-  it("shows an immediate relaunch state when neither a bootstrap nor stored session exists", () => {
-    const fetchMock = vi.fn(); vi.stubGlobal("fetch", fetchMock);
+  it("automatically acquires a read-only session when navigating directly without a bootstrap token", async () => {
+    const browserStorage = storage();
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(session), { status: 200, headers: { "Content-Type": media } })).mockResolvedValueOnce(new Response(JSON.stringify(snapshot), { status: 200, headers: { "Content-Type": media } })); vi.stubGlobal("fetch", fetchMock);
+    render(<DashboardApp bootstrap={null} storage={browserStorage} />);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledWith("/dashboard/api/v1/session", expect.anything()));
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({ body: JSON.stringify({ schema: "dashboard.session.request.v1" }) });
+    await waitFor(() => expect(browserStorage.getItem(SESSION_STORAGE_KEY)).toBe("fresh-session"));
+  });
+  it("shows an unavailable failure state when session acquisition fails", async () => {
+    const fetchMock = vi.fn().mockRejectedValueOnce(new Error("network error")); vi.stubGlobal("fetch", fetchMock);
     render(<DashboardApp bootstrap={null} storage={storage()} />);
-    expect(screen.getByRole("heading", { name: "Dashboard relaunch required" })).toBeInTheDocument();
-    expect(screen.getByRole("status")).toHaveTextContent("Relaunch the dashboard from the relay CLI");
-    expect(screen.queryByText("Starting read-only dashboard session…")).not.toBeInTheDocument();
-    expect(fetchMock).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Dashboard session unavailable" })).toBeInTheDocument());
+    expect(screen.getByRole("alert")).toHaveTextContent("Could not connect to the relay service");
   });
   it("exposes logout and clears the in-memory/storage session only after a 204", async () => {
     const browserStorage = storage({ [SESSION_STORAGE_KEY]: "existing-session" });

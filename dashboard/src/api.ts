@@ -68,14 +68,20 @@ export function snapshotPath(filters: DashboardFilters): string {
 }
 export function detailPath(requestId: string, includeRepair: boolean): string { return `/dashboard/api/v1/requests/${encodeURIComponent(requestId)}?includeRepair=${includeRepair ? "1" : "0"}`; }
 
-export async function exchangeBootstrap(bootstrap: string, signal?: AbortSignal): Promise<DashboardSession> {
+export async function acquireSession(bootstrap?: string | null, signal?: AbortSignal): Promise<DashboardSession> {
+  const body = bootstrap
+    ? { schema: "dashboard.session.request.v1", bootstrap }
+    : { schema: "dashboard.session.request.v1" };
   const response = await fetch("/dashboard/api/v1/session", {
     method: "POST", credentials: "omit", ...(signal === undefined ? {} : { signal }),
-    headers: { ...headers(), "Content-Type": JSON_TYPE }, body: JSON.stringify({ schema: "dashboard.session.request.v1", bootstrap }),
+    headers: { ...headers(), "Content-Type": JSON_TYPE }, body: JSON.stringify(body),
   });
   const payload = await readOrThrow(response);
   if (!isExactSessionPayload(payload)) throw new DashboardApiError(response.status);
   return payload;
+}
+export async function exchangeBootstrap(bootstrap: string, signal?: AbortSignal): Promise<DashboardSession> {
+  return acquireSession(bootstrap, signal);
 }
 export async function logout(session: string, signal?: AbortSignal): Promise<void> {
   const response = await fetch("/dashboard/api/v1/logout", {

@@ -308,6 +308,30 @@ describe("dashboard API route policy", () => {
     expect((json(read as { body?: Uint8Array }) as SnapshotV1).schema).toBe(DASHBOARD_SNAPSHOT_SCHEMA);
   });
 
+  it("issues a read-only session directly without bootstrap for same-origin navigation", async () => {
+    let counter = 10;
+    const auth = createDashboardAuthManager({
+      clock: () => 2_000,
+      randomBytes: (size) => new Uint8Array(size).fill(counter++),
+    });
+    const sessionBody = jsonBody({ schema: DASHBOARD_SESSION_REQUEST_SCHEMA });
+    const sessionResponse = asHandled(await handleDashboardRoute(
+      request("POST", "/dashboard/api/v1/session", { headers: sessionBody.headers, readBody: async () => sessionBody.body }),
+      { auth, read: readPort() },
+    ));
+    expect(sessionResponse.status).toBe(200);
+    const sessionPayload = json(sessionResponse as { body?: Uint8Array }) as { schema: string; session: string; scope: string };
+    expect(sessionPayload.schema).toBe("dashboard.session.v1");
+    expect(sessionPayload.scope).toBe("dashboard:read");
+    expect(typeof sessionPayload.session).toBe("string");
+
+    const read = asHandled(await handleDashboardRoute(
+      request("GET", "/dashboard/api/v1/snapshot?window=1h&includeRepair=0", { headers: authHeaders(sessionPayload.session) }),
+      { auth, read: readPort() },
+    ));
+    expect(read.status).toBe(200);
+  });
+
   it("applies strict query parsing and performs no read on malformed input", async () => {
     const readSnapshot = vi.fn(async () => snapshot());
     const validateSession = vi.fn(() => ({ ok: true, scope: DASHBOARD_SCOPE, idleExpiresAt: 1, absoluteExpiresAt: 2 }));

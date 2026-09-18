@@ -162,6 +162,21 @@ describe("dashboard bootstrap and session authority", () => {
     expect(restarted.validateSession(session.session)).toMatchObject({ ok: false, code: "invalid_auth" });
   });
 
+  it("issues a direct read-only session via createSession", () => {
+    const clock = () => 50_000;
+    const auth = createDashboardAuthManager({ clock, randomBytes: entropySource() });
+    const session = auth.createSession();
+    expect(session).toMatchObject({
+      ok: true,
+      scope: DASHBOARD_SCOPE,
+      idleExpiresAt: 50_000 + DASHBOARD_IDLE_TTL_MS,
+      absoluteExpiresAt: 50_000 + DASHBOARD_ABSOLUTE_TTL_MS,
+    });
+    expect(session.session).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    const validated = auth.validateSession(session.session);
+    expect(validated).toMatchObject({ ok: true, scope: DASHBOARD_SCOPE });
+  });
+
   it("exports the exact session header and default expiry values", () => {
     expect(DASHBOARD_SESSION_HEADER).toBe("X-LLM-Relay-Dashboard-Session");
     expect(DASHBOARD_IDLE_TTL_MS).toBe(30 * 60_000);

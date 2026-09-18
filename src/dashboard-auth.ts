@@ -185,6 +185,13 @@ export class DashboardAuthManager {
     return Object.freeze({ ok: true as const, bootstrap, expiresAt: record.expiresAt });
   }
 
+  /** Issue a direct read-only dashboard session for same-origin browser navigation. */
+  createSession(): DashboardSession {
+    const now = nowFrom(this.#clock);
+    this.cleanup(now);
+    return this.#issueSession(now);
+  }
+
   /** Exchange a live bootstrap exactly once for a read-only dashboard session. */
   exchangeBootstrap(candidate: unknown): DashboardBootstrapResult {
     const now = nowFrom(this.#clock);

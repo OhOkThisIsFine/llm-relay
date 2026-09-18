@@ -110,6 +110,7 @@ export interface DashboardReadPort {
 export interface DashboardAuthPort {
   createBootstrap(): DashboardBootstrap | Promise<DashboardBootstrap>;
   exchangeBootstrap(candidate: string): DashboardBootstrapResult | Promise<DashboardBootstrapResult>;
+  createSession?(): DashboardSession | Promise<DashboardSession>;
   validateSession(candidate: string): DashboardSessionResult | Promise<DashboardSessionResult>;
   logout(candidate: string): DashboardLogoutResult | Promise<DashboardLogoutResult>;
 }
@@ -455,12 +456,15 @@ function isBootstrapRequest(value: unknown): value is { readonly schema: typeof 
 
 function isSessionRequest(
   value: unknown,
-): value is { readonly schema: typeof DASHBOARD_SESSION_REQUEST_SCHEMA; readonly bootstrap: string } {
-  return (
-    hasExactKeys(value, ["schema", "bootstrap"]) &&
-    value.schema === DASHBOARD_SESSION_REQUEST_SCHEMA &&
-    typeof value.bootstrap === "string"
-  );
+): value is { readonly schema: typeof DASHBOARD_SESSION_REQUEST_SCHEMA; readonly bootstrap?: string } {
+  if (!isRecord(value) || value.schema !== DASHBOARD_SESSION_REQUEST_SCHEMA) return false;
+  if ("bootstrap" in value) {
+    return (
+      hasExactKeys(value, ["schema", "bootstrap"]) &&
+      typeof value.bootstrap === "string"
+    );
+  }
+  return hasExactKeys(value, ["schema"]);
 }
 
 function isLogoutRequest(value: unknown): value is { readonly schema: typeof DASHBOARD_LOGOUT_REQUEST_SCHEMA } {
@@ -776,7 +780,11 @@ export async function handleDashboardRoute(
 
   if (!isSessionRequest(parsedBody)) return errorResponse(400, "malformed_query", request.method);
   try {
-    const result = await dependencies.auth.exchangeBootstrap(parsedBody.bootstrap);
+    const result = typeof parsedBody.bootstrap === "string"
+      ? await dependencies.auth.exchangeBootstrap(parsedBody.bootstrap)
+      : await (typeof dependencies.auth.createSession === "function"
+          ? dependencies.auth.createSession()
+          : dependencies.auth.exchangeBootstrap(""));
     if (isSessionSuccess(result)) {
       return handledJson(
         200,
