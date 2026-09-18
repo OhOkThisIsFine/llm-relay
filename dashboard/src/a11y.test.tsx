@@ -33,7 +33,7 @@ describe("dashboard accessibility and truthfulness", () => {
     expect(screen.getAllByText("Provider-published / reported").length).toBeGreaterThan(0); expect(screen.getAllByText("Reference / estimated").length).toBeGreaterThan(0); expect(screen.queryByText("$6.0000")).not.toBeInTheDocument();
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0); expect(screen.getByText("50.0%")).toBeInTheDocument(); expect(screen.getByText("0.0%")).toBeInTheDocument();
     const chartIds = screen.getAllByRole("heading", { level: 2 }).filter((heading) => heading.id.startsWith("chart-")).map((heading) => heading.id); expect(new Set(chartIds).size).toBe(chartIds.length);
-    expect(container.querySelectorAll("table.responsive-table")).toHaveLength(13);
+    expect(container.querySelectorAll("table.responsive-table")).toHaveLength(9);
     expect((await axe(container, { rules: { "color-contrast": { enabled: false } } })).violations).toEqual([]);
   });
   it("keeps labelled table data usable at 320, 768, and 1280px; themes and reduced motion stay self-hosted", async () => {

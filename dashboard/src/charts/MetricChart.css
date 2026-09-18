@@ -7,24 +7,41 @@
 .chart-grid {
   stroke: var(--border);
   stroke-width: 1;
+  stroke-dasharray: 4 4;
 }
 
 .chart-axis-label {
   fill: var(--muted);
   font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
-.chart-series-0 { fill: #2563eb; }
-.chart-series-1 { fill: #0891b2; }
-.chart-series-2 { fill: #7c3aed; }
-.chart-series-3 { fill: #b45309; }
-.chart-series-4 { fill: #be123c; }
+.chart-series-0 { fill: #3b82f6; }
+.chart-series-1 { fill: #10b981; }
+.chart-series-2 { fill: #8b5cf6; }
+.chart-series-3 { fill: #f59e0b; }
+.chart-series-4 { fill: #ec4899; }
+
+.app.dark .chart-series-0 { fill: #60a5fa; }
+.app.dark .chart-series-1 { fill: #34d399; }
+.app.dark .chart-series-2 { fill: #a78bfa; }
+.app.dark .chart-series-3 { fill: #fbbf24; }
+.app.dark .chart-series-4 { fill: #f472b6; }
+
+.metric-bar {
+  transition: opacity 0.15s ease;
+  cursor: pointer;
+}
+
+.metric-bar:hover {
+  opacity: 0.75;
+}
 
 .chart-legend {
   display: flex;
   flex-wrap: wrap;
   gap: .5rem 1rem;
-  margin: .5rem 0;
+  margin: .6rem 0 .2rem;
   padding: 0;
   list-style: none;
   color: var(--muted);
@@ -34,18 +51,24 @@
 .chart-legend li {
   display: inline-flex;
   align-items: center;
-  gap: .3rem;
+  gap: .35rem;
 }
 
 .chart-swatch {
   display: inline-block;
   width: .75rem;
   height: .75rem;
-  border-radius: .15rem;
+  border-radius: .25rem;
 }
 
-.chart-swatch.chart-series-0 { background: #2563eb; }
-.chart-swatch.chart-series-1 { background: #0891b2; }
-.chart-swatch.chart-series-2 { background: #7c3aed; }
-.chart-swatch.chart-series-3 { background: #b45309; }
-.chart-swatch.chart-series-4 { background: #be123c; }
+.chart-swatch.chart-series-0 { background: #3b82f6; }
+.chart-swatch.chart-series-1 { background: #10b981; }
+.chart-swatch.chart-series-2 { background: #8b5cf6; }
+.chart-swatch.chart-series-3 { background: #f59e0b; }
+.chart-swatch.chart-series-4 { background: #ec4899; }
+
+.app.dark .chart-swatch.chart-series-0 { background: #60a5fa; }
+.app.dark .chart-swatch.chart-series-1 { background: #34d399; }
+.app.dark .chart-swatch.chart-series-2 { background: #a78bfa; }
+.app.dark .chart-swatch.chart-series-3 { background: #fbbf24; }
+.app.dark .chart-swatch.chart-series-4 { background: #f472b6; }
