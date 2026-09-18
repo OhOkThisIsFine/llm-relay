@@ -9,9 +9,9 @@ export function BasisBadge({ value }: Readonly<{ value: string | null }>): React
 }
 
 export function PanelCoverage({ value, label }: Readonly<{ value: PanelCoverageV1 | undefined; label: string }>): ReactElement {
-  if (value === undefined) return <aside className="coverage unavailable" aria-label={`${label} data status`} aria-description="Unavailable; reason unavailable; provenance unavailable; observed unavailable"><strong>Unavailable</strong><span>State: unavailable. Reason: unavailable. Provenance: unavailable. Observed: unavailable.</span></aside>;
+  if (value === undefined) return <aside className="coverage sr-only unavailable" aria-label={`${label} data status`} aria-description="Unavailable; reason unavailable; provenance unavailable; observed unavailable"><strong>Unavailable</strong><span>State: unavailable. Reason: unavailable. Provenance: unavailable. Observed: unavailable.</span></aside>;
   const description = `${coverage(value.state)}; reason ${value.reason ?? "unavailable"}; provenance ${value.provenance.length === 0 ? "unavailable" : value.provenance.join(", ")}; observed ${stamp(value.observedAt)}.`;
-  return <aside className={`coverage ${value.state}`} aria-label={`${label} data status`} aria-description={description}><strong>{coverage(value.state)}</strong><span>{description}</span></aside>;
+  return <aside className={`coverage sr-only ${value.state}`} aria-label={`${label} data status`} aria-description={description}><strong>{coverage(value.state)}</strong><span>{description}</span></aside>;
 }
 
 export function TokenCells({ tokens }: Readonly<{ tokens: TokenTotalsV1 | null }>): ReactElement {

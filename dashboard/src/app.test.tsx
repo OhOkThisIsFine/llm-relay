@@ -67,7 +67,7 @@ describe("dashboard application startup", () => {
     const browserStorage = storage({ [SESSION_STORAGE_KEY]: "existing-session" });
     const error = { schema: "dashboard.error.v1", code: "invalid_auth", message: "Dashboard session is unavailable.", requestId: null };
     const fetchMock = vi.fn().mockResolvedValueOnce(new Response(JSON.stringify(snapshot), { status: 200, headers: { "Content-Type": media } })).mockResolvedValueOnce(new Response(JSON.stringify(error), { status: 401, headers: { "Content-Type": media } })); vi.stubGlobal("fetch", fetchMock);
-    render(<DashboardApp bootstrap={null} storage={browserStorage} />);
+    render(<DashboardApp bootstrap={null} storage={browserStorage} showRecentTable={true} />);
     await waitFor(() => expect(screen.getByRole("button", { name: /View request/ })).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: /View request/ }));
     await waitFor(() => expect(screen.getByText("Dashboard session ended")).toBeInTheDocument());

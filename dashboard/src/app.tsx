@@ -9,7 +9,7 @@ export function resolveLaunchSession(bootstrap: string | null, storage: Storage)
   return readStoredSession(storage);
 }
 
-export function DashboardApp({ bootstrap, storage = sessionStorage }: Readonly<{ bootstrap: string | null; storage?: Storage }>): ReactElement {
+export function DashboardApp({ bootstrap, storage = sessionStorage, showRecentTable = false }: Readonly<{ bootstrap: string | null; storage?: Storage; showRecentTable?: boolean }>): ReactElement {
   const [session, setSession] = useState<string | null>(() => resolveLaunchSession(bootstrap, storage));
   const [failure, setFailure] = useState(false);
   const [relaunch, setRelaunch] = useState<"ended" | null>(null);
@@ -60,6 +60,6 @@ export function DashboardApp({ bootstrap, storage = sessionStorage }: Readonly<{
     </main>
   );
   if (session === null) return <main className="app"><p className="status" role="status">Starting read-only dashboard session…</p></main>;
-  return <AnalyticsDashboard session={session} onSessionExpired={endSession} onLogout={onLogout} />;
+  return <AnalyticsDashboard session={session} onSessionExpired={endSession} onLogout={onLogout} showRecentTable={showRecentTable} />;
 }
 

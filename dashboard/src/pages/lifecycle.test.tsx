@@ -8,7 +8,7 @@ const media = "application/vnd.llm-relay.dashboard+json; version=1";
 const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { "Content-Type": media } });
 type Deferred<T> = { promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void };
 function deferred<T>(): Deferred<T> { let resolve!: (value: T) => void; let reject!: (error: unknown) => void; const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; }); return { promise, resolve, reject }; }
-function renderDashboard(overrides: Partial<ComponentProps<typeof AnalyticsDashboard>> = {}) { return render(<AnalyticsDashboard session="memory-session" onSessionExpired={vi.fn()} onLogout={vi.fn().mockResolvedValue(undefined)} {...overrides} />); }
+function renderDashboard(overrides: Partial<ComponentProps<typeof AnalyticsDashboard>> = {}) { return render(<AnalyticsDashboard session="memory-session" onSessionExpired={vi.fn()} onLogout={vi.fn().mockResolvedValue(undefined)} showRecentTable={true} {...overrides} />); }
 async function flush(): Promise<void> { await act(async () => { await Promise.resolve(); await Promise.resolve(); }); }
 function visible(value: "visible" | "hidden"): void { Object.defineProperty(document, "visibilityState", { configurable: true, value }); document.dispatchEvent(new Event("visibilitychange")); }
 function online(value: boolean): void { Object.defineProperty(navigator, "onLine", { configurable: true, value }); window.dispatchEvent(new Event(value ? "online" : "offline")); }

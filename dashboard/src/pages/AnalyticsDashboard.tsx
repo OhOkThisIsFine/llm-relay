@@ -48,15 +48,14 @@ const PANEL_LINKS: ReadonlyArray<readonly [string, string]> = [
   ["chart-token-timeline-heading", "Tokens"],
   ["chart-latency-timeline-heading", "Latency"],
   ["chart-commit-timeline-heading", "Commit"],
-  ["spend-heading", "Spend"],
   ["provider-heading", "Providers"],
   ["model-heading", "Models"],
   ["client-heading", "Clients"],
   ["credential-heading", "Credentials"],
+  ["spend-heading", "Spend"],
   ["errors-heading", "Errors"],
   ["quotas-heading", "Quotas"],
   ["cooldowns-heading", "Cooldowns"],
-  ["recent-heading", "Recent"],
 ];
 
 type Availability = Readonly<{ visible: boolean; online: boolean }>;
@@ -80,7 +79,7 @@ function Select({ label, value, values, onChange }: Readonly<{ label: string; va
   return <label>{label}<select value={value} onChange={(event) => onChange(event.target.value)}>{values.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>;
 }
 
-export function AnalyticsDashboard({ session, onSessionExpired, onLogout }: Readonly<{ session: string; onSessionExpired(): void; onLogout(signal: AbortSignal): Promise<void> }>): ReactElement {
+export function AnalyticsDashboard({ session, onSessionExpired, onLogout, showRecentTable = false }: Readonly<{ session: string; onSessionExpired(): void; onLogout(signal: AbortSignal): Promise<void>; showRecentTable?: boolean }>): ReactElement {
   const [filters, setFilters] = useState<DashboardFilters>(defaultFilters);
   const [theme, setThemeState] = useState<Theme>(() => readStoredTheme() ?? "dark");
   const toggleTheme = () => { const next: Theme = theme === "light" ? "dark" : "light"; setThemeState(next); storeTheme(next); };
@@ -167,7 +166,7 @@ export function AnalyticsDashboard({ session, onSessionExpired, onLogout }: Read
       <Select label="Failure" value={filters.failureKind ?? "all"} values={["all", "timeout", "provider_error", "auth_error", "rate_limit", "aborted", "protocol", "unknown"]} onChange={(value) => setFilter("failureKind", value === "all" ? undefined : value as DashboardFilters["failureKind"])} />
     </section>
     {snapshotState.error !== null && snapshot === null && <section className="panel error" role="alert"><h2>Dashboard unavailable</h2><p>Unable to read dashboard measurements.</p></section>}
-    {snapshot && <DashboardBody snapshot={snapshot} onDetail={openDetail} rememberTrigger={(target) => { detailTrigger.current = target; }} />}
+    {snapshot && <DashboardBody snapshot={snapshot} onDetail={openDetail} rememberTrigger={(target) => { detailTrigger.current = target; }} showRecentTable={showRecentTable} />}
     {detailState.loading && <p className="status" role="status">Loading request details…</p>}{detailState.error && <section className="panel error" role="alert"><h2>Request details unavailable</h2><p>{detailState.error}</p></section>}
     {detailState.data && <DetailDialog detail={detailState.data} onClose={() => { setDetailState({ requestId: null, data: null, loading: false, error: null }); }} />}
   </main>;
@@ -177,21 +176,60 @@ function coverageFor(snapshot: SnapshotV1, panel: PanelId): PanelCoverageV1 | un
 function ResponsiveTable({ caption, headers, children }: Readonly<{ caption: string; headers: readonly string[]; children: ReactNode }>): ReactElement { return <div className="table-wrap"><table className="responsive-table"><caption>{caption}</caption><thead><tr>{headers.map((header) => <th scope="col" key={header}>{header}</th>)}</tr></thead><tbody>{children}</tbody></table></div>; }
 
 function Panel({ id, title, icon: Icon, rowCount, children }: Readonly<{ id: string; title: string; icon?: LucideIcon | undefined; rowCount: number; children: ReactNode }>): ReactElement {
-  return <details className="panel" open={rowCount <= COLLAPSE_ABOVE_ROWS}><summary><h2 id={id + "-heading"} className="panel-title">{Icon && <Icon className="panel-icon" aria-hidden="true" />}{title} <span className="panel-count">({number(rowCount)} row{rowCount === 1 ? "" : "s"})</span></h2></summary>{children}</details>;
+  return <section className="panel" aria-labelledby={id + "-heading"}><div className="panel-header"><h2 id={id + "-heading"} className="panel-title">{Icon && <Icon className="panel-icon" aria-hidden="true" />}{title} <span className="panel-count">({number(rowCount)} row{rowCount === 1 ? "" : "s"})</span></h2></div>{children}</section>;
 }
 
 function safe(value: string | null): string { return value ?? "Unavailable"; }
 export function quotaRowKey(row: QuotaRowV1): string { return JSON.stringify([row.credentialId, row.provider, row.deployment, row.axis, row.period, row.limit, row.resetsAt, row.observedAt]); }
 export function cooldownRowKey(row: CooldownRowV1): string { return JSON.stringify([row.credentialId, row.provider, row.deployment, row.reason, row.until, row.observedAt]); }
 
-function DashboardBody({ snapshot, onDetail, rememberTrigger }: Readonly<{ snapshot: SnapshotV1; onDetail(requestId: string): void; rememberTrigger(target: HTMLElement): void }>): ReactElement {
+function DashboardBody({ snapshot, onDetail, rememberTrigger, showRecentTable = false }: Readonly<{ snapshot: SnapshotV1; onDetail(requestId: string): void; rememberTrigger(target: HTMLElement): void; showRecentTable?: boolean }>): ReactElement {
   const bucketRows = snapshot.buckets.map((bucket) => ({ id: bucket.from, label: utcBucketLabel(bucket.from, snapshot.window), requests: bucket.requests, attempts: bucket.attempts, reportedInput: bucket.tokens.reported.reportedInput.value, reportedOutput: bucket.tokens.reported.reportedOutput.value, cachedInput: bucket.tokens.reported.reportedCachedInput.value, estimatedInput: bucket.tokens.estimated.estimatedInput.value, estimatedOutput: bucket.tokens.estimated.estimatedOutput.value, avgLatency: bucket.avgLatencyMs, p95Latency: bucket.p95LatencyMs, avgCommit: bucket.avgCommitMs }));
-  return <><SummaryCards snapshot={snapshot} />
-    <MetricChart id="request-timeline" title="Request timeline" icon={ChartLine} rows={bucketRows} columns={[{ key: "requests", label: "Requests" }, { key: "attempts", label: "Attempts" }]} panelCoverage={coverageFor(snapshot, "request_timeline")} />
-    <MetricChart id="token-timeline" title="Token timeline" icon={Coins} rows={bucketRows} columns={[{ key: "reportedInput", label: "Reported input" }, { key: "reportedOutput", label: "Reported output" }, { key: "cachedInput", label: "Reported cached input" }, { key: "estimatedInput", label: "Estimated input" }, { key: "estimatedOutput", label: "Estimated output" }]} panelCoverage={coverageFor(snapshot, "token_timeline")} />
-    <MetricChart id="latency-timeline" title="Latency timeline" icon={Gauge} rows={bucketRows} columns={[{ key: "avgLatency", label: "Average latency (ms)" }, { key: "p95Latency", label: "P95 latency (ms)" }]} panelCoverage={coverageFor(snapshot, "latency")} />
-    <MetricChart id="commit-timeline" title="Commit timeline" icon={Zap} rows={bucketRows} columns={[{ key: "avgCommit", label: "Average commit (ms)" }]} panelCoverage={coverageFor(snapshot, "commit")} />
-    <SpendPanel snapshot={snapshot} /><DimensionPanels snapshot={snapshot} /><ErrorPanel snapshot={snapshot} /><QuotaPanel snapshot={snapshot} /><CooldownPanel snapshot={snapshot} /><RecentPanel snapshot={snapshot} onDetail={onDetail} rememberTrigger={rememberTrigger} />
+  return <>
+    <SummaryCards snapshot={snapshot} />
+    <div className="analytics-grid">
+      <div className="col-span-2">
+        <MetricChart id="request-timeline" title="Request timeline" icon={ChartLine} rows={bucketRows} columns={[{ key: "requests", label: "Requests" }, { key: "attempts", label: "Attempts" }]} panelCoverage={coverageFor(snapshot, "request_timeline")} />
+      </div>
+      <div className="col-span-2">
+        <MetricChart id="token-timeline" title="Token timeline" icon={Coins} rows={bucketRows} columns={[{ key: "reportedInput", label: "Reported input" }, { key: "reportedOutput", label: "Reported output" }, { key: "cachedInput", label: "Reported cached input" }, { key: "estimatedInput", label: "Estimated input" }, { key: "estimatedOutput", label: "Estimated output" }]} panelCoverage={coverageFor(snapshot, "token_timeline")} />
+      </div>
+      <div>
+        <MetricChart id="latency-timeline" title="Latency timeline" icon={Gauge} rows={bucketRows} columns={[{ key: "avgLatency", label: "Average latency (ms)" }, { key: "p95Latency", label: "P95 latency (ms)" }]} panelCoverage={coverageFor(snapshot, "latency")} />
+      </div>
+      <div>
+        <MetricChart id="commit-timeline" title="Commit timeline" icon={Zap} rows={bucketRows} columns={[{ key: "avgCommit", label: "Average commit (ms)" }]} panelCoverage={coverageFor(snapshot, "commit")} />
+      </div>
+      <div className="col-span-2">
+        <DimensionPanel snapshot={snapshot} panel="provider" title="Providers" icon={Server} rows={snapshot.providers} label={(row) => (row as typeof snapshot.providers[number]).provider} />
+      </div>
+      <div className="col-span-2">
+        <DimensionPanel snapshot={snapshot} panel="model" title="Models" icon={Layers} rows={snapshot.models} label={(row) => { const model = row as typeof snapshot.models[number]; return model.provider + " / " + model.model; }} />
+      </div>
+      <div>
+        <DimensionPanel snapshot={snapshot} panel="client" title="Clients" icon={Bot} rows={snapshot.clients} label={(row) => (row as typeof snapshot.clients[number]).client} />
+      </div>
+      <div>
+        <DimensionPanel snapshot={snapshot} panel="credential" title="Credentials" icon={KeyRound} rows={snapshot.credentials} label={(row) => { const credential = row as typeof snapshot.credentials[number]; return credential.provider + " / " + credential.label + " (" + credential.credentialId + ")"; }} />
+      </div>
+      <div>
+        <SpendPanel snapshot={snapshot} />
+      </div>
+      <div>
+        <ErrorPanel snapshot={snapshot} />
+      </div>
+      <div className="col-span-2">
+        <QuotaPanel snapshot={snapshot} />
+      </div>
+      <div className="col-span-2">
+        <CooldownPanel snapshot={snapshot} />
+      </div>
+      {showRecentTable && (
+        <div className="col-span-2">
+          <RecentPanel snapshot={snapshot} onDetail={onDetail} rememberTrigger={rememberTrigger} />
+        </div>
+      )}
+    </div>
   </>;
 }
 
@@ -222,8 +260,8 @@ function compactSpend(spend: SpendTotalsV1 | null): string {
 function DimensionPanel({ snapshot, panel, title, icon, rows, label }: Readonly<{ snapshot: SnapshotV1; panel: "provider" | "model" | "client" | "credential"; title: string; icon?: LucideIcon | undefined; rows: readonly DimensionRowV1[]; label(row: DimensionRowV1): string }>): ReactElement {
   return <Panel id={panel} title={title} icon={icon} rowCount={rows.length}>
     <PanelCoverage label={title} value={coverageFor(snapshot, panel)} />
-    <ResponsiveTable caption={title + " breakdown"} headers={["Dimension", "Requests", "Attempts", "Served", "Errors", "Cancelled", "Success", "Latency", "Commit", "Coverage", "Tokens", "Spend"]}>
-      {rows.length === 0 ? <tr><td className="empty-row" colSpan={12}>No matching measurements.</td></tr> : rows.map((row) => {
+    <ResponsiveTable caption={title + " breakdown"} headers={["Dimension", "Requests", "Attempts", "Served", "Errors", "Cancelled", "Success", "Latency", "Commit", "Tokens", "Spend"]}>
+      {rows.length === 0 ? <tr><td className="empty-row" colSpan={11}>No matching measurements.</td></tr> : rows.map((row) => {
         const prov = panel === "provider" ? (row as typeof snapshot.providers[number]).provider : panel === "model" ? (row as typeof snapshot.models[number]).provider : panel === "credential" ? (row as typeof snapshot.credentials[number]).provider : null;
         return (
           <tr key={label(row)}>
@@ -241,7 +279,6 @@ function DimensionPanel({ snapshot, panel, title, icon, rows, label }: Readonly<
             <td data-label="Success">{percent(row.successRate)}</td>
             <td data-label="Latency">{duration(row.avgLatencyMs)}</td>
             <td data-label="Commit">{duration(row.avgCommitMs)}</td>
-            <td data-label="Coverage">{row.coverage}</td>
             <td data-label="Tokens">{compactTokens(row.tokens)}</td>
             <td data-label="Spend">{compactSpend(row.spend)}</td>
           </tr>
@@ -249,15 +286,6 @@ function DimensionPanel({ snapshot, panel, title, icon, rows, label }: Readonly<
       })}
     </ResponsiveTable>
   </Panel>;
-}
-
-function DimensionPanels({ snapshot }: Readonly<{ snapshot: SnapshotV1 }>): ReactElement {
-  return <>
-    <DimensionPanel snapshot={snapshot} panel="provider" title="Providers" icon={Server} rows={snapshot.providers} label={(row) => (row as typeof snapshot.providers[number]).provider} />
-    <DimensionPanel snapshot={snapshot} panel="model" title="Models" icon={Layers} rows={snapshot.models} label={(row) => { const model = row as typeof snapshot.models[number]; return model.provider + " / " + model.model; }} />
-    <DimensionPanel snapshot={snapshot} panel="client" title="Clients" icon={Bot} rows={snapshot.clients} label={(row) => (row as typeof snapshot.clients[number]).client} />
-    <DimensionPanel snapshot={snapshot} panel="credential" title="Credentials" icon={KeyRound} rows={snapshot.credentials} label={(row) => { const credential = row as typeof snapshot.credentials[number]; return credential.provider + " / " + credential.label + " (" + credential.credentialId + ")"; }} />
-  </>;
 }
 
 function ErrorPanel({ snapshot }: Readonly<{ snapshot: SnapshotV1 }>): ReactElement {

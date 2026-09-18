@@ -29,11 +29,11 @@ describe("dashboard accessibility and truthfulness", () => {
     const { container } = render(<AnalyticsDashboard session="memory-session" onSessionExpired={vi.fn()} onLogout={vi.fn().mockResolvedValue(undefined)} />);
     await waitFor(() => expect(screen.getByRole("heading", { name: "Requests" })).toBeInTheDocument());
     for (const control of ["Window", "Attribution", "Provider", "Model", "Client", "Credential", "Outcome", "Failure"]) expect(screen.getByLabelText(control)).toBeInTheDocument();
-    for (const panel of ["Summary", "Request timeline", "Token timeline", "Spend", "Providers", "Models", "Clients", "Credentials", "Latency timeline", "Commit timeline", "Errors", "Recent requests", "Quotas", "Cooldowns"]) expect(screen.getByLabelText(panel + " data status")).toBeInTheDocument();
+    for (const panel of ["Summary", "Request timeline", "Token timeline", "Spend", "Providers", "Models", "Clients", "Credentials", "Latency timeline", "Commit timeline", "Errors", "Quotas", "Cooldowns"]) expect(screen.getByLabelText(panel + " data status")).toBeInTheDocument();
     expect(screen.getAllByText("Provider-published / reported").length).toBeGreaterThan(0); expect(screen.getAllByText("Reference / estimated").length).toBeGreaterThan(0); expect(screen.queryByText("$6.0000")).not.toBeInTheDocument();
     expect(screen.getAllByText("Unavailable").length).toBeGreaterThan(0); expect(screen.getByText("50.0%")).toBeInTheDocument(); expect(screen.getByText("0.0%")).toBeInTheDocument();
     const chartIds = screen.getAllByRole("heading", { level: 2 }).filter((heading) => heading.id.startsWith("chart-")).map((heading) => heading.id); expect(new Set(chartIds).size).toBe(chartIds.length);
-    expect(container.querySelectorAll("table.responsive-table")).toHaveLength(9);
+    expect(container.querySelectorAll("table.responsive-table")).toHaveLength(8);
     expect((await axe(container, { rules: { "color-contrast": { enabled: false } } })).violations).toEqual([]);
   });
   it("keeps labelled table data usable at 320, 768, and 1280px; themes and reduced motion stay self-hosted", async () => {
@@ -104,7 +104,7 @@ describe("dashboard UI contracts", () => {
 it("keeps quota and cooldown identities distinct for pipe-containing tuples and renders all rows", async () => { const quotaA = { ...snapshot.quotas[0]!, credentialId: "cred|prov", provider: "dep", deployment: "x", label: "Quota A" }; const quotaB = { ...quotaA, credentialId: "cred", provider: "prov|dep", label: "Quota B" }; const cooldownA = { credentialId: "cool|provider", provider: "deploy", deployment: "x", reason: "rate_limit" as const, until: "2026-08-20T12:01:00.000Z", observedAt: "2026-08-20T12:00:00.000Z" }; const cooldownB = { ...cooldownA, credentialId: "cool", provider: "provider|deploy" }; const oldQuotaA = [quotaA.credentialId, quotaA.provider, quotaA.deployment].join("|"); const oldQuotaB = [quotaB.credentialId, quotaB.provider, quotaB.deployment].join("|"); const oldCooldownKey = (row: typeof cooldownA) => [row.credentialId, row.provider, row.deployment, row.reason, row.until, row.observedAt].join("|"); expect(oldQuotaA).toBe(oldQuotaB); expect(quotaRowKey(quotaA)).not.toBe(quotaRowKey(quotaB)); expect(oldCooldownKey(cooldownA)).toBe(oldCooldownKey(cooldownB)); expect(cooldownRowKey(cooldownA)).not.toBe(cooldownRowKey(cooldownB)); vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response({ ...snapshot, quotas: [quotaA, quotaB], cooldowns: [cooldownA, cooldownB] }))); render(<AnalyticsDashboard session="memory-session" onSessionExpired={vi.fn()} onLogout={vi.fn().mockResolvedValue(undefined)} />); await waitFor(() => expect(screen.getByText(/Quota A/)).toBeInTheDocument()); expect(screen.getByText(/Quota B/)).toBeInTheDocument(); expect(screen.getByText("cool|provider")).toBeInTheDocument(); expect(screen.getByText("cool")).toBeInTheDocument(); });
   it("traps dialog focus in both directions and returns focus to the originating request", async () => {
     vi.stubGlobal("fetch", vi.fn().mockImplementationOnce(() => Promise.resolve(response(snapshot))).mockImplementation(() => Promise.resolve(response(detail))));
-    const view = render(<AnalyticsDashboard session="memory-session" onSessionExpired={vi.fn()} onLogout={vi.fn().mockResolvedValue(undefined)} />);
+    const view = render(<AnalyticsDashboard session="memory-session" onSessionExpired={vi.fn()} onLogout={vi.fn().mockResolvedValue(undefined)} showRecentTable={true} />);
     await waitFor(() => expect(screen.getByRole("button", { name: /View request/ })).toBeInTheDocument());
     const origin = screen.getByRole("button", { name: /View request/ }); fireEvent.click(origin); await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
     const close = screen.getByRole("button", { name: "Close details" }); close.focus(); fireEvent.keyDown(window, { key: "Tab" }); expect(close).toHaveFocus();
@@ -113,7 +113,7 @@ it("keeps quota and cooldown identities distinct for pipe-containing tuples and 
   });
   it("restores focus to a stable heading when automatic dismissal removes the trigger", async () => {
     vi.stubGlobal("fetch", vi.fn().mockImplementationOnce(() => Promise.resolve(response(snapshot))).mockImplementationOnce(() => Promise.resolve(response(detail))).mockImplementation(() => Promise.resolve(response(snapshot))));
-    render(<AnalyticsDashboard session="memory-session" onSessionExpired={vi.fn()} onLogout={vi.fn().mockResolvedValue(undefined)} />);
+    render(<AnalyticsDashboard session="memory-session" onSessionExpired={vi.fn()} onLogout={vi.fn().mockResolvedValue(undefined)} showRecentTable={true} />);
     await waitFor(() => expect(screen.getByRole("button", { name: /View request/ })).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: /View request/ }));
     await waitFor(() => expect(screen.getByRole("dialog")).toBeInTheDocument());
