@@ -172,7 +172,7 @@ describe("accounting store CLI lifecycle", () => {
       catalog: expect.anything(),
       accountingRecorder: mocks.store,
       accountingReader: mocks.store,
-      dashboardRelayVersion: currentVersion(),
+      relayVersion: currentVersion(),
       dashboardAttributionPolicy: "include_all_labeled",
       // `POST /stop` (backlog item 3, 2026-09-09) reaches the SAME shutdown as a signal.
       onStop: expect.any(Function),

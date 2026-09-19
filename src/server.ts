@@ -247,6 +247,9 @@ export interface ProxyDeps {
   accountingReader?: AccountingReader;
   accountingPricePortOverride?: AccountingPricePort | undefined;
   dashboardAssetRoot?: string;
+  /** Version loaded by this proxy process; "unknown" when an embedder does not supply one. */
+  relayVersion?: string;
+  /** Dashboard-only override; otherwise the dashboard uses relayVersion. */
   dashboardRelayVersion?: string;
   dashboardAttributionPolicy?: AttributionPolicy;
   controlAuthorization?: ControlAuthorizationPort | null;
@@ -358,6 +361,8 @@ export interface Handlers {
   catalog: ModelCatalog;
   pingLoop?: PingLoop;
   breaker: CircuitBreaker;
+  /** Package version loaded by this daemon process; absent only for an unversioned embed. */
+  relayVersion?: string;
   credentialLru: CredentialLru;
   modelCallRecorder?: ModelCallRecorder;
   accountingRecorder: AccountingRecorder;
@@ -816,7 +821,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   });
   const dashboardRead = createDashboardSnapshotReadPort({
     accounting: deps.accountingReader ?? UNAVAILABLE_ACCOUNTING_READER,
-    relayVersion: deps.dashboardRelayVersion ?? "unknown",
+    relayVersion: deps.dashboardRelayVersion ?? deps.relayVersion ?? "unknown",
     attributionPolicy: deps.dashboardAttributionPolicy ?? "unknown",
     availability: createAvailabilityProducer({
       breaker,
@@ -1004,6 +1009,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       catalog,
       pingLoop,
       breaker,
+      relayVersion: deps.relayVersion ?? "unknown",
       credentialLru,
       ...(modelCallRecorder ? { modelCallRecorder } : {}),
       accountingRecorder,

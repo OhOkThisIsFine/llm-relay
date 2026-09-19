@@ -86,6 +86,11 @@ afterEach(() => {
 });
 
 describe("telemetry", () => {
+  it("reports the injected running relay version", () => {
+    const report = getTelemetryReport(twoProviderCfg(), new CircuitBreaker(), NOW, null, "1.2.3");
+    expect(report.version).toBe("1.2.3");
+  });
+
   it("getTelemetryReport generates valid metrics report", () => {
     const cb = new CircuitBreaker();
     cb.recordOutcome(target("nim", "z-ai/glm-5.2"), {

@@ -1387,6 +1387,46 @@ describe("routing show — config-staleness notice", () => {
     }
   });
 
+  it("prints a version mismatch on stderr and leaves stdout JSON unchanged", async () => {
+    const server = createServer((req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          version: "0.0.0-running",
+          config: { path: "x", loadedAt: 1, changedOnDisk: false, diskMtime: 1 },
+        }),
+      );
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("missing test listener");
+      const configPath = join(dir, "version-mismatch-config.json");
+      writeFileSync(configPath, JSON.stringify(configAt(`127.0.0.1:${address.port}`), null, 2));
+      process.argv = ["node", "cli.ts", "--config", configPath, "routing", "show"];
+      const stdout: string[] = [];
+      const stderr: string[] = [];
+      vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+        stdout.push(String(chunk));
+        return true;
+      });
+      vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+        stderr.push(String(chunk));
+        return true;
+      });
+
+      await runRoutingCommand();
+
+      expect(JSON.parse(stdout.join(""))).toMatchObject(routingBlock);
+      const warning = stderr.join("");
+      expect(warning).toContain("the running relay is v0.0.0-running; the installed package is v");
+      expect(warning).toContain("— restart the relay to load it");
+      expect(warning).not.toContain("config changed on disk");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
   it("prints no staleness notice when no relay is listening, and stdout is unaffected", async () => {
     const configPath = join(dir, "offline-config.json");
     writeFileSync(configPath, JSON.stringify(configAt("127.0.0.1:65533"), null, 2));
