@@ -12,7 +12,6 @@ import {
   clearExhausted,
   MAX_EXHAUSTED_MS,
   normalizeCliCommand,
-  type DispatchLane,
 } from "../src/dispatch.js";
 import { parseTelemetryReport, recordLaneRun } from "../src/dispatch-lane-stats.js";
 
@@ -427,13 +426,13 @@ describe("dispatch ladder — order, never execution", () => {
     // rendering defect the audit is removing — the task must stay inside one argv element.
     const view = buildDispatch(cfgWith({ ladder: LADDER }), { task: "rm -rf /; echo $(whoami)" });
     const lane = view.next!;
-    // `attemptBudget` joined the shape on 2026-09-08 (the walk's per-lane budget); `maxConcurrent`
-    // joined it on 2026-09-09 (the per-lane concurrency cap, rendered even when `null`). The
+    // `maxConcurrent` joined the shape on 2026-09-09 (the per-lane concurrency cap, rendered even
+    // when `null`). The retired `attemptBudget` field left with the idle-only walk. The
     // guarantee this test exists for is the two assertions BELOW — the task stays inside one argv
     // element and no field carries a pre-joined command line — so a new structured field is an
     // update, not a weakening. Keep the exact-key list: it is what would catch a convenience
     // "commandLine" string.
-    expect(Object.keys(lane).sort()).toEqual(["attemptBudget", "id", "invoke", "kind", "maxConcurrent", "position", "quota", "state"]);
+    expect(Object.keys(lane).sort()).toEqual(["id", "invoke", "kind", "maxConcurrent", "position", "quota", "state"]);
     expect(lane.invoke?.args).toEqual(["-p", "rm -rf /; echo $(whoami)", "--model", "g-flash"]);
     for (const value of Object.values(view)) {
       expect(typeof value === "string" ? value : "").not.toContain("rm -rf /;");
@@ -563,68 +562,51 @@ describe("dispatch ladder — endpoint", () => {
   });
 });
 
-describe("tier-keyed attempt budgets (backlog item 4)", () => {
-  const WALK = { attemptMs: 90_000, attemptMinSamples: 5, attemptQuantile: 0.8 };
+describe("tier-keyed time-to-answer history", () => {
+  const WALK = { attemptMinSamples: 5 };
 
   function cfgWithTiers(): Config {
     const rung = { id: "slow", kind: "cli", command: "a", args: ["{task}"] };
-    return cfgWith({
-      dispatchWalk: WALK,
-      ladders: { low: [{ ...rung }], high: [{ ...rung }] },
-    });
+    return cfgWith({ dispatchWalk: WALK, ladders: { low: [{ ...rung }], high: [{ ...rung }] } });
   }
 
   function recordOn(cfg: Config, tier: string | null, durationsMs: readonly number[]): void {
     durationsMs.forEach((ms, i) => {
       const parsed = parseTelemetryReport({
-        jobId: `job-${tier ?? "legacy"}-${i}`,
-        laneId: "slow",
-        kind: "cli",
-        ...(tier === null ? {} : { tier }),
-        wallClockMs: ms,
-        exitCode: 0,
-        status: "completed",
-        estimatedInputTokens: 1,
-        estimatedOutputTokens: 1,
+        jobId: `job-${tier ?? "legacy"}-${i}`, laneId: "slow", kind: "cli",
+        ...(tier === null ? {} : { tier }), wallClockMs: ms, exitCode: 0, status: "completed",
+        estimatedInputTokens: 1, estimatedOutputTokens: 1,
       });
       if (!parsed) throw new Error("fixture telemetry report rejected");
       recordLaneRun(cfg, parsed, 1_700_000_000_000 + i);
     });
   }
 
-  function budgetOf(cfg: Config, tier: string): DispatchLane["attemptBudget"] {
-    return buildDispatch(cfg, { tier }).ladder.find((l) => l.id === "slow")?.attemptBudget;
+  function timeOf(cfg: Config, tier: string) {
+    return buildDispatch(cfg, { tier }).ladder.find((l) => l.id === "slow")?.timeToAnswer;
   }
 
-  it("runs recorded under `low` do not move `attemptBudget(lane, 'high')`", () => {
+  it("runs recorded under low do not become high history", () => {
     const cfg = cfgWithTiers();
     recordOn(cfg, "low", [200_000, 210_000, 220_000, 230_000, 240_000, 250_000]);
-    // The low window cleared the sample floor: its own p80.
-    expect(budgetOf(cfg, "low")).toEqual({ ms: 240_000, basis: "history", samples: 6 });
-    // High never ran: the flat figure, never a quantile over another tier's runs.
-    expect(budgetOf(cfg, "high")).toEqual({ ms: 90_000, basis: "floor", samples: 0 });
+    expect(timeOf(cfg, "low")).toEqual({ medianMs: 225_000, p80Ms: 240_000, samples: 6, mode: null });
+    expect(timeOf(cfg, "high")).toBeUndefined();
   });
 
-  it("below the sample floor the tier falls back to the legacy window and reports its basis honestly", () => {
+  it("below the sample floor the tier falls back to one legacy window", () => {
     const cfg = cfgWithTiers();
     recordOn(cfg, null, [300_000, 310_000, 320_000, 330_000, 340_000, 350_000]);
     recordOn(cfg, "high", [10_000, 11_000]);
-    // Two high runs are not a distribution, so the legacy window answers — and the basis says
-    // so: `history` with the legacy window's six samples, never a merge of the two.
-    expect(budgetOf(cfg, "high")).toEqual({ ms: 340_000, basis: "history", samples: 6 });
+    expect(timeOf(cfg, "high")).toEqual({ medianMs: 325_000, p80Ms: 340_000, samples: 6, mode: null });
   });
 
-  it("with no legacy window either, the fallback is still the flat figure", () => {
+  it("with no legacy window, thin tier history is still reported rather than fabricated", () => {
     const cfg = cfgWithTiers();
     recordOn(cfg, "high", [600_000, 600_000]);
-    // `samples` names the two runs the thin window holds (0 before 2026-09-10, which read as "never
-    // ran"): the same count the untiered floor reports (`dispatch-attempt-budget.test.ts`).
-    expect(budgetOf(cfg, "high")).toEqual({ ms: 90_000, basis: "floor", samples: 2 });
+    expect(timeOf(cfg, "high")).toEqual({ medianMs: 600_000, p80Ms: 600_000, samples: 2, mode: null });
   });
 
-  it("the advisory `stats` column stays a per-lane aggregate across tiers", () => {
-    // The backlog entry says the column may still want the aggregate: one lane's runs under
-    // two tiers count once, in one column, while the budgets above stay separate.
+  it("the advisory stats column stays a per-lane aggregate across tiers", () => {
     const cfg = cfgWithTiers();
     recordOn(cfg, "low", [10_000, 11_000]);
     recordOn(cfg, "high", [20_000, 21_000, 22_000]);

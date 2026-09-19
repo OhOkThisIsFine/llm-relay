@@ -2,7 +2,7 @@
  * The walk stops a lane only when it is IDLE, and never moves a packet to a rung that declares a
  * lower capability (2026-09-17). Owner decision the same day: a lane is stopped after
  * `routing.dispatchWalk.idleMs` with no activity — no request the relay daemon serves with the
- * lane's tag, no output, no change in its working tree — never because it ran longer than its past
+ * lane's tag, no output, no owned process CPU increase, no change in its working tree — never because it ran longer than its past
  * runs. Measured 2026-09-16: the old budget stopped `free-pool` at its 789 s p80 with +203 lines
  * written, then started a lane kept for short advisory work with the same implementation packet.
  */
@@ -179,7 +179,7 @@ describe("the walk stops a lane only when it is idle", () => {
     const text = await finish(h, {});
     expect(h.started).toEqual(["slow", "next"]);
     expect(text).toContain("next answered");
-    expect(text).toContain("no activity for 30s (no relay traffic, output or file change)");
+    expect(text).toContain("no activity for 30s (no relay traffic, output, process CPU or file change)");
   });
 
   it("keeps a silent lane while the relay serves a request with its tag", async () => {
@@ -349,7 +349,7 @@ describe("the walk stops a lane only when it is idle", () => {
     const text = await finish(h, {});
     expect(h.started).toEqual(["slow", "next"]);
     expect(text).toContain("next answered");
-    expect(text).toContain("no activity for 30s (no relay traffic, output or file change)");
+    expect(text).toContain("no activity for 30s (no relay traffic, output, process CPU or file change)");
   });
 
 ).exec(h.headers[0] ?? "")?.[1];
@@ -539,7 +539,7 @@ describe("the walk stops a lane only when it is idle", () => {
     const text = await finish(h, {});
     expect(h.started).toEqual(["slow", "next"]);
     expect(text).toContain("next answered");
-    expect(text).toContain("no activity for 30s (no relay traffic, output or file change)");
+    expect(text).toContain("no activity for 30s (no relay traffic, output, process CPU or file change)");
   });
 
 ));

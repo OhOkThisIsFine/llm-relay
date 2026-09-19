@@ -1712,7 +1712,7 @@ describe("loadConfig — provider firstByteTimeoutMs", () => {
 });
 
 describe("routing.dispatchWalk", () => {
-  it("defaults ON with the standard budget when absent — the 2026-09-06 owner request", () => {
+  it("defaults ON with idle stopping and legacy compatibility values when absent", () => {
     const cfg = loadConfig(write("dw-absent.json", base()));
     expect(cfg.routing.dispatchWalk).toEqual({
       enabled: true,
@@ -1774,7 +1774,7 @@ describe("routing.dispatchWalk", () => {
       write("dw-false.json", base({ routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: false } })),
     );
     expect(off.routing.dispatchWalk?.enabled).toBe(false);
-    // The other settings keep their defaults, so turning it back on needs no second edit.
+    // Legacy compatibility values are preserved even while the walk is disabled.
     expect(off.routing.dispatchWalk?.attemptMs).toBe(90_000);
   });
 
@@ -1816,13 +1816,12 @@ describe("routing.dispatchWalk", () => {
     ).toThrow(/dispatchWalk\.attemptms is not a recognized key/);
   });
 
-  it("rejects an out-of-bounds budget, a bad lane count and a non-boolean enabled", () => {
+  it("keeps the historical accepted range for the legacy attempt key, and validates live fields", () => {
     expect(() =>
       loadConfig(write("dw-lowbudget.json", base({
         routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { attemptMs: 10 } },
       }))),
-      // Floor 1000 ms: a budget below that abandons every lane before a process can even start,
-      // which would read to an operator as "every lane is broken".
+      // Historical range is retained so an old config does not change validity when the key is inert.
     ).toThrow(/dispatchWalk\.attemptMs must be a number between 1000 and 3600000/);
     expect(() =>
       loadConfig(write("dw-lanes.json", base({
