@@ -2153,8 +2153,10 @@ removes the job's journal row *before* the caller sees the status, on every term
 worktrees, and a separate measurement found four processes from *finished* runs still burning CPU
 hours later (~530 MB). The distinguishing signal is **ownership, not age** — a slow lane and a
 stale one look identical from outside, and one legitimately ran 29 minutes — so the dispatcher
-reaps only what it started. What it started is enumerable through `ownedProcesses()` by job id,
-and any pid still alive after termination is **reported** in the job's rendering (`owned processes
+reaps only what it started. On POSIX, each lane root is started as its own session/process-group
+leader and cancellation or timeout kills that whole group; Windows uses `taskkill /T /F`. What it
+started is enumerable through `ownedProcesses()` by job id, and any pid still alive after termination
+is **reported** in the job's rendering (`owned processes
 STILL RUNNING after <job> ended: <pids>`) rather than assumed gone. A survivor is the one case
 worth acting on, so it is named rather than logged.
 

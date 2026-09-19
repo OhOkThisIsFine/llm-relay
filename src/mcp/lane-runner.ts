@@ -21,7 +21,7 @@
  * the relay daemon. The daemon's rule stands untouched: no HTTP turn causes a lane spawn. This
  * process answers no HTTP at all.
  */
-import { exec, execFile, execSync } from "node:child_process";
+import { exec, execFile, execSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
@@ -617,7 +617,11 @@ export type LaneSpawner = (
 
 type LaneExecError = Error & { killed?: boolean | undefined; code?: unknown };
 
-/** Terminate a full process tree (on Windows via taskkill /T /F, on POSIX via process group / signal). */
+/**
+ * Terminate a full process tree (Windows: taskkill /T /F; POSIX: the process group created by
+ * `createLaneSpawner`). The positive-pid fallback is defence for an injected/legacy child that was
+ * not started as a group leader; the real POSIX spawner always owns group `pid`.
+ */
 export function terminateProcessTree(pid: number, platform: NodeJS.Platform = process.platform): void {
   if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid <= 0) return;
   if (platform === "win32") {
@@ -681,6 +685,138 @@ function observeOutput(child: LaneChildProcess, onOutput: LaneSpawnOptions["onOu
   watch("stderr");
 }
 
+/** Spawn options for the POSIX process-group path. */
+export interface LaneSpawnProcessOptions {
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  windowsHide: true;
+  detached: true;
+}
+
+/** Child events the POSIX buffered spawn path consumes. */
+export interface LaneSpawnedProcess extends LaneChildProcess {
+  on(event: "error", listener: (err: Error) => void): unknown;
+  on(event: "close", listener: (code: number | null, signal: NodeJS.Signals | null) => void): unknown;
+}
+
+/**
+ * POSIX uses `spawn`, not `execFile`, because only spawn documents `detached: true`. That makes
+ * the root a new session/process-group leader (PGID === PID), so `terminateProcessTree` can own
+ * every ordinary descendant. Buffering here preserves execFile's lane result contract and cap.
+ */
+function spawnPosixLane(
+  processApi: LaneProcessApi,
+  command: string,
+  args: readonly string[],
+  opts: LaneSpawnOptions,
+): LaneSpawnHandle {
+  const spawnProcess = processApi.spawn;
+  if (!spawnProcess) {
+    return {
+      result: Promise.resolve({
+        code: null,
+        stdout: "",
+        stderr: "POSIX lane spawning requires the injected spawn boundary",
+        timedOut: false,
+      }),
+      kill: () => {},
+      pids: () => [],
+    };
+  }
+
+  let child: LaneSpawnedProcess | undefined;
+  let timedOut = false;
+  let bufferExceeded: "stdout" | "stderr" | null = null;
+  let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+  const stdoutChunks: Buffer[] = [];
+  const stderrChunks: Buffer[] = [];
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+
+  const killOwned = (): void => {
+    if (child?.pid) terminateProcessTree(child.pid, processApi.platform);
+    child?.kill();
+  };
+  const clearTimer = (): void => {
+    if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+    timeoutTimer = undefined;
+  };
+  const append = (stream: "stdout" | "stderr", chunk: string | Buffer): void => {
+    const data = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    const isStdout = stream === "stdout";
+    const used = isStdout ? stdoutBytes : stderrBytes;
+    const remaining = Math.max(0, MAX_OUTPUT_BYTES - used);
+    if (remaining > 0) {
+      const kept = data.length <= remaining ? data : data.subarray(0, remaining);
+      (isStdout ? stdoutChunks : stderrChunks).push(kept);
+      if (isStdout) stdoutBytes += kept.length;
+      else stderrBytes += kept.length;
+    }
+    if (data.length > remaining && bufferExceeded === null) {
+      bufferExceeded = stream;
+      killOwned();
+    }
+  };
+
+  const result = new Promise<LaneRunResult>((resolve) => {
+    let settled = false;
+    const settle = (code: number | null, error?: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimer();
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      let stderr = Buffer.concat(stderrChunks).toString("utf8");
+      if (!stderr && error) stderr = error.message;
+      if (bufferExceeded !== null) {
+        const msg = `${bufferExceeded} exceeded ${MAX_OUTPUT_BYTES} byte lane output limit`;
+        stderr = stderr ? `${stderr}\n${msg}` : msg;
+      }
+      resolve({
+        code: bufferExceeded === null ? code : null,
+        stdout,
+        stderr,
+        timedOut,
+      });
+    };
+
+    try {
+      child = spawnProcess(command, args as string[], {
+        cwd: opts.cwd,
+        env: opts.env,
+        windowsHide: true,
+        detached: true,
+      });
+    } catch (e) {
+      settle(null, e as Error);
+      return;
+    }
+
+    child.stdout?.on("data", (chunk) => append("stdout", chunk));
+    child.stderr?.on("data", (chunk) => append("stderr", chunk));
+    observeOutput(child, opts.onOutput);
+    child.on("error", (err) => settle(null, err));
+    child.on("close", (code) => settle(code));
+    // Same stdin rule as the Windows execFile path: an agent waiting for EOF must receive it.
+    child.stdin?.end();
+
+    if (opts.timeoutMs > 0) {
+      timeoutTimer = setTimeout(() => {
+        timedOut = true;
+        killOwned();
+      }, opts.timeoutMs);
+      timeoutTimer.unref?.();
+    }
+  });
+
+  return {
+    result,
+    kill: () => {
+      clearTimer();
+      killOwned();
+    },
+    pids: () => (child?.pid === undefined ? [] : [child.pid]),
+  };
+}
 /** Spawn options common to the direct and Windows shell-fallback paths. */
 export interface LaneExecOptions {
   encoding: "utf8";
@@ -711,12 +847,19 @@ export interface LaneProcessApi {
     opts: LaneExecOptions,
     callback: LaneExecCallback,
   ) => LaneChildProcess;
+  /** POSIX-only real spawn seam: `detached` is supported by spawn, not execFile. */
+  spawn?: (
+    command: string,
+    args: string[],
+    opts: LaneSpawnProcessOptions,
+  ) => LaneSpawnedProcess;
 }
 
 const nodeProcessApi: LaneProcessApi = {
   platform: process.platform,
   execFile: (command, args, opts, callback) => execFile(command, args, opts, callback),
   exec: (command, opts, callback) => exec(command, opts, callback),
+  spawn: (command, args, opts) => spawn(command, args, opts),
 };
 
 /**
@@ -746,6 +889,8 @@ export function createLaneSpawner(
         kill: () => {},
       };
     }
+
+    if (processApi.platform !== "win32") return spawnPosixLane(processApi, command, args, opts);
 
     const execOpts: LaneExecOptions = {
       encoding: "utf8",
@@ -781,13 +926,9 @@ export function createLaneSpawner(
       };
 
       child = processApi.execFile(command, args as string[], execOpts, (err, stdout, stderr) => {
-        if (!err) {
-          resolve({ code: 0, stdout, stderr, timedOut: false });
-          return;
-        }
         // An npm `.cmd` shim is not directly executable; Windows answers ENOENT. Retry through the
         // shell, quoting every token — see `quoteCmdArg`.
-        if (processApi.platform === "win32" && err.code === "ENOENT" && !killed) {
+        if (err && processApi.platform === "win32" && err.code === "ENOENT" && !killed) {
           const line = `${quoteCmdArg(command)} ${args.map(quoteCmdArg).join(" ")}`;
           const fallback = processApi.exec(line, execOpts, (err2, stdout2, stderr2) => {
             settle(err2, stdout2 ?? "", stderr2 ?? "");
@@ -805,15 +946,14 @@ export function createLaneSpawner(
       // zero bytes until the timeout kills it. Measured live; the synchronous form hid it.
       child.stdin?.end();
       observeOutput(child, opts.onOutput);
+
     });
 
     return {
       result,
       kill: () => {
         killed = true;
-        if (child?.pid) {
-          terminateProcessTree(child.pid, processApi.platform);
-        }
+        if (child?.pid) terminateProcessTree(child.pid, processApi.platform);
         child?.kill();
       },
       // ⚠ Read lazily, and that is load-bearing rather than tidy: the ENOENT fallback above REPLACES

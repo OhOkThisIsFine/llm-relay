@@ -18,6 +18,7 @@ import {
   createLaneSpawner,
   type LaneChildProcess,
   type LaneProcessApi,
+  type LaneSpawnedProcess,
   type LaneSpawner,
 } from "../src/mcp/lane-runner.js";
 import { McpDispatchServer, describeActivity, type DispatchViewBuilder } from "../src/mcp/server.js";
@@ -88,18 +89,22 @@ describe("describeActivity", () => {
 // ---------------------------------------------------------------------------------------------
 // The spawner feeds it: a second `data` listener beside execFile's own buffering one.
 
-interface StreamingChild extends LaneChildProcess {
+interface StreamingChild extends LaneSpawnedProcess {
   stdout: EventEmitter;
   stderr: EventEmitter;
+  lifecycle: EventEmitter;
 }
 
 function streamingChild(): StreamingChild {
+  const lifecycle = new EventEmitter();
   return {
     pid: 4321,
     stdin: { end: () => {} },
     stdout: new EventEmitter(),
     stderr: new EventEmitter(),
     kill: () => true,
+    on: (event, listener) => lifecycle.on(event, listener as (...args: unknown[]) => void),
+    lifecycle,
   };
 }
 
@@ -109,12 +114,15 @@ describe("createLaneSpawner output observation", () => {
     let finish: () => void = () => {};
     const processApi: LaneProcessApi = {
       platform: "linux",
-      execFile: (_command, _args, _opts, callback) => {
-        finish = () => callback(null, "hello world", "warn");
-        return child;
+      execFile: () => {
+        throw new Error("POSIX lane should use spawn");
       },
       exec: () => {
         throw new Error("not reached");
+      },
+      spawn: () => {
+        finish = () => child.lifecycle.emit("close", 0, null);
+        return child;
       },
     };
     const seen: Array<{ stream: string; bytes: number }> = [];
@@ -128,7 +136,7 @@ describe("createLaneSpawner output observation", () => {
     child.stdout.emit("data", Buffer.from("wörld"));
     child.stderr.emit("data", "warn");
     finish();
-    expect(await run.result).toEqual({ code: 0, stdout: "hello world", stderr: "warn", timedOut: false });
+    expect(await run.result).toEqual({ code: 0, stdout: "hello wörld", stderr: "warn", timedOut: false });
     expect(seen).toEqual([
       { stream: "stdout", bytes: 6 },
       { stream: "stdout", bytes: Buffer.byteLength("wörld") },

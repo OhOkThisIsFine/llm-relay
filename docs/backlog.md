@@ -31,17 +31,6 @@
   to launch Windows command shims; if a shell remains necessary, its encoder and Windows test must
   prove embedded quotes and `& | < > ^ ( ) % !` stay one literal argument.
 
-- **POSIX lane reaping does not reliably kill descendants (verified 2026-09-18, high).**
-  `terminateProcessTree` tries `process.kill(-pid, "SIGKILL")`, which targets process group `pid`,
-  then falls back to killing only `pid`. But `createLaneSpawner` does not start the child as a new
-  process-group/session leader, so under the default POSIX spawn the child normally inherits its
-  parent's process group and `-pid` names no group. Reproduced on Linux with the same default-spawn
-  shape: child and grandchild inherited the parent's PGID, the negative-pid kill returned `ESRCH`,
-  and the grandchild remained alive after the root was killed. **Property:** every terminal,
-  cancelled or abandoned spawned lane leaves no process it started running. Add a real POSIX
-  parent→grandchild integration test; either create an owned process group/session or enumerate and
-  terminate descendants explicitly.
-
 - **The repository gate has no Windows execution leg and is not enforced on `main` (verified
   2026-09-18, medium/repository hardening).** `.github/workflows/ci.yml` is intentionally Ubuntu-
   only on the assumption that development happens on Windows, while `CONTRIBUTING.md` now invites
