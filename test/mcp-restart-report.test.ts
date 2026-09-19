@@ -38,7 +38,7 @@ async function killedResult(path: string, jobId: string, treeSnapshot?: TreeSnap
       throw new Error("unused in dispatch_result test");
     },
     journal: createJobJournal(path),
-    treeSnapshot,
+    ...(treeSnapshot === undefined ? {} : { treeSnapshot }),
     write: (chunk) => out.push(JSON.parse(chunk) as (typeof out)[number]),
   });
   await server.ingest(
