@@ -26,7 +26,8 @@ import { randomBytes } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { resolveWindowsNpmShim, type WindowsNpmShimDeps, type WindowsNpmShimResolution } from "./windows-npm-shim.js";
-import { nullJobJournal, type JobJournal } from "./job-journal.js";
+import { nullJobJournal, type JobJournal, type JournalStartingTree } from "./job-journal.js";
+import type { TreeSnapshot } from "./tree-delta.js";
 import { nullJobArchive, type JobArchive } from "./job-archive.js";
 import { classifyLaneProbeOutput, type LaneProbeSpawnResult } from "../lane-quota-probe.js";
 import { laneOfRung } from "../lane-manifest.js";
@@ -1158,6 +1159,8 @@ export class LaneJobStore {
 
   private readonly journal: JobJournal;
   private readonly archive: JobArchive;
+  /** Starting trees carried off orphan rows before the journal drops them on its next write. */
+  private readonly adoptedStartingTrees = new Map<string, { cwd: string; startingTree: JournalStartingTree }>();
   private readonly nextJobId: () => string;
 
   constructor(
@@ -1225,6 +1228,9 @@ export class LaneJobStore {
         process: { pids: [], survivors: [], terminated: false },
       };
       this.jobs.set(row.jobId, killed);
+      if (row.startingTree !== undefined) {
+        this.adoptedStartingTrees.set(row.jobId, { cwd: row.cwd, startingTree: row.startingTree });
+      }
       // ⚠ Archived at adoption, because the journal's first write by THIS process rewrites the file
       // with only its own rows — so without this, the killed report survived exactly one restart
       // and a second one answered `unknown jobId` for it all over again.
@@ -1412,6 +1418,23 @@ export class LaneJobStore {
     const job = this.jobs.get(id);
     if (!job || job.status !== "running") return;
     job.readOnly = { laneId, binding };
+  }
+
+  /** Persist the job-wide starting tree while the job is still running. */
+  noteStartingTree(id: string, tree: TreeSnapshot, scope: readonly string[] | undefined): void {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "running") return;
+    this.journal.noteStartingTree?.(id, tree, scope);
+  }
+
+  /**
+   * Return, once, the starting trees carried by jobs adopted as killed after a restart. The server
+   * owns the git reader, so the store cannot render their deltas synchronously during construction.
+   */
+  takeAdoptedStartingTrees(): Array<{ jobId: string; cwd: string; startingTree: JournalStartingTree }> {
+    const adopted = [...this.adoptedStartingTrees].map(([jobId, value]) => ({ jobId, ...value }));
+    this.adoptedStartingTrees.clear();
+    return adopted;
   }
 
   /** Record what the launcher changed for the lane now running, so the reply can state it. */
