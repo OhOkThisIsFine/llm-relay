@@ -541,7 +541,7 @@ export const DEFAULT_DISPATCH_WALK: DispatchWalkSettings = {
  * — the `compat`/`laneProbe` precedent, because an ignored typo would read as a setting that took
  * effect while changing nothing.
  */
-function parseDispatchWalk(raw: unknown): DispatchWalkSettings {
+function parseDispatchWalk(raw: unknown, warnings: string[] = []): DispatchWalkSettings {
   if (raw === undefined || raw === null) return { ...DEFAULT_DISPATCH_WALK };
   if (typeof raw === "boolean") return { ...DEFAULT_DISPATCH_WALK, enabled: raw };
   if (typeof raw !== "object" || Array.isArray(raw)) {
@@ -556,6 +556,17 @@ function parseDispatchWalk(raw: unknown): DispatchWalkSettings {
   }
   if (o.enabled !== undefined && typeof o.enabled !== "boolean") {
     throw new Error(`config.routing.dispatchWalk.enabled must be a boolean`);
+  }
+  // These legacy budget knobs are still parsed so existing configs keep loading, but since
+  // v0.84.0 the walk stops a lane only on observable idleness (`idleMs`). Announce an explicit
+  // setting rather than letting an operator believe it changed the stopping policy.
+  for (const key of ["attemptMs", "agentAttemptMs", "attemptQuantile"] as const) {
+    if (o[key] !== undefined) {
+      warnings.push(
+        `config.routing.dispatchWalk.${key} has no effect on when a lane is stopped since v0.84.0: ` +
+          `the walk stops a lane only when it is idle (idleMs).`,
+      );
+    }
   }
   const bounded = (name: string, value: unknown, fallback: number, min: number, max: number): number => {
     if (value === undefined) return fallback;
@@ -898,7 +909,7 @@ function parseOptionalBlocks(
   const pacing = parsePacing(r.pacing);
   const crawl = parseCrawl(r.crawl);
   const laneProbe = parseLaneProbe(r.laneProbe);
-  const dispatchWalk = parseDispatchWalk(r.dispatchWalk);
+  const dispatchWalk = parseDispatchWalk(r.dispatchWalk, warnings);
   const mcp = parseMcpSettings(r.mcp, warnings);
   return {
     ...(sticky ? { sticky } : {}),
