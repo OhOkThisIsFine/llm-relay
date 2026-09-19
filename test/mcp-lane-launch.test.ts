@@ -7,7 +7,7 @@
  * The reply names each correction on a `launch:` line.
  */
 import { describe, expect, it } from "vitest";
-import { McpDispatchServer } from "../src/mcp/server.js";
+import { buildLaneEnv, McpDispatchServer } from "../src/mcp/server.js";
 import { agyWorkingDirInvoke, expandEnvReferences } from "../src/mcp/lane-runner.js";
 import type { Config } from "../src/config.js";
 import type { DispatchLane, DispatchView } from "../src/dispatch.js";
@@ -44,6 +44,54 @@ describe("expandEnvReferences", () => {
   });
 });
 
+describe("buildLaneEnv", () => {
+  const config = {
+    providers: {
+      anthropic: { authEnv: "ANTHROPIC_API_KEY" },
+      fleet: { credentials: [{ label: "one", authEnv: "FLEET_EXACT_KEY" }] },
+    },
+  } as unknown as Config;
+
+  it("removes configured legacy credential names and their real aliases", () => {
+    const env = buildLaneEnv(
+      { ANTHROPIC_API_KEY: "not-real", ANTHROPIC_AUTH_TOKEN: "not-real-2", SAFE: "keep" },
+      undefined,
+      config,
+      "linux",
+    );
+    expect(env).toEqual({ SAFE: "keep" });
+  });
+
+  it("scrubs only the exact names of explicit fleet slots", () => {
+    const env = buildLaneEnv(
+      { FLEET_EXACT_KEY: "not-real", FLEET_API_KEY: "unrelated", SAFE: "keep" },
+      undefined,
+      config,
+      "linux",
+    );
+    expect(env).toEqual({ FLEET_API_KEY: "unrelated", SAFE: "keep" });
+  });
+
+  it("lets a rung deliberately reintroduce a credential variable", () => {
+    const env = buildLaneEnv(
+      { ANTHROPIC_API_KEY: "inherited-not-real", SAFE: "keep" },
+      { ANTHROPIC_API_KEY: "lane-only-not-real" },
+      config,
+      "linux",
+    );
+    expect(env).toEqual({ ANTHROPIC_API_KEY: "lane-only-not-real", SAFE: "keep" });
+  });
+
+  it("treats credential variable names case-insensitively on Windows", () => {
+    const env = buildLaneEnv(
+      { anthropic_api_key: "not-real", Safe: "keep" },
+      undefined,
+      config,
+      "win32",
+    );
+    expect(env).toEqual({ Safe: "keep" });
+  });
+});
 describe("agyWorkingDirInvoke", () => {
   const wrapped = {
     command: "pwsh",
@@ -69,7 +117,7 @@ describe("agyWorkingDirInvoke", () => {
   });
 });
 
-function harness(lane: DispatchLane) {
+function harness(lane: DispatchLane, config?: Config) {
   const calls: Array<{ args: string[]; env: NodeJS.ProcessEnv | undefined }> = [];
   const spawn: LaneSpawner = (_command, args, opts) => {
     calls.push({ args: [...args], env: opts.env });
@@ -80,7 +128,7 @@ function harness(lane: DispatchLane) {
   };
   const out: string[] = [];
   const server = new McpDispatchServer({
-    config: { host: "127.0.0.1", port: 8791, routing: { default: "x" } } as unknown as Config,
+    config: config ?? ({ host: "127.0.0.1", port: 8791, routing: { default: "x" } } as unknown as Config),
     buildView: async () => view,
     spawn,
     platform: "win32",
@@ -129,6 +177,61 @@ describe("the lane launcher, end to end", () => {
     expect(text).toContain(`launch: agy works in ${process.cwd()} (--add-dir)`);
   });
 
+  it("does not pass a configured relay credential from the MCP process into a lane", async () => {
+    const name = "LLM_RELAY_TEST_PROVIDER_SECRET";
+    const before = process.env[name];
+    process.env[name] = "not-a-real-secret";
+    try {
+      const config = {
+        host: "127.0.0.1",
+        port: 8791,
+        providers: { test: { authEnv: name } },
+        routing: { default: "x" },
+      } as unknown as Config;
+      const h = harness({
+        id: "plain",
+        kind: "cli",
+        position: 1,
+        state: "ready",
+        invoke: { command: "claude", args: ["-p", "{task}"] },
+      }, config);
+      await dispatchText(h);
+      expect(h.calls[0]?.env?.[name]).toBeUndefined();
+    } finally {
+      if (before === undefined) delete process.env[name];
+      else process.env[name] = before;
+    }
+  });
+
+  it("passes a relay credential only when the rung explicitly sets that variable", async () => {
+    const name = "LLM_RELAY_TEST_PROVIDER_SECRET";
+    const before = process.env[name];
+    process.env[name] = "inherited-not-real";
+    try {
+      const config = {
+        host: "127.0.0.1",
+        port: 8791,
+        providers: { test: { authEnv: name } },
+        routing: { default: "x" },
+      } as unknown as Config;
+      const h = harness({
+        id: "plain",
+        kind: "cli",
+        position: 1,
+        state: "ready",
+        invoke: {
+          command: "claude",
+          args: ["-p", "{task}"],
+          env: { [name]: "lane-only-not-real" },
+        },
+      }, config);
+      await dispatchText(h);
+      expect(h.calls[0]?.env?.[name]).toBe("lane-only-not-real");
+    } finally {
+      if (before === undefined) delete process.env[name];
+      else process.env[name] = before;
+    }
+  });
   it("an ordinary lane gets no launch line", async () => {
     const h = harness({
       id: "plain",
