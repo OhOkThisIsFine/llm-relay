@@ -114,7 +114,7 @@ function harness(opts: { readings: Array<TreeSnapshot | null>; laneMs?: number; 
     buildView: async () => view,
     spawn,
     treeSnapshot,
-    journal: opts.journal,
+    ...(opts.journal === undefined ? {} : { journal: opts.journal }),
     cwd: () => process.cwd(),
     write: (chunk) => out.push(JSON.parse(chunk) as (typeof out)[number]),
   });
