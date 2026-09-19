@@ -54,7 +54,9 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   - The lane launcher expands `%VAR%` environment values (or removes one that does not resolve),
     and an AGY lane gets `--add-dir <cwd>`. The job shows both on a `launch:` line (`9f341da`).
   - An agent-mode answer ends with a `tree delta` block: what the lane changed in `git status`,
-    with an optional `scope` that marks paths OUT OF SCOPE. Report only (`4e1899e`).
+    with an optional `scope` that marks paths OUT OF SCOPE. A restart-killed job now recovers the
+    bounded starting status from the running-job journal and labels the delta as measured at restart
+    adoption time, not at death. Report only (`4e1899e`; current branch adds restart recovery).
   - The walk skips a rung whose new `capability` is below the dispatch tier (`42b2745`). Its
     budget extension was replaced by the idle-only stop in v0.84.0.
   - The Codex `relay` agent template writes provenance only from a real dispatch result
@@ -71,8 +73,8 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 - **Immediate next.** After the owner restarts Claude Desktop: run a Code tab
   dispatch of a pool task that takes more than 60 s, and confirm it answers in one call and that
   `last activity:` names relay traffic. Open backlog: route B, the Codex Desktop check, the
-  dashboard pin control, the tree delta for a `killed` job, the unused budget code, and the idle
-  signal for lanes that do not use the relay.
+  dashboard pin control, the unused budget code, and the idle signal for lanes that do not use the
+  relay.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 

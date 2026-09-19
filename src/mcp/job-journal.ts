@@ -20,6 +20,7 @@
  */
 import { atomicWriteJsonSync, safeReadJsonSync } from "../storage/json-store.js";
 import { relayStatePath } from "../state-paths.js";
+import { MAX_ACTIVITY_STAT_PATHS, type TreeSnapshot } from "./tree-delta.js";
 
 /** One running job, as the journal records it. */
 export interface JournalRow {
@@ -30,6 +31,12 @@ export interface JournalRow {
   startedAt: number;
   /** The task's first line, cut short, so another process can list the job recognisably. */
   label?: string;
+  /**
+   * The job-wide git status captured before the first lane ran, plus the caller's scope. Optional
+   * because answer-mode jobs, non-git cwd values, old rows, and trees above the bounded path limit
+   * deliberately carry none.
+   */
+  startingTree?: JournalStartingTree;
   /**
    * The process and the journal instance that own the row. Absent on a row written before
    * 2026-09-17, which is read exactly as before: an orphan.
@@ -42,6 +49,12 @@ export interface JournalRow {
    * which is how the suite simulates a restart without a second process.
    */
   owner?: { pid: number; instance: string };
+}
+
+export interface JournalStartingTree {
+  prefix: string;
+  entries: [string, string][];
+  scope?: string[];
 }
 
 export interface JournalFile {
@@ -73,6 +86,8 @@ export function jobJournalPath(env: NodeJS.ProcessEnv = process.env): string {
 export interface JobJournal {
   /** Record a job as running. */
   note(row: JournalRow): void;
+  /** Persist the starting git status for a running agent-mode job, when it fits the bound. */
+  noteStartingTree?(jobId: string, tree: TreeSnapshot, scope: readonly string[] | undefined): void;
   /** Remove a job that reached a terminal state, or one that never started. */
   clear(jobId: string): void;
   /** Rows present at STARTUP whose owner is gone — i.e. jobs a previous process died holding. */
@@ -89,6 +104,7 @@ export interface JobJournal {
 /** A journal that records nothing. The default under vitest, and for an embedder that declines one. */
 export const nullJobJournal: JobJournal = {
   note: () => {},
+  noteStartingTree: () => {},
   clear: () => {},
   orphans: () => [],
   foreign: () => undefined,
@@ -141,11 +157,17 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
   // report.test.ts` caught it (the corrupt-JSON case passed regardless — `JSON.parse` throws on
   // its own — and only the version-99 case distinguished); `tsc` reports it too, as TS2561.
   const readDisk = (): JournalRow[] | null => {
-    const parsed = safeReadJsonSync<JournalFile>(path, {
-      validator: (v): v is JournalFile =>
+    const parsed = safeReadJsonSync<{ version: 1; jobs: unknown[] }>(path, {
+      validator: (v): v is { version: 1; jobs: unknown[] } =>
         isRecord(v) && v["version"] === JOB_JOURNAL_VERSION && Array.isArray(v["jobs"]),
     });
-    return parsed ? parsed.jobs.filter(isJournalRow) : null;
+    if (!parsed) return null;
+    const valid: JournalRow[] = [];
+    for (const value of parsed.jobs) {
+      const row = readJournalRow(value);
+      if (row !== null) valid.push(row);
+    }
+    return valid;
   };
 
   /**
@@ -198,6 +220,26 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
       rows.set(row.jobId, { ...row, owner: { pid, instance } });
       flush();
     },
+    noteStartingTree(jobId, tree, scope) {
+      readOnce();
+      const row = rows.get(jobId);
+      if (row === undefined) return;
+      // Never persist a truncated start: omitted pre-existing paths would be reported later as
+      // false additions. Above the activity bound, absence is the weaker and honest claim.
+      if (tree.entries.size > MAX_ACTIVITY_STAT_PATHS) {
+        if (row.startingTree !== undefined) {
+          delete row.startingTree;
+          flush();
+        }
+        return;
+      }
+      row.startingTree = {
+        prefix: tree.prefix,
+        entries: [...tree.entries],
+        ...(scope === undefined ? {} : { scope: [...scope] }),
+      };
+      flush();
+    },
     clear(jobId) {
       readOnce();
       if (!rows.delete(jobId)) return;
@@ -225,17 +267,64 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-function isJournalRow(value: unknown): value is JournalRow {
-  if (!isRecord(value)) return false;
-  return (
-    typeof value["jobId"] === "string" &&
-    typeof value["laneId"] === "string" &&
-    typeof value["cwd"] === "string" &&
-    typeof value["startedAt"] === "number" &&
-    (value["spec"] === undefined || typeof value["spec"] === "string") &&
-    (value["label"] === undefined || typeof value["label"] === "string") &&
-    (value["owner"] === undefined || isOwner(value["owner"]))
-  );
+function readJournalRow(value: unknown): JournalRow | null {
+  if (!isRecord(value)) return null;
+  if (
+    typeof value["jobId"] !== "string" ||
+    typeof value["laneId"] !== "string" ||
+    typeof value["cwd"] !== "string" ||
+    typeof value["startedAt"] !== "number" ||
+    (value["spec"] !== undefined && typeof value["spec"] !== "string") ||
+    (value["label"] !== undefined && typeof value["label"] !== "string") ||
+    (value["owner"] !== undefined && !isOwner(value["owner"]))
+  ) {
+    return null;
+  }
+
+  const row: JournalRow = {
+    jobId: value["jobId"],
+    laneId: value["laneId"],
+    cwd: value["cwd"],
+    startedAt: value["startedAt"],
+    ...(value["spec"] === undefined ? {} : { spec: value["spec"] }),
+    ...(value["label"] === undefined ? {} : { label: value["label"] }),
+    ...(value["owner"] === undefined ? {} : { owner: value["owner"] }),
+  };
+  const startingTree = readStartingTree(value["startingTree"]);
+  if (startingTree !== undefined) row.startingTree = startingTree;
+  return row;
+}
+
+/**
+ * A malformed optional starting tree does not invalidate the death record itself. The weaker
+ * result is a killed job with no delta, not an invented "unknown jobId".
+ */
+function readStartingTree(value: unknown): JournalStartingTree | undefined {
+  if (!isRecord(value) || typeof value["prefix"] !== "string" || !Array.isArray(value["entries"])) {
+    return undefined;
+  }
+  if (value["entries"].length > MAX_ACTIVITY_STAT_PATHS) return undefined;
+  const entries: [string, string][] = [];
+  for (const pair of value["entries"]) {
+    if (
+      !Array.isArray(pair) ||
+      pair.length !== 2 ||
+      typeof pair[0] !== "string" ||
+      typeof pair[1] !== "string"
+    ) {
+      return undefined;
+    }
+    entries.push([pair[0], pair[1]]);
+  }
+  const scopeValue = value["scope"];
+  if (scopeValue !== undefined && (!Array.isArray(scopeValue) || !scopeValue.every((item) => typeof item === "string"))) {
+    return undefined;
+  }
+  return {
+    prefix: value["prefix"],
+    entries,
+    ...(scopeValue === undefined ? {} : { scope: [...scopeValue] as string[] }),
+  };
 }
 
 function isOwner(value: unknown): value is JournalRow["owner"] {

@@ -1114,6 +1114,8 @@ export class McpDispatchServer {
   private readonly activityTags = new Map<string, string>();
   /** Last cumulative process-tree CPU reading for the current attempt of each job. */
   private readonly processCpu = new Map<string, number>();
+  /** Startup adoption work that must settle before the first request reads a killed job. */
+  private readonly startup: Promise<void>;
 
   constructor(private readonly deps: McpServerDeps) {
     this.jobs = new LaneJobStore(deps.journal ?? nullJobJournal, deps.archive ?? nullJobArchive);
@@ -1122,6 +1124,7 @@ export class McpDispatchServer {
     this.now = deps.now ?? Date.now;
     this.cwd = deps.cwd ?? (() => process.cwd());
     this.maxDepth = deps.maxDepth ?? DEFAULT_MAX_DEPTH;
+    this.startup = this.restoreKilledTreeDeltas();
   }
 
   /**
@@ -1136,7 +1139,7 @@ export class McpDispatchServer {
     this.buffer += chunk;
     const { lines, rest } = splitMessages(this.buffer);
     this.buffer = rest;
-    return Promise.all(lines.map((line) => this.handleLine(line))).then(() => undefined);
+    return this.startup.then(() => Promise.all(lines.map((line) => this.handleLine(line)))).then(() => undefined);
   }
 
   /**
@@ -1745,7 +1748,30 @@ export class McpDispatchServer {
     const before = await this.readTree(opts.cwd);
     if (before !== null) {
       this.trees.set(jobId, { cwd: opts.cwd, before, scope: opts.scope, activityLastSeen: before });
+      this.jobs.noteStartingTree(jobId, before, opts.scope);
     }
+  }
+
+  /**
+   * A killed job is adopted synchronously by `LaneJobStore`, but only the server owns the git reader.
+   * Complete the report here by comparing the journaled start with the tree as it exists when this
+   * restarted server adopts the job. That timing is stated explicitly: it can include edits made
+   * after the old process died, so it must never be described as an exact death-time snapshot.
+   */
+  private async restoreKilledTreeDeltas(): Promise<void> {
+    const adopted = this.jobs.takeAdoptedStartingTrees();
+    await Promise.all(
+      adopted.map(async ({ jobId, cwd, startingTree }) => {
+        const after = await this.readTree(cwd);
+        if (after === null) return;
+        const before: TreeSnapshot = { prefix: startingTree.prefix, entries: new Map(startingTree.entries) };
+        const delta = renderTreeDelta(cwd, before, after, startingTree.scope);
+        this.jobs.noteTreeDelta(
+          jobId,
+          `${delta}\n  note: measured at restart adoption time, not at the time the job was killed`,
+        );
+      }),
+    );
   }
 
   /**
