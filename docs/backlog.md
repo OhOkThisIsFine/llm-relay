@@ -22,7 +22,8 @@
   2026-09-18, high/security).** `createLaneSpawner` (`src/mcp/lane-runner.ts`) first uses
   `execFile`, then on Windows `ENOENT` rebuilds the command as one string and passes it to
   `exec()`. That string uses `quoteCmdArg` from `src/lane-probe.ts`, which wraps each argument in
-  double quotes and replaces an embedded `"` with `\\"`. Backslash is not `cmd.exe`'s quote escape,
+  double quotes and replaces an embedded quote with a backslash followed by a quote. Backslash is
+  not `cmd.exe`'s quote escape,
   so task text containing a quote can terminate the quoted argument and expose shell metacharacters
   such as `&` or `|`. This is reachable from dispatch: `normalizeOptions` explicitly leaves task
   text unsanitized and relies on it remaining one argv element. The existing fallback test covers a
