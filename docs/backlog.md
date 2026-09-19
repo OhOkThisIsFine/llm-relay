@@ -53,16 +53,6 @@
   parent→grandchild integration test; either create an owned process group/session or enumerate and
   terminate descendants explicitly.
 
-- **The process safety net can swallow non-transport bugs by message substring (verified
-  2026-09-18, medium).** `isTransportError` (`src/process-safety-net.ts`) correctly prefers a closed
-  set of error codes, but its code-less fallback accepts any error whose message contains generic
-  fragments including `"terminated"` or `"premature close"`. The classifier has no evidence that
-  such an arbitrary uncaught error came from Node/undici; for example an application error such as
-  `worker terminated after invariant failure` is classified `swallow`, contradicting the module's
-  stated fail-fast rule for real bugs. **Property:** only demonstrably transport-origin errors are
-  swallowed. Narrow message-only recognition to exact/structured Node-undici shapes (or require a
-  transport code/cause), and pin negative cases containing the current generic words.
-
 - **Agent-mode dispatch inherits relay credential environment variables (verified 2026-09-18,
   high/security).** `runMcp` reaches `loadOrExit`, which calls `ensureEnvFileLoaded`; that merges
   `~/.llm-relay/.env` provider keys into `process.env`. `startLane` then builds every spawned
