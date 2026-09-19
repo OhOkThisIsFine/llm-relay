@@ -196,19 +196,21 @@ describe("dispatch lane walk", () => {
     const probeHasStarted = new Promise<void>((resolve) => { probeStarted = resolve; });
 
     const started: string[] = [];
-    const killed: string[] = [];
     const spawn: LaneSpawner = (command) => {
       started.push(command);
       if (command === "l1") {
         const result = new Promise<LaneRunResult>((resolve) => { finishLane = resolve; });
         return {
           result,
-          kill: () => killed.push(command),
+          // Terminal jobs are reaped even after successful completion, so the kill callback is not
+          // evidence of abandonment. The telemetry assertion below pins the routing verdict.
+          kill: () => {},
         };
       }
       return { result: Promise.resolve(ok("second lane should never run")), kill: () => {} };
     };
 
+    const reports: DispatchedTelemetryReport[] = [];
     const readLaneActivity = async (): Promise<null> => {
       probeStarted();
       await new Promise<void>((resolve) => { releaseProbe = resolve; });
@@ -220,6 +222,7 @@ describe("dispatch lane walk", () => {
       buildView: async () => view(["l1", "l2"]),
       spawn,
       readLaneActivity,
+      reportTelemetry: (report) => reports.push(report),
     });
 
     const answer = h.tool("dispatch", { task: "do it" });
@@ -231,8 +234,8 @@ describe("dispatch lane walk", () => {
     expect(isError).toBe(false);
     expect(text).toContain("finished during the probe");
     expect(started).toEqual(["l1"]);
-    expect(killed).toEqual([]);
     expect(text).not.toContain("abandoned");
+    expect(reports.map((report) => [report.laneId, report.status])).toEqual([["l1", "completed"]]);
   });
 
   it("⚠ the LAST lane gets NO budget — it is awaited, not abandoned", async () => {
