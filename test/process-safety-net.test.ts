@@ -43,10 +43,30 @@ describe("classifyProcessError", () => {
     expect(classifyProcessError(a)).toBe("fatal");
   });
 
-  it("swallows Node/undici-authored message shapes that carry no code", () => {
+  it("swallows exact Node/undici-authored message shapes only when the chain has no code", () => {
     expect(classifyProcessError(new TypeError("fetch failed"))).toBe("swallow");
     expect(classifyProcessError(new Error("other side closed"))).toBe("swallow");
     expect(classifyProcessError(new Error("socket hang up"))).toBe("swallow");
+    expect(classifyProcessError(new TypeError("terminated"))).toBe("swallow");
+    expect(classifyProcessError(new Error("premature close"))).toBe("swallow");
+    expect(classifyProcessError(new Error("read ECONNRESET"))).toBe("swallow");
+  });
+
+  it("does not mistake application messages containing transport words for transport errors", () => {
+    expect(classifyProcessError(new Error("worker terminated after invariant failure"))).toBe("fatal");
+    expect(classifyProcessError(new Error("premature close while committing state"))).toBe("fatal");
+    expect(classifyProcessError(new Error("socket hang up handler crashed"))).toBe("fatal");
+    expect(classifyProcessError(new Error("fetch failed validation"))).toBe("fatal");
+  });
+
+  it("does not let an outer transport-like message override a non-transport cause code", () => {
+    const err = new TypeError("terminated");
+    (err as { cause?: unknown }).cause = coded("ERR_INVALID_ARG_TYPE");
+    expect(classifyProcessError(err)).toBe("fatal");
+
+    const fetchWrapper = new TypeError("fetch failed");
+    (fetchWrapper as { cause?: unknown }).cause = coded("ERR_ASSERTION");
+    expect(classifyProcessError(fetchWrapper)).toBe("fatal");
   });
 
   it("is fatal for everything else — bugs must still crash", () => {
