@@ -1728,6 +1728,27 @@ describe("routing.dispatchWalk", () => {
     });
   });
 
+  it("warns when legacy attempt budget knobs are explicitly set, because idleMs is the stopping policy", () => {
+    const cfg = loadConfig(write("dw-noop-budget-warnings.json", base({
+      routing: {
+        default: "nim/z-ai/glm-5.2",
+        dispatchWalk: { attemptMs: 12_000, agentAttemptMs: 34_000, attemptQuantile: 0.9 },
+      },
+    })));
+    const warnings = cfg.warnings ?? [];
+    expect(warnings).toHaveLength(3);
+    expect(warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining("config.routing.dispatchWalk.attemptMs"),
+      expect.stringContaining("config.routing.dispatchWalk.agentAttemptMs"),
+      expect.stringContaining("config.routing.dispatchWalk.attemptQuantile"),
+    ]));
+    expect(warnings.every((warning) => warning.includes("idleMs"))).toBe(true);
+    // Existing configs still load and preserve their values for compatibility/observability.
+    expect(cfg.routing.dispatchWalk?.attemptMs).toBe(12_000);
+    expect(cfg.routing.dispatchWalk?.agentAttemptMs).toBe(34_000);
+    expect(cfg.routing.dispatchWalk?.attemptQuantile).toBe(0.9);
+  });
+
   it("dispatchWalk.outlier: `false` is inert, a partial object fills from the defaults, an unknown key or an out-of-range value is refused by name", () => {
     const off = loadConfig(
       write("dw-outlier-false.json", base({ routing: { default: "nim/z-ai/glm-5.2", dispatchWalk: { outlier: false } } })),
