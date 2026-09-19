@@ -85,13 +85,13 @@ export function executableCandidates(
  * ⚠ Absence is the branch signal, not an exceptional condition — a missing entry is the normal
  * case and must never throw.
  */
-export function commandExistsOnPath(
+export function executableOnPath(
   command: string,
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
-): boolean {
+): string | undefined {
   const path = env.PATH;
-  if (!path) return false;
+  if (!path) return undefined;
 
   const p = platform === "win32" ? win32 : posix;
   const candidates = executableCandidates(command, env, platform);
@@ -102,11 +102,20 @@ export function commandExistsOnPath(
       const full = p.join(directory, candidate);
       try {
         accessSync(full, fsConstants.X_OK);
-        if (statSync(full).isFile()) return true;
+        if (statSync(full).isFile()) return full;
       } catch {
         // Keep searching. Absence is the branch signal, not an exceptional condition.
       }
     }
   }
-  return false;
+  return undefined;
+}
+
+/** Is `command` runnable from PATH? Boolean compatibility surface over the one resolving walk. */
+export function commandExistsOnPath(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return executableOnPath(command, env, platform) !== undefined;
 }

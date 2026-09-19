@@ -144,25 +144,38 @@ describe("createLaneSpawner output observation", () => {
     ]);
   });
 
-  it("observes the Windows shell-fallback child too, and a throwing observer never fails the lane", async () => {
+  it("observes the Windows shim-fallback child too, and a throwing observer never fails the lane", async () => {
     const fallback = streamingChild();
+    let execFileCalls = 0;
     const processApi: LaneProcessApi = {
       platform: "win32",
       execFile: (_command, _args, _opts, callback) => {
-        queueMicrotask(() => callback(Object.assign(new Error("nf"), { code: "ENOENT" }), "", ""));
-        // A child that exposes no streams — the pre-existing test double shape.
-        return { stdin: { end: () => {} }, kill: () => true };
-      },
-      exec: (_line, _opts, callback) => {
+        execFileCalls += 1;
+        if (execFileCalls === 1) {
+          queueMicrotask(() => callback(Object.assign(new Error("nf"), { code: "ENOENT" }), "", ""));
+          return { stdin: { end: () => {} }, kill: () => true };
+        }
         queueMicrotask(() => {
           fallback.stdout.emit("data", "abc");
           callback(null, "abc", "");
         });
         return fallback;
       },
+      exec: () => {
+        throw new Error("cmd.exe fallback must not run");
+      },
+      spawn: () => {
+        throw new Error("Windows lane should not use POSIX spawn");
+      },
     };
     let calls = 0;
-    const run = createLaneSpawner(processApi, {})("tool.cmd", ["x"], {
+    const run = createLaneSpawner(processApi, {}, (_command, args) => ({
+      ok: true,
+      command: "C:/node.exe",
+      args: ["C:/tool.js", ...args],
+      shimPath: "C:/tool.cmd",
+      entryPath: "C:/tool.js",
+    }))("tool.cmd", ["x"], {
       env: {},
       cwd: "C:/w",
       timeoutMs: 1_000,

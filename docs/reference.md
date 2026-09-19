@@ -1919,9 +1919,14 @@ or target rather than guessing what this host can reach.
 
 Why that difference matters: executing a lane command correctly is the hard part. The lane needs
 three client idle timeouts lifted or a long think is aborted at about 300 seconds; it needs its
-stdin closed or `agy` waits on it until the timeout; an npm `.cmd` shim needs a shell whose every
-token is quoted; and a console-subsystem child needs `windowsHide` or it steals the desktop focus.
-`llm-relay mcp` does all of that once, so a caller never builds a command line.
+stdin closed or `agy` waits on it until the timeout; and a console-subsystem child needs
+`windowsHide` or it steals the desktop focus. On Windows, an npm `.cmd` shim cannot be executed
+directly: the launcher locates npm's generated `.ps1` companion, reads its literal
+`$basedir/<entrypoint>` metadata, verifies that target is a Node script, then invokes the current
+Node executable directly with the original argument array. Neither `cmd.exe` nor PowerShell
+serializes the task text. A non-npm `.cmd`/`.bat`, or a shim whose generated metadata cannot be
+resolved conservatively, fails instead of falling back to shell reparsing. `llm-relay mcp` owns all
+of that once, so a caller never builds a command line.
 
 Add it to a host:
 
