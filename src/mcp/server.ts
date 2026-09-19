@@ -23,6 +23,7 @@
 import { randomUUID } from "node:crypto";
 import type { Config } from "../config.js";
 import { LANE_ACTIVITY_HEADER } from "../lane-activity.js";
+import { credentialCandidateEnvNames } from "../authEnv.js";
 import { DEFAULT_MCP_BLOCKING_WAIT_MS, DEFAULT_MCP_MAX_WAIT_MS, EFFORT_LEVELS, type EffortLevel } from "../config-types.js";
 import type { AssistantMessage, ContentBlock, ToolUseBlock } from "../anthropic.js";
 import { isToolUseBlock } from "../anthropic.js";
@@ -959,12 +960,71 @@ function laneAnswered(r: LaneRunResult): boolean {
   return r.code === 0 && !r.timedOut && !isContentEmpty(r.stdout);
 }
 
-/** Apply a rung's declared env deltas: a string sets, `null` unsets an inherited variable. */
-function applyLaneEnv(base: NodeJS.ProcessEnv, deltas: Record<string, string | null> | undefined): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...base };
+/** Every configured environment variable that may hold a relay-owned provider credential. */
+export function laneCredentialEnvNames(config: Config): string[] {
+  const names = new Set<string>();
+  for (const [providerName, provider] of Object.entries(config.providers ?? {})) {
+    if (provider.credentials !== undefined) {
+      // Explicit fleet slots deliberately do NOT alias-fallback (`resolveCredentialExact`), so
+      // scrub exactly the names those slots declare and no broader heuristic set.
+      for (const slot of provider.credentials) names.add(slot.authEnv);
+      continue;
+    }
+    for (const name of credentialCandidateEnvNames(provider.authEnv, providerName)) names.add(name);
+  }
+
+  // A legacy standalone reshaper can own a credential outside `providers`. Provider-backed
+  // reshapers are already covered above, but the explicit name is cheap and harmless to repeat.
+  if (config.reshaper?.authEnv) names.add(config.reshaper.authEnv);
+  for (const candidate of config.reshaperCandidates ?? []) {
+    if (candidate.authEnv) names.add(candidate.authEnv);
+  }
+  return [...names];
+}
+
+/**
+ * Build a lane's child environment.
+ *
+ * A spawned agent receives the ordinary host environment EXCEPT relay-owned provider credentials.
+ * An operator may deliberately reintroduce one by naming that variable in the rung's own `env`
+ * block with a non-null value. That exception is explicit configuration, not inheritance.
+ *
+ * Windows environment names are case-insensitive, so the scrub and explicit-override checks are
+ * case-insensitive there too.
+ */
+export function buildLaneEnv(
+  base: NodeJS.ProcessEnv,
+  deltas: Record<string, string | null> | undefined,
+  config: Config,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  const normalize = (name: string): string => platform === "win32" ? name.toUpperCase() : name;
+  const credentialNames = new Set(laneCredentialEnvNames(config).map(normalize));
+  const explicitlySet = new Set(
+    Object.entries(deltas ?? {})
+      .filter(([, value]) => value !== null)
+      .map(([name]) => normalize(name)),
+  );
+
+  const env: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(base)) {
+    if (credentialNames.has(normalize(name)) && !explicitlySet.has(normalize(name))) continue;
+    env[name] = value;
+  }
   for (const [name, value] of Object.entries(deltas ?? {})) {
-    if (value === null) delete env[name];
-    else env[name] = value;
+    if (value === null) {
+      for (const existing of Object.keys(env)) {
+        if (normalize(existing) === normalize(name)) delete env[existing];
+      }
+    } else {
+      // Avoid two spellings of the same Windows variable surviving the copy.
+      if (platform === "win32") {
+        for (const existing of Object.keys(env)) {
+          if (existing !== name && normalize(existing) === normalize(name)) delete env[existing];
+        }
+      }
+      env[name] = value;
+    }
   }
   return env;
 }
@@ -2048,7 +2108,7 @@ export class McpDispatchServer {
     // The launcher's own corrections, recorded on the job so the reply names them.
     const agy = agyWorkingDirInvoke(declared, opts.cwd);
     const invoke = agy?.invoke ?? declared;
-    const expansion = expandEnvReferences(applyLaneEnv(process.env, invoke.env), this.deps.platform);
+    const expansion = expandEnvReferences(buildLaneEnv(process.env, invoke.env, this.deps.config, this.deps.platform), this.deps.platform);
     const env = expansion.env;
     env[DEPTH_ENV] = String(opts.depth + 1);
     // Every model request a Claude Code lane sends carries this lane's tag, so the relay daemon can
