@@ -2,7 +2,7 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-17 (v0.84.0)
+## 0. State through 2026-09-18
 
 - **The documentation is now usable by a third party (2026-09-17, lap `ca8814f5`, commit
   `cfb5420`, no source change).** Owner instruction: third-party contributors and testers are
@@ -68,11 +68,18 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   does not do. Design item D6 of the plan above replaces it. Also decided: `POST /reload` is
   approved for design (D2), growing cooldowns for repeated 5xx and 402 are approved (packet S5),
   and operator-declared prices are declined (D4).
-- **Immediate next.** After the owner restarts Claude Desktop: run a Code tab
-  dispatch of a pool task that takes more than 60 s, and confirm it answers in one call and that
-  `last activity:` names relay traffic. Open backlog: route B, the Codex Desktop check, the
-  dashboard pin control, the tree delta for a `killed` job, the unused budget code, and the idle
-  signal for lanes that do not use the relay.
+- **2026-09-18 lane-activity hardening (PR #18, merged).** The walk remains idle-only.
+  Each spawned attempt replaces any inherited lane-activity header with exactly one fresh tag; the
+  daemon's bounded activity store evicts inactive tags before an in-flight one; tree liveness gets
+  a fresh baseline for each lane attempt while the final tree delta keeps the job-wide baseline;
+  and spawned lanes that do not route traffic through the relay can prove work through cumulative
+  CPU time from the process tree this dispatcher owns. The retired attempt-budget computation and
+  `abandonedSinceSuccess` maintenance are gone; legacy config keys still load with warnings and
+  the old persisted field is still accepted on read.
+- **Immediate next.** The live dispatch/lane backlog is now the capability derivation from synced
+  model data, Route B's vendor-qualification blocker, the owner-driven Codex Desktop relay check,
+  and the tree delta for a job killed by an MCP restart. The unused budget-code and non-relay
+  idle-signal items are closed.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
