@@ -313,8 +313,8 @@ export interface LaneJob {
    */
   treeDelta?: string;
   /**
-   * The newest activity the walk saw for the lane now running (relay traffic, output, a file
-   * change), with its source. Replaced per lane; the walk stops a lane when this is older than
+   * The newest activity the walk saw for the lane now running (relay traffic, output, owned
+   * process CPU, or a file change), with its source. Replaced per lane; the walk stops a lane when this is older than
    * `routing.dispatchWalk.idleMs`.
    */
   lastActive?: { at: number; source: string };
@@ -1113,6 +1113,13 @@ export class LaneJobStore {
   registerProcess(id: string, handle: OwnedProcess): void {
     this.kills.set(id, handle.kill);
     this.owned.set(id, handle);
+  }
+
+  /** Root pids currently owned by a still-running job, through the same handle the reaper uses. */
+  runningPids(id: string): number[] {
+    const job = this.jobs.get(id);
+    if (!job || job.status !== "running") return [];
+    return readOwnedPids(this.owned.get(id));
   }
 
   /**

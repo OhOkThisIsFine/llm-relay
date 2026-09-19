@@ -25,6 +25,8 @@ interface LaneScript {
   answersAfterMs: number;
   /** Exit code at settlement; absent means a successful answer. */
   exitCode?: number | null;
+  /** Root pids the injected spawn handle reports for process-tree CPU sampling. */
+  pids?: number[];
   /** Emit output every this many ms while it runs; absent = silent. */
   outputEveryMs?: number;
 }
@@ -47,6 +49,8 @@ function harness(opts: {
   readings?: Array<TreeSnapshot | null>;
   /** What the relay daemon reports for a tag; absent = no daemon. */
   traffic?: (tag: string, now: number) => LaneTraffic | null;
+  /** Cumulative CPU milliseconds for the owned process tree; absent = no CPU reader. */
+  cpu?: (pids: readonly number[], now: number) => number | null;
 }) {
   const out: Array<{ id?: number; result?: { content: Array<{ text: string }> } }> = [];
   const started: string[] = [];
@@ -81,7 +85,11 @@ function harness(opts: {
         timers.push(setTimeout(tick, every));
       }
     });
-    return { result, kill: () => settle({ code: null, stdout: "", stderr: "killed", timedOut: false }) };
+    return {
+      result,
+      kill: () => settle({ code: null, stdout: "", stderr: "killed", timedOut: false }),
+      ...(script.pids === undefined ? {} : { pids: () => script.pids ?? [] }),
+    };
   };
   const view: DispatchView = {
     tier: (opts.tier ?? "high") as DispatchView["tier"],
@@ -96,6 +104,7 @@ function harness(opts: {
   const readings = opts.readings;
   const treeSnapshot: TreeSnapshotReader = async () => (readings === undefined ? null : (readings.shift() ?? null));
   const traffic = opts.traffic;
+  const cpu = opts.cpu;
   const server = new McpDispatchServer({
     config: {
       host: "127.0.0.1",
@@ -112,6 +121,11 @@ function harness(opts: {
             asked.push(tag);
             return traffic(tag, Date.now());
           },
+        }),
+    ...(cpu === undefined
+      ? {}
+      : {
+          readProcessCpu: async (pids: readonly number[]) => cpu(pids, Date.now()),
         }),
     cwd: () => process.cwd(),
     write: (chunk) => out.push(JSON.parse(chunk) as (typeof out)[number]),
@@ -552,6 +566,71 @@ describe("the walk stops a lane only when it is idle", () => {
     });
     await finish(h, {});
     expect(h.started).toEqual(["slow", "next"]);
+  });
+
+  it("keeps a silent non-relay lane while its owned process tree accumulates CPU time", async () => {
+    let cpuMs = 0;
+    const seenPids: number[][] = [];
+    const h = harness({
+      lanes: [cliLane("slow"), cliLane("next")],
+      scripts: {
+        slow: { answersAfterMs: 10 * IDLE_MS, pids: [101] },
+        next: { answersAfterMs: 100 },
+      },
+      cpu: (pids) => {
+        seenPids.push([...pids]);
+        cpuMs += 1_000;
+        return cpuMs;
+      },
+    });
+    const text = await finish(h, {});
+    expect(h.started).toEqual(["slow"]);
+    expect(text).toContain("slow answered");
+    expect(seenPids.length).toBeGreaterThan(1);
+    expect(seenPids.every((pids) => pids.length === 1 && pids[0] === 101)).toBe(true);
+  });
+
+  it("does not treat a flat process CPU reading as activity", async () => {
+    const h = harness({
+      lanes: [cliLane("slow"), cliLane("next")],
+      scripts: {
+        slow: { answersAfterMs: 10 * IDLE_MS, pids: [202] },
+        next: { answersAfterMs: 100 },
+      },
+      cpu: () => 5_000,
+    });
+    const text = await finish(h, {});
+    expect(h.started).toEqual(["slow", "next"]);
+    expect(text).toContain("next answered");
+    expect(text).toContain("1. slow: abandoned after 30s");
+  });
+
+  it("treats an unavailable process CPU reading as no signal", async () => {
+    const h = harness({
+      lanes: [cliLane("slow"), cliLane("next")],
+      scripts: {
+        slow: { answersAfterMs: 10 * IDLE_MS, pids: [303] },
+        next: { answersAfterMs: 100 },
+      },
+      cpu: () => null,
+    });
+    await finish(h, {});
+    expect(h.started).toEqual(["slow", "next"]);
+  });
+
+  it("does not sample process CPU while newer output already proves activity", async () => {
+    let cpuReads = 0;
+    const h = harness({
+      lanes: [cliLane("slow")],
+      scripts: { slow: { answersAfterMs: 3 * IDLE_MS, outputEveryMs: 5_000, pids: [404] } },
+      cpu: () => {
+        cpuReads += 1;
+        return 0;
+      },
+    });
+    const text = await finish(h, {});
+    expect(text).toContain("slow answered");
+    expect(cpuReads).toBe(0);
   });
 
   it("keeps a silent lane whose git tree changed, and stops it once the tree stops changing", async () => {

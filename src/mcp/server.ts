@@ -37,6 +37,7 @@ import {
   type TreeSnapshot,
   type TreeSnapshotReader,
 } from "./tree-delta.js";
+import type { ProcessCpuReader } from "./process-cpu.js";
 import { estimateTokensFromCharacters } from "../metadata.js";
 import type { DispatchedTelemetryReport, DispatchLaneStatus, DispatchMode } from "../dispatch-lane-stats.js";
 import {
@@ -143,6 +144,11 @@ export interface McpServerDeps {
    * Absent, or null for a tag, means no signal from the daemon — never "idle".
    */
   readLaneActivity?: (tag: string) => Promise<LaneTraffic | null>;
+  /**
+   * Reads cumulative CPU milliseconds for the spawned process tree this job owns. The first
+   * successful reading is a baseline; only a later increase can count as activity.
+   */
+  readProcessCpu?: ProcessCpuReader;
   /** The platform whose environment rules the lane launcher applies; defaults to `process.platform`. */
   platform?: NodeJS.Platform;
   maxDepth?: number;
@@ -903,6 +909,8 @@ function flagValue(args: readonly string[], flag: string): string | null {
 
 /** How often the walk checks a running lane for activity. */
 export const IDLE_POLL_MS = 15_000;
+/** Minimum cumulative CPU increase between samples that proves process-tree activity. */
+const PROCESS_CPU_ACTIVITY_MS = 1_000;
 
 /** The header line Claude Code adds to every request, from `ANTHROPIC_CUSTOM_HEADERS`. */
 function withActivityHeader(existing: string | undefined, tag: string): string {
@@ -1044,6 +1052,8 @@ export class McpDispatchServer {
   >();
   /** The activity tag (`lane-activity.ts`) of the lane each running job has started last. */
   private readonly activityTags = new Map<string, string>();
+  /** Last cumulative process-tree CPU reading for the current attempt of each job. */
+  private readonly processCpu = new Map<string, number>();
 
   constructor(private readonly deps: McpServerDeps) {
     this.jobs = new LaneJobStore(deps.journal ?? nullJobJournal, deps.archive ?? nullJobArchive);
@@ -1465,7 +1475,10 @@ export class McpDispatchServer {
         this.jobs.fail(job.id, `dispatch walk failed: ${e.message}`);
         return "done" as const;
       })
-      .finally(() => this.activityTags.delete(job.id));
+      .finally(() => {
+        this.activityTags.delete(job.id);
+        this.processCpu.delete(job.id);
+      });
     return this.awaitOrPoll(job.id, settled, waitMs.waitMs, {
       clamp: waitMs.clamped ? { requested: waitMs.requested, ceiling, key: ceilingKey } : undefined,
       progressToken: blocking?.progress === true ? ctx.progressToken : undefined,
@@ -1806,6 +1819,26 @@ export class McpDispatchServer {
     }
     const early = newestActivity(seen);
     if (early !== null && now - early.at < IDLE_POLL_MS) return early;
+
+    // A CLI lane can be busy without relay traffic, stdout or a file write. Read only the process
+    // tree this dispatcher already owns for reaping, and only after cheaper signals went stale.
+    // The first reading is a baseline and proves nothing; a later >=1 s cumulative CPU increase
+    // is current activity. A failed read is no signal, never an idle verdict.
+    const pids = this.jobs.runningPids(jobId);
+    if (pids.length > 0 && this.deps.readProcessCpu !== undefined) {
+      const cpuMs = await this.deps.readProcessCpu(pids).catch(() => null);
+      if (typeof cpuMs === "number" && Number.isFinite(cpuMs) && cpuMs >= 0) {
+        const previous = this.processCpu.get(jobId);
+        this.processCpu.set(jobId, cpuMs);
+        if (previous !== undefined && cpuMs - previous >= PROCESS_CPU_ACTIVITY_MS) {
+          seen.push({ at: this.now(), source: "process CPU time" });
+        }
+      }
+    }
+    const afterCpu = newestActivity(seen);
+    const afterCpuNow = this.now();
+    if (afterCpu !== null && afterCpuNow - afterCpu.at < IDLE_POLL_MS) return afterCpu;
+
     const tree = this.trees.get(jobId);
     const reading = tree === undefined ? null : await this.readTree(tree.cwd);
     if (tree !== undefined && reading !== null) {
@@ -1885,6 +1918,8 @@ export class McpDispatchServer {
     // dispatcher STARTED, which is the only reliable signal for a reaper. Age is not — a long
     // lane and a stale one look identical from outside, and one legitimately ran 29 minutes.
     this.jobs.registerProcess(jobId, started);
+    // The owned handle now describes THIS attempt. Never compare its CPU with the previous lane's.
+    this.processCpu.delete(jobId);
 
     // The attempt promise is made total here, once, so neither branch below has to repeat it and
     // no rejection can escape into the walk.
