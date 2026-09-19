@@ -31,15 +31,12 @@
   to launch Windows command shims; if a shell remains necessary, its encoder and Windows test must
   prove embedded quotes and `& | < > ^ ( ) % !` stay one literal argument.
 
-- **The repository gate has no Windows execution leg and is not enforced on `main` (verified
-  2026-09-18, medium/repository hardening).** `.github/workflows/ci.yml` is intentionally Ubuntu-
-  only on the assumption that development happens on Windows, while `CONTRIBUTING.md` now invites
-  third-party contributors and the Windows-only spawn boundary above is not exercised by Linux.
-  GitHub currently reports `main` as unprotected and the repository has no rulesets, so the stated
-  PR gate can be bypassed by a direct push. **Property:** the platform-specific process boundary is
-  exercised on Windows CI, and the default branch requires the CI gate before changes can land.
-  Keep the Windows leg targeted if a second full gate is unnecessary; configure branch protection
-  or a repository ruleset as the settings half of the same property.
+- **The default branch does not enforce the CI gate (verified 2026-09-18,
+  medium/repository hardening).** GitHub reports `main` as unprotected and the repository has no
+  rulesets, so the documented PR gate can still be bypassed by a direct push. The platform half is
+  covered by the targeted `windows-process-boundary` CI job; what remains is repository settings.
+  **Property:** the default branch requires the CI gate before changes can land, through branch
+  protection or a repository ruleset.
 
 - **A lane's `capability` is a hand-set config value, but it must come from the synced capability
   data (owner correction, 2026-09-17, high).** `applyRungCapability` (`src/config/routing-parser.ts`)

@@ -54,7 +54,7 @@ npm run build          # build:server (TWO tsc passes -> dist/, see below) + bui
 npm test               # vitest run  (the suite is the source of truth; do not pin a count here — it drifts)
 npm run typecheck      # tsc --noEmit — src/ (tsconfig.json)
 npm run typecheck:test # tsc — the SUITE (tsconfig.test.json). See the note below.
-npm run check          # typecheck + typecheck:test + test + check:dashboard (tsc for dashboard/ + the dashboard suite's own vitest config) + check:package (bundle inventory check + packed smoke). The one gate's second half; CI runs exactly this after the build.
+npm run check          # typecheck + typecheck:test + test + check:dashboard (tsc for dashboard/ + the dashboard suite's own vitest config) + check:package (bundle inventory check + packed smoke). The one gate's second half; CI runs this full gate on Ubuntu, plus a targeted Windows process-boundary job.
 npm run gate           # build + check, in ONE command — THE gate. Record the ledger through it.
 npm run dev -- --config config.json   # run from src via tsx, no build
 npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
@@ -142,9 +142,11 @@ restructuring `server.ts`/`config.ts` to clear the first is the enterprise-shape
 ⚠ Don't "fix" a finding by deleting an intentional discard: `_`-prefixed names and
 `const { key, ...rest }` are conventions here, covered by the rule options rather than by edits.
 
-**CI** (`.github/workflows/ci.yml`) runs `npm ci --ignore-scripts` → `npm run build` →
-`npm run check` on every push to `main` and every PR, plus a check that the `postinstall` hook stays
-inert on a non-global install. Before this existed, `typecheck` ran in **no** workflow and the suite
+**CI** (`.github/workflows/ci.yml`) runs the full `npm ci --ignore-scripts` → `npm run build` →
+`npm run check` gate on Ubuntu for every push to `main` and every PR, plus a check that the
+`postinstall` hook stays inert on a non-global install. A targeted `windows-latest` job separately
+type-checks the test suite and executes the lane spawn/env/lifecycle boundary, including a real npm
+command shim. Before CI existed, `typecheck` ran in **no** workflow and the suite
 ran only inside the publish job — i.e. first at the moment a version was already shipping, so every
 "tsc clean / suite green" claim in this repo rested on somebody's unverifiable local run.
 
@@ -1377,8 +1379,8 @@ turn the suite red — read the failing test's stated reasoning before assuming 
 and change the test in the SAME commit as the source fix.
 
 Current: **usable end-to-end**, suite green, tsc clean — and verified by CI
-(`.github/workflows/ci.yml` runs `npm run build` then `npm run check`: both typechecks, both suites,
-and the package checks) rather than by a local run only. A real `claude` agentic session completes through the proxy against NIM.
+(the full Ubuntu `npm run build && npm run check` gate plus the targeted Windows process-boundary
+job) rather than by a local run only. A real `claude` agentic session completes through the proxy against NIM.
 (The point-in-time assessment doc that used to back this claim was deleted 2026-08-04 as a stale
 snapshot — CI and the suite are the living evidence.)
 
