@@ -6,7 +6,8 @@
  * samples cumulative CPU time for exactly the process tree it owns. An increase is evidence of
  * work; a flat value is not. The first sample is only a baseline and is interpreted by the caller.
  *
- * This module never decides whether a lane is idle. It only reads one monotonic measurement.
+ * This module never decides whether a lane is idle. It reads cumulative CPU counters for the
+ * processes present in one snapshot; the tree-wide sum can fall when a descendant exits.
  * Under vitest the real reader returns null unless a caller injects another reader, so the suite
  * never enumerates the operator's live processes.
  */
