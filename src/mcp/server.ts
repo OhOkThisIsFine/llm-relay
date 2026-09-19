@@ -1874,8 +1874,12 @@ export class McpDispatchServer {
       if (raced.kind === "settled") return raced.outcome;
       if (this.jobs.get(jobId)?.status !== "running") break;
       const seen = await this.latestActivity(jobId);
-      // The lane may have settled while the activity read was waiting on IO. Observe that result
-      // before making any idle decision, and likewise re-check cancellation/restart after the await.
+      // The lane may have settled while the activity read was waiting on IO. Yield one timer turn
+      // to let an already-resolved child/result promise run its continuation before declaring the
+      // lane idle. This closes the boundary where the activity read and process completion resolve
+      // in the same event-loop turn: completion wins, never an idle kill.
+      const afterProbe = await Promise.race([settled, pollTimer(0)]);
+      if (afterProbe.kind === "settled") return afterProbe.outcome;
       if (settledOutcome !== null) return settledOutcome;
       if (this.jobs.get(jobId)?.status !== "running") break;
       if (seen !== null && seen.at > lastActive) {
