@@ -1857,7 +1857,16 @@ export class McpDispatchServer {
     );
     if (idleMs === null) return guarded;
 
-    const settled = guarded.then((o) => ({ kind: "settled" as const, outcome: o }));
+    // Keep the settled value beside the race. An activity probe is asynchronous (daemon traffic
+    // and git status), so the lane can finish while `latestActivity()` is still in flight. Without
+    // this latch, that successful result is invisible until the NEXT loop iteration; the current
+    // iteration can instead cross `idleMs`, kill the already-finished lane, and report it as
+    // abandoned. Completion must win once it has happened.
+    let settledOutcome: LaneAttemptOutcome | null = null;
+    const settled = guarded.then((o) => {
+      settledOutcome = o;
+      return { kind: "settled" as const, outcome: o };
+    });
     // The lane counts as active at its start, so a lane is never stopped before `idleMs` has passed.
     let lastActive = attemptStart;
     for (;;) {
@@ -1865,6 +1874,10 @@ export class McpDispatchServer {
       if (raced.kind === "settled") return raced.outcome;
       if (this.jobs.get(jobId)?.status !== "running") break;
       const seen = await this.latestActivity(jobId);
+      // The lane may have settled while the activity read was waiting on IO. Observe that result
+      // before making any idle decision, and likewise re-check cancellation/restart after the await.
+      if (settledOutcome !== null) return settledOutcome;
+      if (this.jobs.get(jobId)?.status !== "running") break;
       if (seen !== null && seen.at > lastActive) {
         lastActive = seen.at;
         this.jobs.noteLastActivity(jobId, seen.at, seen.source);
