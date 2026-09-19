@@ -297,12 +297,35 @@ function readRegularFile(root: string, target: string): Buffer | null {
 
 export class DashboardStaticHandler {
   readonly #root: string;
-  readonly #manifest: DashboardManifest | null;
-  readonly #artifacts: Map<string, Artifact> | null;
+  readonly #options: DashboardStaticOptions;
+  readonly #manifestPath: string | null;
+  #manifestMtimeMs: number = -1;
+  #manifest: DashboardManifest | null = null;
+  #artifacts: Map<string, Artifact> | null = null;
 
   constructor(options: DashboardStaticOptions) {
     this.#root = resolve(options.assetRoot);
-    this.#manifest = readManifest(options);
+    this.#options = options;
+    this.#manifestPath = typeof options.manifest === "string"
+      ? options.manifest
+      : (options.manifest === undefined ? options.manifestPath ?? null : null);
+    this.#syncManifest();
+  }
+
+  #syncManifest(force = false): void {
+    if (this.#manifestPath) {
+      try {
+        const stat = lstatSync(this.#manifestPath);
+        if (!force && stat.mtimeMs === this.#manifestMtimeMs) return;
+        this.#manifestMtimeMs = stat.mtimeMs;
+      } catch {
+        this.#manifestMtimeMs = -1;
+        this.#manifest = null;
+        this.#artifacts = null;
+        return;
+      }
+    }
+    this.#manifest = readManifest(this.#options);
     this.#artifacts = this.#manifest ? buildClosure(this.#manifest) : null;
   }
 
@@ -321,6 +344,7 @@ export class DashboardStaticHandler {
     }
     if (path === "/dashboard/") {
       if (method !== "GET" && method !== "HEAD") return emptyResponse(405, { Allow: "GET, HEAD" });
+      if (this.#manifestPath) this.#syncManifest();
       // The shell is useful only when the same validated manifest can account
       // for the entry's complete asset closure.  Never serve an index that
       // points at an unknown, broken, or cyclic asset graph.
@@ -337,7 +361,11 @@ export class DashboardStaticHandler {
     if (!path.startsWith("/dashboard/assets/")) return emptyResponse(404);
     if (method !== "GET" && method !== "HEAD") return emptyResponse(405, { Allow: "GET, HEAD" });
     const assetName = path.slice("/dashboard/assets/".length);
-    const artifact = this.#artifacts?.get(assetName);
+    let artifact = this.#artifacts?.get(assetName);
+    if (!artifact && this.#manifestPath) {
+      this.#syncManifest(true);
+      artifact = this.#artifacts?.get(assetName);
+    }
     if (!artifact || !artifact.mime) return emptyResponse(404);
     const body = readRegularFile(this.#root, artifact.target);
     if (!body) return emptyResponse(404);

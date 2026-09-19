@@ -102,9 +102,15 @@ export async function fetchDetail(session: string, requestId: string, includeRep
   return payload;
 }
 export function consumeBootstrapFragment(location: Location, history: History): string | null {
-  const fragment = new URLSearchParams(location.hash.startsWith("#") ? location.hash.slice(1) : location.hash);
+  const rawHash = location.hash.startsWith("#") ? location.hash.slice(1) : location.hash;
+  const fragment = new URLSearchParams(rawHash);
   const bootstrap = fragment.get("bootstrap");
-  if (bootstrap !== null || location.hash.length > 0) history.replaceState(null, "", `${location.pathname}${location.search}`);
+  if (bootstrap !== null) {
+    fragment.delete("bootstrap");
+    const remaining = fragment.toString();
+    const newHash = remaining.length > 0 ? `#${remaining}` : "";
+    history.replaceState(null, "", `${location.pathname}${location.search}${newHash}`);
+  }
   return bootstrap;
 }
 export function readStoredSession(storage: Storage = sessionStorage): string | null { return storage.getItem(SESSION_STORAGE_KEY); }

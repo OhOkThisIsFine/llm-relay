@@ -73,4 +73,25 @@ describe("dashboard application startup", () => {
     await waitFor(() => expect(screen.getByText("Dashboard session ended")).toBeInTheDocument());
     expect(browserStorage.getItem(SESSION_STORAGE_KEY)).toBeNull();
   });
+  it("renders with initialTab set to routing without crashing", async () => {
+    const browserStorage = storage({ [SESSION_STORAGE_KEY]: "existing-session" });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } })); vi.stubGlobal("fetch", fetchMock);
+    render(<DashboardApp bootstrap={null} storage={browserStorage} initialTab="routing" />);
+    await waitFor(() => expect(screen.getByRole("navigation", { name: "Main sections" })).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: /Models & Routing/ })).toBeInTheDocument();
+  });
+  it("renders with initialTab set to keys without crashing", async () => {
+    const browserStorage = storage({ [SESSION_STORAGE_KEY]: "existing-session" });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } })); vi.stubGlobal("fetch", fetchMock);
+    render(<DashboardApp bootstrap={null} storage={browserStorage} initialTab="keys" />);
+    await waitFor(() => expect(screen.getByRole("navigation", { name: "Main sections" })).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: /Keys & Providers/ })).toBeInTheDocument();
+  });
+  it("renders with initialTab set to agents without crashing", async () => {
+    const browserStorage = storage({ [SESSION_STORAGE_KEY]: "existing-session" });
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({}), { status: 200, headers: { "Content-Type": "application/json" } })); vi.stubGlobal("fetch", fetchMock);
+    render(<DashboardApp bootstrap={null} storage={browserStorage} initialTab="agents" />);
+    await waitFor(() => expect(screen.getByRole("navigation", { name: "Main sections" })).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: /Agent Setup/ })).toBeInTheDocument();
+  });
 });

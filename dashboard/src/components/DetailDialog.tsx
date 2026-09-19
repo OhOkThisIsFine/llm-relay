@@ -143,8 +143,59 @@ export function DetailDialog({ detail, onClose }: Readonly<{ detail: DetailV1; o
           {detail.attempts.length === 0 ? (
             <p className="empty-row">No recorded attempts are available for this request.</p>
           ) : (
-            <div className="table-wrap">
-              <table className="responsive-table">
+            <>
+              {detail.attempts.length > 1 && (
+                <div style={{ marginBottom: "0.75rem", padding: "0.5rem 0.75rem", borderRadius: "0.375rem", background: "rgba(234, 179, 8, 0.1)", border: "1px solid rgba(234, 179, 8, 0.2)", fontSize: "0.8125rem", color: "var(--foreground)" }}>
+                  <strong>Failover Sequence:</strong> This request executed {detail.attempts.length} sequential attempts across providers.
+                </div>
+              )}
+              <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem", marginBottom: "1rem" }}>
+                {detail.attempts.map((attempt, idx) => {
+                  const isSuccess = attempt.status === "success";
+                  return (
+                    <div
+                      key={attempt.attemptId}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "0.75rem",
+                        padding: "0.5rem 0.75rem",
+                        borderRadius: "0.375rem",
+                        border: "1px solid var(--border)",
+                        backgroundColor: isSuccess ? "rgba(34, 197, 94, 0.05)" : "rgba(239, 68, 68, 0.05)",
+                        fontSize: "0.8125rem",
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <span style={{ fontWeight: 600, color: "var(--muted-foreground)", width: "1.75rem" }}>
+                        #{idx + 1}
+                      </span>
+                      <span className="inline-flex items-center" style={{ gap: "0.25rem", fontWeight: 500 }}>
+                        {attempt.provider ? <PlatformDot provider={attempt.provider} /> : null}
+                        {attempt.provider ?? "Unknown"}
+                      </span>
+                      <span style={{ fontFamily: "monospace", color: "var(--foreground)", opacity: 0.9 }}>
+                        {attempt.model ?? "Unknown model"}
+                      </span>
+                      <span className="badge" style={{ textTransform: "uppercase", fontSize: "0.7rem" }}>
+                        {attempt.role}
+                      </span>
+                      <StatusBadge value={attempt.status} />
+                      <span style={{ marginLeft: "auto", fontSize: "0.75rem", color: "var(--muted-foreground)", fontFamily: "monospace" }}>
+                        {duration(attempt.latencyMs)}
+                        {attempt.commitMs !== null ? ` (commit ${duration(attempt.commitMs)})` : ""}
+                      </span>
+                      {attempt.failureKind && (
+                        <div style={{ width: "100%", paddingLeft: "2.5rem", fontSize: "0.75rem", color: "#dc2626" }}>
+                          Failure: {attempt.failureKind}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="table-wrap">
+                <table className="responsive-table">
                 <caption>Bounded request attempts</caption>
                 <thead>
                   <tr>
@@ -203,6 +254,7 @@ export function DetailDialog({ detail, onClose }: Readonly<{ detail: DetailV1; o
                 </tbody>
               </table>
             </div>
+            </>
           )}
         </section>
 

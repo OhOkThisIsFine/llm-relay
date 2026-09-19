@@ -136,6 +136,34 @@ describe("dashboard static resolver", () => {
     expect(escaping.handle({ method: "GET", path: "/dashboard/assets/escape-abcdefgh.js" })).toMatchObject({ handled: true, status: 404 });
   });
 
+  it("dynamically reloads the manifest when updated on disk", () => {
+    const root = mkdtempSync(join(tmpdir(), "llm-relay-dashboard-reload-"));
+    roots.push(root);
+    const viteDir = join(root, ".vite");
+    const assetsDir = join(root, "assets");
+    mkdirSync(viteDir);
+    mkdirSync(assetsDir);
+    const manifestPath = join(viteDir, "manifest.json");
+
+    writeFileSync(join(root, "index.html"), "<!doctype html><script src=\"/dashboard/assets/v1-abcdefgh.js\"></script>");
+    writeFileSync(join(assetsDir, "v1-abcdefgh.js"), "console.log('v1')");
+    writeFileSync(manifestPath, JSON.stringify({
+      "index.html": { file: "assets/v1-abcdefgh.js" },
+    }));
+
+    const handler = createDashboardStaticHandler({ assetRoot: root, manifestPath });
+    expect(handler.handle({ method: "GET", path: "/dashboard/assets/v1-abcdefgh.js" })).toMatchObject({ status: 200 });
+
+    // Update manifest and asset on disk (simulating a dashboard rebuild)
+    writeFileSync(join(assetsDir, "v2-12345678.js"), "console.log('v2')");
+    writeFileSync(manifestPath, JSON.stringify({
+      "index.html": { file: "assets/v2-12345678.js" },
+    }));
+
+    // The handler should dynamically pick up the new asset without restarting
+    expect(handler.handle({ method: "GET", path: "/dashboard/assets/v2-12345678.js" })).toMatchObject({ status: 200 });
+  });
+
   it("resolves the production dashboard beside the compiled module", () => {
     const moduleDirectory = dirname(fileURLToPath(new URL("../../src/dashboard-static.ts", import.meta.url)));
     expect(getProductionDashboardAssetRoot()).toBe(resolve(moduleDirectory, "dashboard"));

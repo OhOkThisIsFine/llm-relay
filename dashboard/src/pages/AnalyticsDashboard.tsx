@@ -81,6 +81,8 @@ function Select({ label, value, values, onChange }: Readonly<{ label: string; va
 
 export function AnalyticsDashboard({ session, onSessionExpired, onLogout, showRecentTable = false }: Readonly<{ session: string; onSessionExpired(): void; onLogout(signal: AbortSignal): Promise<void>; showRecentTable?: boolean }>): ReactElement {
   const [filters, setFilters] = useState<DashboardFilters>(defaultFilters);
+  const [recentVisible, setRecentVisible] = useState(showRecentTable);
+  useEffect(() => { setRecentVisible(showRecentTable); }, [showRecentTable]);
   const [theme, setThemeState] = useState<Theme>(() => readStoredTheme() ?? "dark");
   const toggleTheme = () => { const next: Theme = theme === "light" ? "dark" : "light"; setThemeState(next); storeTheme(next); };
   const [loggingOut, setLoggingOut] = useState(false); const [logoutError, setLogoutError] = useState<string | null>(null);
@@ -143,13 +145,15 @@ export function AnalyticsDashboard({ session, onSessionExpired, onLogout, showRe
         <h1 ref={detailFocusFallback} tabIndex={-1}>Usage and fleet health</h1>
       </div>
       <div className="header-actions">
+        <button type="button" onClick={() => setRecentVisible((prev) => !prev)}>
+          <List aria-hidden="true" size={16} /> {recentVisible ? "Hide recent requests" : "Show recent requests"}
+        </button>
         <button type="button" onClick={toggleTheme}>Use {theme === "light" ? "dark" : "light"} theme</button>
         <button type="button" onClick={loadSnapshot} disabled={!readingEnabled}><RefreshCw aria-hidden="true" size={16} /> Refresh</button>
-        <button type="button" onClick={() => void requestLogout()} disabled={loggingOut}>{loggingOut ? "Ending session…" : "Logout"}</button>
       </div>
     </header>
     <p className="status" role="status" aria-live="polite">{status}</p>{logoutError && <p className="status error" role="alert">{logoutError}</p>}
-    {snapshot && <nav className="panel-nav" aria-label="Jump to a panel"><ul>{PANEL_LINKS.map(([id, label]) => <li key={id}><a href={`#${id}`}>{label}</a></li>)}</ul></nav>}
+    {snapshot && <nav className="panel-nav" aria-label="Jump to a panel"><ul>{PANEL_LINKS.map(([id, label]) => <li key={id}><a href={`#${id}`}>{label}</a></li>)}{recentVisible && <li><a href="#recent-heading">Recent</a></li>}</ul></nav>}
     <div className="range-nav">
       <span className="range-nav-label">Window:</span>
       <SegmentedControl ariaLabel="Quick time window" value={filters.window} options={windows} onValueChange={(value) => setFilter("window", value as WindowId)} />
@@ -166,7 +170,7 @@ export function AnalyticsDashboard({ session, onSessionExpired, onLogout, showRe
       <Select label="Failure" value={filters.failureKind ?? "all"} values={["all", "timeout", "provider_error", "auth_error", "rate_limit", "aborted", "protocol", "unknown"]} onChange={(value) => setFilter("failureKind", value === "all" ? undefined : value as DashboardFilters["failureKind"])} />
     </section>
     {snapshotState.error !== null && snapshot === null && <section className="panel error" role="alert"><h2>Dashboard unavailable</h2><p>Unable to read dashboard measurements.</p></section>}
-    {snapshot && <DashboardBody snapshot={snapshot} onDetail={openDetail} rememberTrigger={(target) => { detailTrigger.current = target; }} showRecentTable={showRecentTable} />}
+    {snapshot && <DashboardBody snapshot={snapshot} onDetail={openDetail} rememberTrigger={(target) => { detailTrigger.current = target; }} showRecentTable={recentVisible} />}
     {detailState.loading && <p className="status" role="status">Loading request details…</p>}{detailState.error && <section className="panel error" role="alert"><h2>Request details unavailable</h2><p>{detailState.error}</p></section>}
     {detailState.data && <DetailDialog detail={detailState.data} onClose={() => { setDetailState({ requestId: null, data: null, loading: false, error: null }); }} />}
   </main>;
@@ -206,16 +210,16 @@ function DashboardBody({ snapshot, onDetail, rememberTrigger, showRecentTable = 
       <div className="col-span-2">
         <DimensionPanel snapshot={snapshot} panel="model" title="Models" icon={Layers} rows={snapshot.models} label={(row) => { const model = row as typeof snapshot.models[number]; return model.provider + " / " + model.model; }} />
       </div>
-      <div>
+      <div className="col-span-2">
         <DimensionPanel snapshot={snapshot} panel="client" title="Clients" icon={Bot} rows={snapshot.clients} label={(row) => (row as typeof snapshot.clients[number]).client} />
       </div>
-      <div>
+      <div className="col-span-2">
         <DimensionPanel snapshot={snapshot} panel="credential" title="Credentials" icon={KeyRound} rows={snapshot.credentials} label={(row) => { const credential = row as typeof snapshot.credentials[number]; return credential.provider + " / " + credential.label + " (" + credential.credentialId + ")"; }} />
       </div>
-      <div>
+      <div className="col-span-2">
         <SpendPanel snapshot={snapshot} />
       </div>
-      <div>
+      <div className="col-span-2">
         <ErrorPanel snapshot={snapshot} />
       </div>
       <div className="col-span-2">
@@ -236,7 +240,7 @@ function DashboardBody({ snapshot, onDetail, rememberTrigger, showRecentTable = 
 function SpendPanel({ snapshot }: Readonly<{ snapshot: SnapshotV1 }>): ReactElement {
   const spend = snapshot.summary.spend;
   const rows: ReadonlyArray<readonly [string, SpendTotalsV1[keyof Omit<SpendTotalsV1, "unpricedRequests" | "partiallyPricedRequests">]]> = [["Provider-published / reported", spend.providerPublishedReported], ["Provider-published / estimated", spend.providerPublishedEstimated], ["Reference / reported", spend.referenceReported], ["Reference / estimated", spend.referenceEstimated]];
-  return <Panel id="spend" title="Spend detail" icon={CircleDollarSign} rowCount={rows.length}><PanelCoverage label="Spend" value={coverageFor(snapshot, "spend")} /><ResponsiveTable caption="Spend cells are intentionally not blended" headers={["Cell", "Amount", "Price source", "Token basis", "Measurement source", "Observed"]}>{rows.map(([label, cell]) => <tr key={label}><th scope="row" data-label="Cell">{label}</th><td data-label="Amount">{currencyMicrousd(cell.amountMicrousd)}</td><td data-label="Price source">{cell.priceSource}</td><td data-label="Token basis">{cell.tokenBasis}</td><td data-label="Measurement source">{cell.source}</td><td data-label="Observed">{stamp(cell.observedAt)}</td></tr>)}<tr><th scope="row" data-label="Cell">Unpriced requests</th><td data-label="Amount" colSpan={5}>{number(spend.unpricedRequests)}</td></tr><tr><th scope="row" data-label="Cell">Partially priced requests</th><td data-label="Amount" colSpan={5}>{spend.partiallyPricedRequests > 0 ? number(spend.partiallyPricedRequests) + " — amounts above are lower bounds" : "0"}</td></tr></ResponsiveTable></Panel>;
+  return <Panel id="spend" title="Spend detail" icon={CircleDollarSign} rowCount={rows.length}><PanelCoverage label="Spend" value={coverageFor(snapshot, "spend")} /><ResponsiveTable caption="Spend cells are intentionally not blended" headers={["Cell", "Amount", "Price source", "Token basis", "Measurement source", "Observed"]}>{rows.map(([label, cell]) => <tr key={label}><th scope="row" data-label="Cell" style={{ whiteSpace: "nowrap" }}>{label}</th><td data-label="Amount" style={{ whiteSpace: "nowrap" }}>{currencyMicrousd(cell.amountMicrousd)}</td><td data-label="Price source" style={{ whiteSpace: "nowrap" }}>{cell.priceSource}</td><td data-label="Token basis" style={{ whiteSpace: "nowrap" }}>{cell.tokenBasis}</td><td data-label="Measurement source" style={{ whiteSpace: "nowrap" }}>{cell.source}</td><td data-label="Observed" style={{ whiteSpace: "nowrap" }}>{stamp(cell.observedAt)}</td></tr>)}<tr><th scope="row" data-label="Cell">Unpriced requests</th><td data-label="Amount" colSpan={5}>{number(spend.unpricedRequests)}</td></tr><tr><th scope="row" data-label="Cell">Partially priced requests</th><td data-label="Amount" colSpan={5}>{spend.partiallyPricedRequests > 0 ? number(spend.partiallyPricedRequests) + " — amounts above are lower bounds" : "0"}</td></tr></ResponsiveTable></Panel>;
 }
 
 function compactTokens(tokens: TokenTotalsV1 | null): string {

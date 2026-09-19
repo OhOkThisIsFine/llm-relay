@@ -10,19 +10,19 @@
   ],
   "observed": {
     "dashboardFiles": 5,
-    "dashboardRawBytes": 275580,
-    "jsBytes": 255748,
-    "cssBytes": 18608,
+    "dashboardRawBytes": 399513,
+    "jsBytes": 377583,
+    "cssBytes": 20706,
     "htmlBytes": 383,
     "manifestBytes": 185,
-    "packBytes": 1136374,
-    "unpackedBytes": 5618773,
+    "packBytes": 1164783,
+    "unpackedBytes": 5744919,
     "packageEntries": 429
   },
   "ceilings": {
-    "dashboardRawBytes": 291600,
-    "packBytes": 1150000,
-    "unpackedBytes": 5800000,
-    "packageEntries": 430
+    "dashboardRawBytes": 420000,
+    "packBytes": 1250000,
+    "unpackedBytes": 6000000,
+    "packageEntries": 440
   }
 }

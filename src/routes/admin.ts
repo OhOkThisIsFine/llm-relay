@@ -99,7 +99,7 @@ function relayModels(
       contextNote = "context window unknown, so it is not advertised";
     } else if (isPool) {
       const unresolved = poolResolved !== null && poolResolved.unknownMembers > 0
-        ? ` (${poolResolved.unknownMembers} members unresolved)`
+        ? ` (${poolResolved.unknownMembers} ${poolResolved.unknownMembers === 1 ? "member" : "members"} unresolved)`
         : "";
       contextNote = `context window ${tokens} tokens, the minimum over the pool's resolving members${unresolved}`;
     } else {
