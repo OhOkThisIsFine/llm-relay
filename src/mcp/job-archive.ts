@@ -1,6 +1,5 @@
 /**
- * The finished-job archive — how a job's FINAL report survives the MCP server restarting, and how
- * job ids stay monotonic across that restart.
+ * The finished-job archive — how a job's FINAL report survives the MCP server restarting.
  *
  * ⚠ WHY THIS EXISTS (C:\Code\docs\backlog.md, 2026-09-11, re-hit 2026-09-15): the relay was
  * restarted between two sessions; `dispatch_status`/`dispatch_result` then answered `unknown jobId`
@@ -18,9 +17,7 @@
  * ⚠ A terminal row is written EAGERLY, not write-behind, and that is deliberate: the measured
  * restart is the host killing this process (`TerminateProcess`, no signal handler runs), so a
  * debounced write would lose exactly the report the archive exists to keep, in exactly the case it
- * exists for. A terminal transition happens once per job, so the write is rare; the `WriteBehindTimer`
- * is used only for the id counter, which the journal's own eager write already protects (a running
- * job's id is on disk from the moment it is created).
+ * exists for. A terminal transition happens once per job, so the write is rare.
  *
  * Bounded: the newest `MAX_ARCHIVED_JOBS` jobs, each stream capped at `MAX_ARCHIVED_OUTPUT_CHARS`
  * with the TAIL kept (a lane's final report is the end of its stdout) and a marker saying what was
@@ -29,7 +26,6 @@
  */
 import { atomicWriteJsonSync, safeReadJsonSync } from "../storage/json-store.js";
 import { relayStatePath } from "../state-paths.js";
-import { WriteBehindTimer } from "../write-behind.js";
 import type { LaneJob, LaneAttempt, LaneProcessReport, JobStatus } from "./lane-runner.js";
 
 export const JOB_ARCHIVE_VERSION = 1;
@@ -45,7 +41,7 @@ export type ArchivedJob = LaneJob & { status: Exclude<JobStatus, "running">; end
 
 export interface JobArchiveFile {
   version: 1;
-  /** The highest job sequence number this or any previous process minted. */
+  /** Legacy v1 field retained so pre-random-id archives remain readable. */
   lastSeq: number;
   jobs: ArchivedJob[];
 }
@@ -69,9 +65,7 @@ export function jobArchivePath(env: NodeJS.ProcessEnv = process.env): string {
 export interface JobArchive {
   /** Persist a job that has reached a terminal state. Written at once. */
   record(job: LaneJob): void;
-  /** Remember the highest sequence number minted, so a restart continues past it. */
-  noteSeq(seq: number): void;
-  /** What a previous process left: its finished jobs and its highest sequence number. */
+  /** What a previous process left; lastSeq is legacy v1 compatibility only. */
   restore(): { jobs: ArchivedJob[]; lastSeq: number };
   /** Run any pending debounced write now — the shutdown seam. */
   flush(): void;
@@ -80,8 +74,6 @@ export interface JobArchive {
    * job that another host's server finished after this one started.
    */
   lookup(jobId: string): ArchivedJob | undefined;
-  /** The highest sequence number on disk now, so a fresh id cannot repeat one another process minted. */
-  lastSeqOnDisk(): number;
   /** Every finished job on disk now. */
   all(): ArchivedJob[];
 }
@@ -89,15 +81,13 @@ export interface JobArchive {
 /** An archive that keeps nothing. The default for an embedder that declines one. */
 export const nullJobArchive: JobArchive = {
   record: () => {},
-  noteSeq: () => {},
   restore: () => ({ jobs: [], lastSeq: 0 }),
   flush: () => {},
   lookup: () => undefined,
-  lastSeqOnDisk: () => 0,
   all: () => [],
 };
 
-/** The sequence number inside a `job-NNNN` id, or null for any other spelling. */
+/** The sequence number inside a legacy safe-integer `job-NNNN` id, or null for opaque/new ids. */
 export function jobSeqOf(id: string): number | null {
   const m = /^job-(\d+)$/.exec(id);
   if (!m) return null;
@@ -114,7 +104,6 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
   const rows = new Map<string, ArchivedJob>();
   let lastSeq = 0;
   let loaded = false;
-  const timer = new WriteBehindTimer();
 
   /** The valid rows and the highest sequence on disk now; null for an absent or unusable file. */
   const readDisk = (): { rows: ArchivedJob[]; lastSeq: number } | null => {
@@ -171,28 +160,18 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
       if (job.status === "running" || job.endedAt === undefined) return;
       rows.set(job.id, boundOutput(job as ArchivedJob));
       // ⚠ Eager, see the module header: the case this exists for is a process killed with no
-      // handler, where a debounced write is a lost report.
-      timer.clear();
+      // handler, where a delayed write is a lost report.
       write();
-    },
-    noteSeq(seq) {
-      readOnce();
-      if (!Number.isSafeInteger(seq) || seq <= lastSeq) return;
-      lastSeq = seq;
-      timer.touch(write);
     },
     restore() {
       readOnce();
       return { jobs: [...rows.values()], lastSeq };
     },
     flush() {
-      timer.flushNow();
+      // Terminal archive writes are eager; kept as the shutdown seam for callers and embedders.
     },
     lookup(jobId) {
       return readDisk()?.rows.find((row) => row.id === jobId);
-    },
-    lastSeqOnDisk() {
-      return readDisk()?.lastSeq ?? 0;
     },
     all() {
       return readDisk()?.rows ?? [];

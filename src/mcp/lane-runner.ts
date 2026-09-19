@@ -22,11 +22,12 @@
  * process answers no HTTP at all.
  */
 import { exec, execFile, execSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { quoteCmdArg } from "../lane-probe.js";
 import { nullJobJournal, type JobJournal } from "./job-journal.js";
-import { jobSeqOf, nullJobArchive, type JobArchive } from "./job-archive.js";
+import { nullJobArchive, type JobArchive } from "./job-archive.js";
 import { classifyLaneProbeOutput, type LaneProbeSpawnResult } from "../lane-quota-probe.js";
 import { laneOfRung } from "../lane-manifest.js";
 import type { DispatchLaneStatus } from "../dispatch-lane-stats.js";
@@ -928,29 +929,39 @@ function recentOf(job: LaneJob, elsewhere: boolean): RecentJob {
 }
 
 /**
- * Newest start first. Two jobs can start in the same millisecond, so the job number breaks the tie:
- * ids are minted in order across every process (`seedJobCounter`).
+ * Newest start first. `startedAt` is the ordering fact across independent MCP processes. When two
+ * rows share one millisecond, the opaque id is only a deterministic tie-break. Within one process
+ * its fixed-width local suffix is monotonic; across processes a same-ms tie has no knowable order
+ * without re-introducing the shared sequencer this module deliberately avoids.
  */
 function newestFirst(a: Pick<RecentJob, "id" | "startedAt">, b: Pick<RecentJob, "id" | "startedAt">): number {
-  return b.startedAt - a.startedAt || (jobSeqOf(b.id) ?? 0) - (jobSeqOf(a.id) ?? 0);
+  return b.startedAt - a.startedAt || b.id.localeCompare(a.id);
 }
 
 /**
- * Monotonic job ids. Readable, and stable to sort. Process-global, and SEEDED from what a previous
- * process left on disk (`seedJobCounter`), so a restart never mints an id the previous process
- * already handed out — `job-0001` after a restart used to name a different job than the same
- * handle did before it (C:\Code\docs\backlog.md, 2026-09-11).
+ * Build one process-local job-id allocator.
+ *
+ * The old allocator read a shared max sequence and then incremented a process-local counter. Two
+ * MCP processes could both read N before either wrote N+1, so both handed out the same handle.
+ *
+ * New ids keep the established `job-<digits>` wire shape but replace the shared sequence with a
+ * 128-bit random PROCESS instance plus a local monotonic suffix. Independent processes need no
+ * coordination. The leading 9 plus fixed-width 39-digit instance guarantees every new id is
+ * outside JavaScript's safe-integer range, so `jobSeqOf` can continue recognizing only legacy
+ * sequential ids in old archive files.
  */
-let jobCounter = 0;
-function nextJobId(): string {
-  jobCounter += 1;
-  return `job-${String(jobCounter).padStart(4, "0")}`;
+export function createJobIdFactory(entropy: Uint8Array = randomBytes(16)): () => string {
+  const bytes = Buffer.from(entropy);
+  if (bytes.length !== 16) throw new Error("job id entropy must be exactly 16 bytes");
+  const instance = BigInt(`0x${bytes.toString("hex")}`).toString(10).padStart(39, "0");
+  let local = 0n;
+  return (): string => {
+    local += 1n;
+    return `job-9${instance}${local.toString(10).padStart(8, "0")}`;
+  };
 }
 
-/** Raise the counter to at least `seq`; never lowers it. */
-export function seedJobCounter(seq: number): void {
-  if (Number.isSafeInteger(seq) && seq > jobCounter) jobCounter = seq;
-}
+const defaultJobIdFactory = createJobIdFactory();
 
 /**
  * The job store.
@@ -986,13 +997,18 @@ export class LaneJobStore {
 
   private readonly journal: JobJournal;
   private readonly archive: JobArchive;
+  private readonly nextJobId: () => string;
 
-  constructor(journal: JobJournal = nullJobJournal, archive: JobArchive = nullJobArchive) {
+  constructor(
+    journal: JobJournal = nullJobJournal,
+    archive: JobArchive = nullJobArchive,
+    nextJobId: () => string = defaultJobIdFactory,
+  ) {
     this.journal = journal;
     this.archive = archive;
+    this.nextJobId = nextJobId;
     // Archive first, then orphans: a job can be in only one of the two (the journal row is cleared
-    // at the same transition the archive row is written), and the counter is seeded from BOTH so a
-    // fresh id can collide with neither a finished job's nor a killed one's.
+    // at the same transition the archive row is written). New ids need no disk seeding.
     this.restoreArchive();
     this.adoptOrphans();
   }
@@ -1003,13 +1019,10 @@ export class LaneJobStore {
    * can say the report predates this process.
    */
   private restoreArchive(): void {
-    const { jobs, lastSeq } = this.archive.restore();
-    seedJobCounter(lastSeq);
+    const { jobs } = this.archive.restore();
     for (const row of jobs) {
       if (this.jobs.has(row.id)) continue;
       this.jobs.set(row.id, { ...row, restored: true });
-      const seq = jobSeqOf(row.id);
-      if (seq !== null) seedJobCounter(seq);
     }
   }
 
@@ -1031,8 +1044,6 @@ export class LaneJobStore {
   private adoptOrphans(): void {
     for (const row of this.journal.orphans()) {
       if (this.jobs.has(row.jobId)) continue;
-      const seq = jobSeqOf(row.jobId);
-      if (seq !== null) seedJobCounter(seq);
       const killed: LaneJob = {
         id: row.jobId,
         status: "killed",
@@ -1067,13 +1078,8 @@ export class LaneJobStore {
     dispatchSource?: "daemon" | "fallback",
     label?: string,
   ): LaneJob {
-    // ⚠ Seeded from the DISK at every mint, not only at start: another host's server mints from the
-    // same files, and two processes seeded once each handed out the same `job-NNNN`. The journal
-    // row below is written at once, so the window left between two processes is one write.
-    seedJobCounter(this.archive.lastSeqOnDisk());
-    seedJobCounter(this.journal.maxSeqOnDisk());
     const job: LaneJob = {
-      id: nextJobId(),
+      id: this.nextJobId(),
       status: "running",
       laneId,
       spec,
@@ -1090,8 +1096,6 @@ export class LaneJobStore {
       ...(label ? { label } : {}),
     };
     this.jobs.set(job.id, job);
-    const seq = jobSeqOf(job.id);
-    if (seq !== null) this.archive.noteSeq(seq);
     // ⚠ Recorded BEFORE the lane runs, so a kill between here and the first attempt is still
     // reported. The row is removed by `reap()` the moment the job goes terminal, which is why what
     // survives a crash is exactly the set that was still running.

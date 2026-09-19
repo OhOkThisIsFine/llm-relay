@@ -14,7 +14,7 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { LaneJobStore, seedJobCounter } from "../src/mcp/lane-runner.js";
+import { createJobIdFactory, LaneJobStore } from "../src/mcp/lane-runner.js";
 import { createJobJournal } from "../src/mcp/job-journal.js";
 import {
   MAX_ARCHIVED_JOBS,
@@ -63,26 +63,25 @@ describe("finished-job archive across a restart", () => {
     }
   });
 
-  it("continues the job-id sequence past every id the previous process minted — finished OR killed", () => {
+  it("never reuses a handle across a restart, without consulting the old sequence", () => {
     const { dir, cleanup } = tempDir();
     try {
       const archivePath = join(dir, "mcp-job-archive.json");
       const journalPath = join(dir, "mcp-jobs.json");
-      const first = new LaneJobStore(createJobJournal(journalPath), createJobArchive(archivePath));
-      const a = first.create("lane-a", "pool/high", "C:/tree");
-      first.complete(a.id, { code: 0, stdout: "ok", stderr: "", timedOut: false });
+      const firstIds = createJobIdFactory(new Uint8Array(16).fill(1));
+      const secondIds = createJobIdFactory(new Uint8Array(16).fill(2));
+      const first = new LaneJobStore(createJobJournal(journalPath), createJobArchive(archivePath), firstIds);
+      const done = first.create("lane-a", "pool/high", "C:/tree");
+      first.complete(done.id, { code: 0, stdout: "ok", stderr: "", timedOut: false });
       const stillRunning = first.create("lane-b", "agy", "C:/tree");
-      const highest = jobSeqOf(stillRunning.id) as number;
 
-      // Simulate a fresh process: the module counter is process-global, so it is reset LOWER here
-      // to prove the seeding raises it rather than relying on the same process's own memory.
-      // `seedJobCounter` never lowers, so this goes through the archive's own restore path.
-      const second = new LaneJobStore(createJobJournal(journalPath), createJobArchive(archivePath));
+      // A restarted process gets a fresh 128-bit process instance. Its first local counter value is
+      // the SAME as the old process's first one, yet the handles cannot collide.
+      const second = new LaneJobStore(createJobJournal(journalPath), createJobArchive(archivePath), secondIds);
       const next = second.create("lane-c", "pool/low", "C:/tree");
-      // ⚠ RED on HEAD: the counter restarted at job-0001 and the new job collided with an archived
-      // or killed one, so one handle named two jobs.
-      expect(jobSeqOf(next.id)).toBeGreaterThan(highest);
-      expect(second.get(a.id)?.status).toBe("completed");
+      expect(next.id).toMatch(/^job-\d+$/);
+      expect(new Set([done.id, stillRunning.id, next.id]).size).toBe(3);
+      expect(second.get(done.id)?.status).toBe("completed");
       expect(second.get(stillRunning.id)?.status).toBe("killed");
       expect(second.list().map((j) => j.id)).toContain(next.id);
     } finally {
@@ -90,13 +89,17 @@ describe("finished-job archive across a restart", () => {
     }
   });
 
-  it("seeds the counter from a bare lastSeq even when every archived row is gone", () => {
+  it("keeps legacy lastSeq readable but does not use it to allocate new ids", () => {
     const { dir, cleanup } = tempDir();
     try {
       const path = join(dir, "mcp-job-archive.json");
       writeFileSync(path, JSON.stringify({ version: 1, lastSeq: 9000, jobs: [] }));
-      const store = new LaneJobStore(undefined, createJobArchive(path));
-      expect(jobSeqOf(store.create("l", undefined, "C:/w").id)).toBeGreaterThan(9000);
+      const ids = createJobIdFactory(new Uint8Array(16).fill(3));
+      const store = new LaneJobStore(undefined, createJobArchive(path), ids);
+      const id = store.create("l", undefined, "C:/w").id;
+      expect(id).toMatch(/^job-\d+$/);
+      expect(jobSeqOf(id)).toBeNull();
+      expect(createJobArchive(path).restore().lastSeq).toBe(9000);
     } finally {
       cleanup();
     }
@@ -134,8 +137,12 @@ describe("finished-job archive across a restart", () => {
       const running = store.create("lane-a", "pool/high", "C:/tree");
       archive.record(store.get(running.id) as never);
       archive.flush();
-      const onDisk = JSON.parse(readFileSync(path, "utf8")) as { jobs: unknown[] };
-      expect(onDisk.jobs).toEqual([]);
+
+      // With the old shared job-sequence allocator, creating a running job also dirtied the
+      // archive's lastSeq field, so this file happened to exist. Opaque process-unique ids remove
+      // that unrelated write: the stronger invariant is that a running job creates NO terminal
+      // archive row, and the archive file may legitimately not exist until something finishes.
+      expect(createJobArchive(path).restore().jobs).toEqual([]);
       // And a restart with no journal reports nothing for it — that is the journal's job.
       expect(new LaneJobStore(undefined, createJobArchive(path)).get(running.id)).toBeUndefined();
     } finally {
@@ -217,19 +224,25 @@ describe("finished-job archive across a restart", () => {
     expect(isArchivedJob({ id: "job-0001", status: "cancelled", laneId: "l", startedAt: 1, endedAt: 2, exitCode: 1, stdout: "", stderr: "", timedOut: false, cwd: "c", attempts: [], process: { pids: [1], survivors: [], terminated: true } })).toBe(true);
   });
 
-  it("parses job sequence numbers and refuses any other spelling", () => {
+  it("parses only legacy safe-integer job sequences; new ids stay numeric but opaque", () => {
     expect(jobSeqOf("job-0042")).toBe(42);
     expect(jobSeqOf("job-140")).toBe(140);
     expect(jobSeqOf("job-0000")).toBeNull();
     expect(jobSeqOf("x-0001")).toBeNull();
     expect(jobSeqOf("")).toBeNull();
-    // `seedJobCounter` never lowers: a stale lower figure cannot re-issue a live id.
-    seedJobCounter(-1);
-    seedJobCounter(Number.NaN);
-    const store = new LaneJobStore(undefined, nullJobArchive);
-    const before = jobSeqOf(store.create("l", undefined, "C:/w").id) as number;
-    seedJobCounter(1);
-    expect(jobSeqOf(store.create("l", undefined, "C:/w").id)).toBe(before + 1);
+
+    const one = createJobIdFactory(new Uint8Array(16).fill(1));
+    const two = createJobIdFactory(new Uint8Array(16).fill(2));
+    const a1 = one();
+    const a2 = one();
+    const b1 = two();
+    expect(a1).toMatch(/^job-\d+$/);
+    expect(a2).toMatch(/^job-\d+$/);
+    expect(b1).toMatch(/^job-\d+$/);
+    expect(new Set([a1, a2, b1]).size).toBe(3);
+    expect(a2 > a1).toBe(true);
+    expect(jobSeqOf(a1)).toBeNull();
+    expect(jobSeqOf(b1)).toBeNull();
   });
 
   it("resolves its default path under the vitest temp root, never the operator's real archive", () => {
