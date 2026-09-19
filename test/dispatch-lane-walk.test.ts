@@ -3,18 +3,16 @@
  *
  * `dispatch` used to run ONE lane and report a failure when that lane was slow; the calling agent
  * then picked the next lane by hand. It now walks the ladder past a lane that shows no activity
- * for `idleMs` (a time budget until 2026-09-17), kills that lane, tries the next, and — when every lane is spent — returns an
+ * for `idleMs`, kills that lane, tries the next, and — when every lane is spent — returns an
  * instruction to do the work in the calling session instead.
  *
  * ⚠ **The slow lane here NEVER resolves on its own; it resolves only when killed.** That makes
  * every walk assertion deterministic rather than a race between two timers: if the idle stop failed to
  * fire, the test hangs and fails outright instead of passing on a lucky schedule.
  *
- * ⚠ **The `Config` is hand-built rather than loaded.** `parseDispatchWalk` floors `attemptMs` at
- * 1000 ms, which is right for an operator (a budget below that abandons a lane before a process can
- * start) and wrong for a suite, where it would add a second of real waiting per abandoned lane. The
- * server reads `cfg.routing.dispatchWalk` directly, so the parser is not on this path; its own
- * bounds are covered in `test/config.test.ts`.
+ * ⚠ **The `Config` is hand-built rather than loaded.** `parseDispatchWalk` floors `idleMs` at
+ * 30 seconds, which is right for an operator and too slow for this suite. The server reads the
+ * settings directly here; parser bounds are covered in `test/config.test.ts`.
  */
 import { describe, it, expect } from "vitest";
 import {
@@ -32,14 +30,10 @@ const WALK: DispatchWalkSettings = {
   enabled: true,
   idleMs: 40,
   attemptMs: 40,
-  // The daemon's agent-mode floor. The walk here reads `attemptMs` and each lane's own budget; this
-  // field only completes the type, so it matches `attemptMs` to keep the timing obvious.
+  // Legacy compatibility fields; the walk does not read them.
   agentAttemptMs: 40,
-  // ⚠ A sample floor far above anything these fixtures record, so every lane here keeps the flat
-  // `attemptMs` and the walk's timing stays deterministic. The per-lane quantile budget has its own
-  // suite (`test/dispatch-attempt-budget.test.ts`); mixing it in here would make every walk
-  // assertion depend on recorded history that these tests never write.
   attemptQuantile: 0.8,
+  // Still live for history fallback/outliers; these fixtures record no history.
   attemptMinSamples: 1000,
   // The outlier rule reads recorded history these fixtures never write; off keeps the walk's
   // timing the only thing under test here.
@@ -163,19 +157,16 @@ describe("dispatch lane walk", () => {
     expect(spawn.killed).toEqual(["l1"]);
   });
 
-  it("⚠ stops an idle lane at idleMs, whatever time budget the lane's history gives it", async () => {
-    // Owner decision 2026-09-17: a lane is stopped when it is IDLE, never because it passed a time
-    // budget. The lane's recorded budget says 5 seconds; the walk ignores it and stops the silent
-    // lane at the 40 ms idle limit.
+  it("⚠ stops an idle lane at idleMs regardless of advisory time-to-answer history", async () => {
     const spawn = laneRunner({ l2: ok("the second lane answered") });
-    const withBudget = view(["l1", "l2"]);
-    withBudget.ladder[0]!.attemptBudget = { ms: 5_000, basis: "history", samples: 10 };
-    const h = new Harness({ buildView: async () => withBudget, spawn });
+    const withHistory = view(["l1", "l2"]);
+    withHistory.ladder[0]!.timeToAnswer = { medianMs: 5_000, p80Ms: 8_000, samples: 10, mode: "agent" };
+    const h = new Harness({ buildView: async () => withHistory, spawn });
     const { text, isError } = await h.tool("dispatch", { task: "do it" });
     expect(isError).toBe(false);
     expect(text).toContain("the second lane answered");
     expect(spawn.started).toEqual(["l1", "l2"]);
-    expect(text).toContain("no activity for 0s (no relay traffic, output or file change)");
+    expect(text).toContain("no activity for 0s (no relay traffic, output, process CPU or file change)");
   });
 
   it("names every lane it tried and why, so the walk is legible", async () => {
@@ -238,10 +229,9 @@ describe("dispatch lane walk", () => {
     expect(reports.map((report) => [report.laneId, report.status])).toEqual([["l1", "completed"]]);
   });
 
-  it("⚠ the LAST lane gets NO budget — it is awaited, not abandoned", async () => {
-    // Only l3 answers, and it answers LATE. With a budget applied to the last lane the walk would
-    // kill it and return nothing; with no budget it waits, which is the whole point — there is
-    // nowhere left to move to, so killing would throw away the only answer still coming.
+  it("⚠ the LAST lane is never idle-stopped — it is awaited, not abandoned", async () => {
+    // Only l3 answers, and it answers LATE. There is nowhere left to move to, so an idle stop would
+    // only throw away the sole answer still coming.
     let settle: (r: LaneRunResult) => void = () => {};
     const started: string[] = [];
     const spawn: LaneSpawner = (command) => {
@@ -265,8 +255,8 @@ describe("dispatch lane walk", () => {
   });
 
   it("returns the terminal fallback instruction when every lane is spent", async () => {
-    // ⚠ Every lane FAILS FAST here rather than hanging, and that matters: the last lane gets no
-    // budget, so a hanging last lane is correctly still WAITED FOR and the walk has not ended.
+    // ⚠ Every lane FAILS FAST here rather than hanging, and that matters: the last lane is never
+    // idle-stopped, so a hanging last lane is correctly still WAITED FOR and the walk has not ended.
     // The terminal instruction is for a walk that truly finished with nothing.
     const spawn = laneRunner({ l1: nonZero("no"), l2: nonZero("no"), l3: nonZero("no") });
     const h = new Harness({ spawn });
