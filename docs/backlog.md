@@ -31,17 +31,6 @@
   to launch Windows command shims; if a shell remains necessary, its encoder and Windows test must
   prove embedded quotes and `& | < > ^ ( ) % !` stay one literal argument.
 
-- **MCP job ids are not atomic across concurrent host processes (verified 2026-09-18, high).**
-  `LaneJobStore.create` reads `lastSeqOnDisk()` / `maxSeqOnDisk()`, raises a process-local
-  `jobCounter`, then mints `job-NNNN` and only afterwards writes the journal/archive. Two MCP
-  processes can therefore both read the same maximum before either writes and both mint the same
-  id. `job-journal.ts` and `job-archive.ts` explicitly have no cross-process lock; their merge-on-
-  write logic cannot distinguish two different jobs with the same key. The current multi-host test
-  covers a higher id that is already on disk before the next mint, not the simultaneous read/read
-  race. **Property:** a job id names exactly one job across all live `llm-relay mcp` processes.
-  Allocation must be an atomic cross-process claim or use collision-resistant ids, with a test that
-  synchronizes two independent allocators at the claim boundary.
-
 - **POSIX lane reaping does not reliably kill descendants (verified 2026-09-18, high).**
   `terminateProcessTree` tries `process.kill(-pid, "SIGKILL")`, which targets process group `pid`,
   then falls back to killing only `pid`. But `createLaneSpawner` does not start the child as a new

@@ -12,12 +12,12 @@
  * job 2,023 times over 71 minutes and never called `dispatch_result`).
  */
 import { describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { LaneJobStore } from "../src/mcp/lane-runner.js";
+import { createJobIdFactory, LaneJobStore } from "../src/mcp/lane-runner.js";
 import { createJobJournal } from "../src/mcp/job-journal.js";
-import { createJobArchive, jobSeqOf } from "../src/mcp/job-archive.js";
+import { createJobArchive } from "../src/mcp/job-archive.js";
 import { McpDispatchServer, taskLabel, type DispatchViewBuilder } from "../src/mcp/server.js";
 import type { Config } from "../src/config.js";
 import type { DispatchLane, DispatchView } from "../src/dispatch.js";
@@ -111,28 +111,30 @@ describe("two llm-relay mcp processes share the job files", () => {
     }
   });
 
-  it("never mints an id the other process handed out after this one started", () => {
+  it("independent process allocators cannot collide at the same local counter value", () => {
     const { dir, cleanup } = tempDir();
     try {
-      const { mine, journalPath, archivePath } = twoHosts(dir, () => true);
-      const second = mine();
-      const probe = second.create("agy", undefined, "C:/tree");
-      // The other process runs its own counter, so it is written to the files directly: one job it
-      // is running and one it finished, both far past anything this process has minted.
-      const base = (jobSeqOf(probe.id) as number) + 500;
-      const running = `job-${base}`;
-      const finished = `job-${base + 1}`;
-      writeFileSync(journalPath, JSON.stringify({
-        version: 1,
-        jobs: [{ jobId: running, laneId: "x", cwd: "C:/t", startedAt: 1, owner: { pid: OTHER_PID, instance: "other" } }],
-      }));
-      const ours = second.create("agy", undefined, "C:/tree");
-      // ⚠ RED before disk seeding at mint time: the counter was seeded once, at start.
-      expect(jobSeqOf(ours.id)).toBeGreaterThan(base);
+      const journalPath = join(dir, "mcp-jobs.json");
+      const archivePath = join(dir, "mcp-job-archive.json");
+      const first = new LaneJobStore(
+        createJobJournal(journalPath, { pid: OTHER_PID, isAlive: () => true }),
+        createJobArchive(archivePath),
+        createJobIdFactory(new Uint8Array(16).fill(1)),
+      );
+      const second = new LaneJobStore(
+        createJobJournal(journalPath, { isAlive: (pid) => pid === OTHER_PID }),
+        createJobArchive(archivePath),
+        createJobIdFactory(new Uint8Array(16).fill(2)),
+      );
 
-      writeFileSync(archivePath, JSON.stringify({ version: 1, lastSeq: base + 1, jobs: [] }));
-      expect(jobSeqOf(second.create("agy", undefined, "C:/tree").id)).toBeGreaterThan(base + 1);
-      expect(finished).not.toBe(ours.id);
+      // Both factories are at local counter 1. The old read-max/increment design could collide
+      // here before either process published its row; process-instance entropy makes disk timing
+      // irrelevant.
+      const theirs = first.create("free-pool", "pool/high", "C:/tree");
+      const ours = second.create("agy", undefined, "C:/tree");
+      expect(theirs.id).not.toBe(ours.id);
+      expect(theirs.id).toMatch(/^job-\d+$/);
+      expect(ours.id).toMatch(/^job-\d+$/);
     } finally {
       cleanup();
     }

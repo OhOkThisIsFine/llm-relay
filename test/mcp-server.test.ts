@@ -1526,26 +1526,13 @@ function responses(lines: readonly string[]): { id: number; text: string }[] {
   });
 }
 
-/** A spawner whose FIRST call answers at once and whose later calls take `slowMs`. */
-function firstFastThenSlow(slowMs: number): LaneSpawner {
-  const result: LaneRunResult = { code: 0, stdout: "lane answer", stderr: "", timedOut: false };
-  const fast = fakeSpawner(result, 0);
-  const slow = fakeSpawner(result, slowMs);
-  let calls = 0;
-  return (command, args, opts) => (calls++ === 0 ? fast : slow)(command, args, opts);
-}
-
 describe("stdio serve loop", () => {
   it("answers a request written while an earlier dispatch still blocks on waitMs", async () => {
     vi.useFakeTimers();
     try {
-      const h = new Harness({ spawn: firstFastThenSlow(5000) });
-      // Job ids are monotonic per process, so a dispatch that completes at once tells us the
-      // id the NEXT dispatch will get — the one we need to address while it is still blocking.
-      const warmup = await h.tool("dispatch", { task: "warm-up" });
-      const previous = Number(/job: job-(\d+)/.exec(warmup.text)?.[1]);
-      expect(Number.isFinite(previous)).toBe(true);
-      const jobId = `job-${String(previous + 1).padStart(4, "0")}`;
+      const h = new Harness({
+        spawn: fakeSpawner({ code: 0, stdout: "lane answer", stderr: "", timedOut: false }, 5000),
+      });
       const before = h.out.length;
 
       const source = new ChunkSource();
@@ -1553,13 +1540,17 @@ describe("stdio serve loop", () => {
 
       source.push(toolFrame(10, "dispatch", { task: "slow", waitMs: 1000 }));
       await vi.advanceTimersByTimeAsync(1);
-      // A SEPARATE write while the dispatch above is inside its 1000 ms wait.
-      source.push(toolFrame(11, "dispatch_status", { jobId }));
+      // A SEPARATE write while the dispatch above is inside its 1000 ms wait. Listing jobs is the
+      // protocol-supported way to recover a handle the caller does not yet have; no prediction of
+      // the allocator's next opaque id is needed.
+      source.push(toolFrame(11, "dispatch_status", {}));
       await vi.advanceTimersByTimeAsync(10);
 
       const early = responses(h.out.slice(before));
       expect(early.map((r) => r.id)).toEqual([11]);
-      expect(early[0]?.text).toContain("status: running");
+      expect(early[0]?.text).toContain("running");
+      const jobId = /(job-\d+)\s+running/.exec(early[0]?.text ?? "")?.[1];
+      expect(jobId).toBeDefined();
 
       // A cancel from a third write reaches the job and ends the blocking dispatch early: the
       // job tools work while a `dispatch` holds the loop, which is the whole point.

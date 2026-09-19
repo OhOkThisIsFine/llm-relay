@@ -84,8 +84,6 @@ export interface JobJournal {
   foreign(jobId: string): JournalRow | undefined;
   /** Every row another live process owns now. */
   foreignRows(): JournalRow[];
-  /** The highest `job-NNNN` sequence any row on disk carries, read at call time; 0 when none. */
-  maxSeqOnDisk(): number;
 }
 
 /** A journal that records nothing. The default under vitest, and for an embedder that declines one. */
@@ -95,7 +93,6 @@ export const nullJobJournal: JobJournal = {
   orphans: () => [],
   foreign: () => undefined,
   foreignRows: () => [],
-  maxSeqOnDisk: () => 0,
 };
 
 /** How a journal decides who owns a row. Injected so the suite can prove both branches. */
@@ -220,15 +217,6 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
     foreignRows() {
       readOnce();
       return (readDisk() ?? []).filter((row) => !rows.has(row.jobId) && ownedElsewhere(row));
-    },
-    maxSeqOnDisk() {
-      let max = 0;
-      for (const row of readDisk() ?? []) {
-        const m = /^job-(\d+)$/.exec(row.jobId);
-        const n = m ? Number(m[1]) : 0;
-        if (Number.isSafeInteger(n) && n > max) max = n;
-      }
-      return max;
     },
   };
 }

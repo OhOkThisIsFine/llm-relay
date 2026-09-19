@@ -2103,10 +2103,11 @@ status line says so. The caller decides.
 **A finished job survives a restart of the MCP server.** Every terminal job is written to
 `mcp-job-archive.json` under the cache directory the moment it ends (eagerly — the measured restart
 runs no shutdown handler), and read back on the next start marked `record: restored from disk`, so
-`dispatch_status`/`dispatch_result` answer for it instead of `unknown jobId`. Job ids continue past
-the highest one any previous process minted, finished or killed — a handle from before the restart
-never names a different job after it. The archive keeps the newest 100 jobs, each stream capped at
-512 KiB (tail kept, with a marker).
+`dispatch_status`/`dispatch_result` answer for it instead of `unknown jobId`. Job ids are opaque
+`job-<digits>` handles: each MCP process gets a 128-bit random instance and a local monotonic
+suffix, so a restart or a second host needs no shared sequence allocator and an old handle never
+names a different job. Legacy sequential ids in an existing archive remain readable. The archive
+keeps the newest 100 jobs, each stream capped at 512 KiB (tail kept, with a marker).
 
 **Several hosts share the job files.** Claude Desktop, Codex Desktop and a CLI session each start
 their own `llm-relay mcp` process, and all of them read and write the same journal and archive.

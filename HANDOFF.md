@@ -105,8 +105,8 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
     through `candidate-runner.ts`/`server.ts`.
   - **MCP dispatch subsystem** (`src/mcp/lane-runner.ts`, `src/mcp/server.ts`,
     `src/mcp/job-archive.ts` new, `src/mcp/readonly-boundary.ts`) — a silent, stalled lane is now
-    reported (not silently left `running`); finished dispatch jobs and the job-id counter survive
-    a daemon restart via the new archive; `dispatch(readOnly: true)` now binds the lane's own
+    reported (not silently left `running`); finished dispatch jobs survive
+    an MCP-server restart via the archive; job handles are now process-unique rather than a shared counter; `dispatch(readOnly: true)` now binds the lane's own
     read-only tool flags (`claude`/`codex`), not only its cwd (`opencode`/`agy` refused by name,
     the gap stated rather than claimed).
   - **Dashboard's first write** (`routes/admin.ts` `operatorLanePin`) — `POST /dispatch
