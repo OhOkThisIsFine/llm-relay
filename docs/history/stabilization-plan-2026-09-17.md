@@ -285,6 +285,10 @@ envelope from a known binary; to unwrap it is inside the repair boundary.
   `docs/lane-orphan-measurement-<date>.md`.
 - **Why.** The result decides D1. If the lane survives, D1 can re-adopt it. If it dies with the
   parent, D1 needs a detached start.
+- **Measured 2026-09-19 (S4 complete).** Windows `taskkill /F` of the MCP PID WITHOUT `/T`
+  killed the in-flight fake lane too: it was not alive 500 ms later and produced 1 of 60 expected
+  lines. Evidence: `docs/lane-orphan-measurement-2026-09-19.md`. D1 therefore needs detachment
+  (or an equivalent independent process lifetime) before re-adoption can preserve running work.
 
 ---
 
@@ -399,8 +403,9 @@ the owner these questions.
   journal, and let the next MCP process re-adopt a live lane or read a finished lane's output.
 - **Trade.** (b) removes the largest measured loss. It also weakens the rule "the store reaps what
   it started" (`LaneJobStore.reap`), needs a pid-reuse defence, and is a strong-model design, not
-  a cheap packet. S4 must measure first whether a lane survives its parent on Windows.
-- **Recommendation.** Run S4, then design (b) in its own lap.
+  a cheap packet. S4 measured on 2026-09-19 that the lane dies with its MCP parent on Windows.
+- **Recommendation.** Design (b) in its own lap; S4 proves re-adoption without detachment is
+  insufficient.
 
 ### D2 The daemon does not reload `config.json`
 - **True now.** An edit takes effect at the next restart. `/telemetry` and three CLI commands
