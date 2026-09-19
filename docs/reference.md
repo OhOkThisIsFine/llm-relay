@@ -214,12 +214,15 @@ two seconds behind) and flushed on a graceful shutdown; a hard kill can lose tha
 
 **The relay does not hot-reload `config.json`.** An edit takes effect only on the next start, and
 the relay says so rather than leaving you to wonder why nothing changed: `GET /telemetry` carries
+`version` with the package version loaded by that daemon, plus
 `config: { path, loadedAt, changedOnDisk, diskMtime }`, comparing the file's mtime when this
 process loaded it against its mtime right now. When a config-reading command talks to a running
-relay (`routing show`, `offload status`, `pools`, `routing`, `config`) and that relay reports
-`changedOnDisk: true`, the command prints one notice on stderr —
+relay (`routing show|get`, `config show|get`, `offload status`), it compares that running version
+with the installed package and prints
+`the running relay is v<x>; the installed package is v<y> — restart the relay to load it` on stderr
+when they differ. When the relay reports `changedOnDisk: true`, the command also prints the config notice —
 `config changed on disk since the relay loaded it — restart required (llm-relay stop, then start)`
-— while its own stdout output is unaffected, because these commands are JSON surfaces. The daemon
+— while its own stdout output is unaffected. The daemon
 also logs the same fact once to its own log/stderr, the first time `GET /telemetry` observes the
 change, so an operator watching the log sees it without running a command. Restart with
 `llm-relay stop` (see [CLI reference](#cli-reference)) followed by starting the relay again.
@@ -2629,7 +2632,9 @@ the store's `writerHealth()`: `{ state, lastSuccessfulWriteAt, lastFailureAt,
 lastFailureReason }`, where `state` is one of `writing`, `lease_refused`, `flush_failed`,
 `schema_refused`, `read_only` and the timestamps are ISO strings or `null` (never a
 fabricated time, never `0`; the reason is a bounded metadata-only head, never user data).
-It is `null` when no ledger is attached to the reporter. The block names metering state
+`GET /telemetry` also carries `version`, the package version loaded by the running daemon; an
+unversioned programmatic embed reports `"unknown"`. The `accounting` block is `null` when no ledger
+is attached to the reporter. The block names metering state
 only — no credential, key, or spend figures — so `/telemetry` stays tokenless
 provider-aggregate data.
 

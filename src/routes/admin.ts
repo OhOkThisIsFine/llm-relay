@@ -159,6 +159,8 @@ export interface AdminHandlers {
   pingLoop?: PingLoop;
   logger: MetadataLogger;
   breaker: CircuitBreaker;
+  /** Package version loaded by this daemon process; absent only for an unversioned embed. */
+  relayVersion?: string;
   /**
    * The server's accounting ledger when it has one, narrowed to the same in-memory window read
    * the availability producer and G2's cap evaluator take. Optional because a bare programmatic
@@ -814,7 +816,7 @@ export async function handleAdminRoutes(
   if (req.method === "GET" && pathname === "/telemetry") {
     const accounting =
       typeof h.accountingReader?.writerHealth === "function" ? h.accountingReader.writerHealth() : null;
-    const report = getTelemetryReport(cfg, h.breaker, Date.now(), accounting);
+    const report = getTelemetryReport(cfg, h.breaker, Date.now(), accounting, h.relayVersion ?? "unknown");
     // Log the fact exactly once per process — see the doc comment on
     // AdminHandlers.claimConfigStalenessLogOnce and config.ts `configStaleness`.
     if (report.config.changedOnDisk && h.claimConfigStalenessLogOnce()) {
