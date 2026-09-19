@@ -1545,13 +1545,16 @@ and name a different lane by hand:
     counts as activity now. This is the signal that matters for a pool lane, because `claude -p`
     writes no output until it exits. The tag never leaves the relay.
   - **output** from the lane process.
-  - **its git working tree** — a `git status` change since the last check, or the newest mtime of a
-    changed file.
+  - **owned process CPU** — for spawned lanes, cumulative CPU time of the exact process tree the
+    dispatcher registered for reaping. The first read is only a baseline; a later increase is work.
+  - **its git working tree** — a per-lane `git status` baseline is reset when the walk advances,
+    then a status change or the newest mtime of a changed file counts as activity.
 
-  A lane that does not talk to this relay (AGY, Codex, OpenCode) has only the last two signs. Five
+  A lane that does not talk to this relay (AGY, Codex, OpenCode) can still prove work through its
+  own output, process CPU or file changes. Five
   minutes of no traffic covers a lane that runs a long command, such as a test suite. The job shows
   the newest sign on a `last activity:` line while it runs, and an attempt the walk stopped says
-  `no activity for 300s (no relay traffic, output or file change)`.
+  `no activity for 300s (no relay traffic, output, process CPU or file change)`.
 - ⚠ **The LAST lane is never stopped.** There is nowhere to move to, so killing a lane that is still
   working would throw away the only answer still coming. Its own `--timeout` still bounds it.
 - ⚠ **Nor is a lane whose later lanes cannot answer.** When every lane after it is on a streak of
@@ -1585,7 +1588,7 @@ and name a different lane by hand:
   "dispatchWalk": {
     "enabled": true,
     "idleMs": 300000,          // how long a lane may show no activity before the walk stops it
-    "attemptMinSamples": 5,    // recorded runs a lane needs before its own history is used
+    "attemptMinSamples": 5,    // sample floor for history fallback and outlier detection
     "maxLanes": 4,        // how many lanes one dispatch may try
     "pinMs": 900000,      // how long the lane that answered is preferred
     "demoteMs": 900000    // how long a lane that did not answer is ordered behind the rest
@@ -1595,8 +1598,9 @@ and name a different lane by hand:
 ```
 
 Default ON; `"dispatchWalk": false` is a byte-for-byte revert to one lane per call with no memory.
-An unknown key is a config error. `attemptMs`, `agentAttemptMs` and `attemptQuantile` still load,
-but since 2026-09-17 they stop no lane: the walk stops a lane only when it is idle.
+An unknown key is a config error. `attemptMs`, `agentAttemptMs` and `attemptQuantile` are legacy
+pre-v0.84 keys: they still validate and load so existing configs remain compatible, and an explicit
+setting warns that it has no effect. No per-lane attempt budget is computed; `idleMs` is the stop policy.
 
 Each lane's recorded runs still give its **usual time to answer** (the median and 80th percentile
 of its completed runs), which a running job and `dispatch_lanes` show so a caller can tell a slow
