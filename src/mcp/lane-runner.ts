@@ -9,8 +9,8 @@
  * - Three client idle watchdogs abort a long think at ~300 s unless the lane env lifts all three
  *   (`CLAUDE_STREAM_IDLE_TIMEOUT_MS`, `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS`, `API_FORCE_IDLE_TIMEOUT`).
  * - An async `execFile` leaves stdin an OPEN pipe, and `agy` then waits on it until the timeout.
- * - An npm `.cmd` shim needs a shell, and the shell fallback must quote EVERY token or a spaced
- *   argument splits (`codex` saw one prompt as seven arguments).
+ * - An npm `.cmd` shim cannot be executed directly; on Windows its generated shim metadata is
+ *   resolved to a Node entrypoint so arbitrary task argv never passes through a shell.
  * - A console-subsystem child spawned from a console-less parent ALLOCATES a console and steals
  *   the desktop focus, unless `windowsHide` is set.
  * - `claude -p` buffers its whole answer until exit, so an empty log does not mean a dead lane.
@@ -25,7 +25,7 @@ import { exec, execFile, execSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
-import { quoteCmdArg } from "../lane-probe.js";
+import { resolveWindowsNpmShim, type WindowsNpmShimDeps, type WindowsNpmShimResolution } from "./windows-npm-shim.js";
 import { nullJobJournal, type JobJournal } from "./job-journal.js";
 import { nullJobArchive, type JobArchive } from "./job-archive.js";
 import { classifyLaneProbeOutput, type LaneProbeSpawnResult } from "../lane-quota-probe.js";
@@ -855,6 +855,13 @@ export interface LaneProcessApi {
   ) => LaneSpawnedProcess;
 }
 
+/** Injectable npm-shim resolver so unit tests never inspect the host filesystem. */
+export type WindowsNpmShimResolver = (
+  command: string,
+  args: readonly string[],
+  deps: WindowsNpmShimDeps,
+) => WindowsNpmShimResolution;
+
 const nodeProcessApi: LaneProcessApi = {
   platform: process.platform,
   execFile: (command, args, opts, callback) => execFile(command, args, opts, callback),
@@ -876,6 +883,7 @@ const nodeProcessApi: LaneProcessApi = {
 export function createLaneSpawner(
   processApi: LaneProcessApi,
   hostEnv: NodeJS.ProcessEnv = process.env,
+  resolveNpmShim: WindowsNpmShimResolver = resolveWindowsNpmShim,
 ): LaneSpawner {
   return (command, args, opts) => {
     if (hostEnv["VITEST"]) {
@@ -926,15 +934,28 @@ export function createLaneSpawner(
       };
 
       child = processApi.execFile(command, args as string[], execOpts, (err, stdout, stderr) => {
-        // An npm `.cmd` shim is not directly executable; Windows answers ENOENT. Retry through the
-        // shell, quoting every token — see `quoteCmdArg`.
+        // npm-installed commands are usually .cmd shims, which CreateProcess cannot execute
+        // directly. Do NOT reconstruct a cmd.exe command line, and do not rely on Windows
+        // PowerShell's legacy native-argument serializer: both can reinterpret task text. Resolve
+        // npm's generated .ps1 metadata to its Node entrypoint, then execFile Node with the
+        // ORIGINAL argv.
         if (err && processApi.platform === "win32" && err.code === "ENOENT" && !killed) {
-          const line = `${quoteCmdArg(command)} ${args.map(quoteCmdArg).join(" ")}`;
-          const fallback = processApi.exec(line, execOpts, (err2, stdout2, stderr2) => {
-            settle(err2, stdout2 ?? "", stderr2 ?? "");
+          const resolved = resolveNpmShim(command, args, {
+            env: opts.env,
+            cwd: opts.cwd,
+            nodeExecutable: process.execPath,
           });
+          if (!resolved.ok) {
+            settle(Object.assign(new Error(resolved.error), { code: "ENOENT" }), stdout ?? "", stderr ?? "");
+            return;
+          }
+          const fallback = processApi.execFile(
+            resolved.command,
+            resolved.args,
+            execOpts,
+            (err2, stdout2, stderr2) => settle(err2, stdout2 ?? "", stderr2 ?? ""),
+          );
           child = fallback;
-          // ⚠ Same stdin rule as the direct spawn below.
           fallback.stdin?.end();
           observeOutput(fallback, opts.onOutput);
           return;
@@ -957,7 +978,7 @@ export function createLaneSpawner(
         child?.kill();
       },
       // ⚠ Read lazily, and that is load-bearing rather than tidy: the ENOENT fallback above REPLACES
-      // `child` with the shell-spawned process, so a pid captured at spawn time would name the shim
+      // `child` with the direct Node process, so a pid captured at spawn time would name the shim
       // that never ran. Whatever root the spawn settled on is what a reaper must terminate.
       pids: () => (child?.pid === undefined ? [] : [child.pid]),
     };

@@ -176,29 +176,57 @@ describe("createLaneSpawner", () => {
       vi.useRealTimers();
     }
   });
-  it("Windows ENOENT fallback hides both children and closes both stdin pipes", async () => {
+  it("Windows ENOENT fallback resolves a Node entrypoint and preserves the original argv", async () => {
     const direct = fakeChild();
     const fallback = fakeChild();
-    const directCalls: SpawnCall[] = [];
-    const shellCalls: SpawnCall[] = [];
+    const calls: SpawnCall[] = [];
+    let execCalls = 0;
     const processApi: LaneProcessApi = {
       platform: "win32",
       execFile: (command, args, opts, callback) => {
-        directCalls.push({ command, args, opts });
-        queueMicrotask(() => {
-          const missing = Object.assign(new Error("not found"), { code: "ENOENT" });
-          callback(missing, "", "");
-        });
-        return direct.process;
-      },
-      exec: (command, opts, callback) => {
-        shellCalls.push({ command, opts });
+        calls.push({ command, args, opts });
+        if (calls.length === 1) {
+          queueMicrotask(() => {
+            const missing = Object.assign(new Error("not found"), { code: "ENOENT" });
+            callback(missing, "", "");
+          });
+          return direct.process;
+        }
         queueMicrotask(() => callback(null, "FALLBACK_OK", ""));
         return fallback.process;
       },
+      exec: () => {
+        execCalls += 1;
+        throw new Error("cmd.exe fallback must never run");
+      },
     };
 
-    const run = createLaneSpawner(processApi, {})("tool.cmd", ["one", "two words"], laneOpts);
+    const dangerous = [
+      "two words",
+      'quote"inside',
+      "& echo NO",
+      "| more",
+      "<in",
+      ">out",
+      "^caret",
+      "%PATH%",
+      "!bang!",
+      "$(Write-Output NO)",
+      "`backtick",
+    ];
+    let resolverInput: { command: string; args: readonly string[] } | undefined;
+    const resolveShim = (command: string, args: readonly string[]) => {
+      resolverInput = { command, args: [...args] };
+      return {
+        ok: true as const,
+        command: "C:\\Program Files\\nodejs\\node.exe",
+        args: ["C:\\npm\\node_modules\\tool\\cli.js", ...args],
+        shimPath: "C:\\npm\\tool.cmd",
+        entryPath: "C:\\npm\\node_modules\\tool\\cli.js",
+      };
+    };
+
+    const run = createLaneSpawner(processApi, {}, resolveShim)("tool.cmd", dangerous, laneOpts);
     const result = await run.result;
 
     expect(result).toEqual({
@@ -207,10 +235,13 @@ describe("createLaneSpawner", () => {
       stderr: "",
       timedOut: false,
     });
-    expect(directCalls).toHaveLength(1);
-    expect(shellCalls).toHaveLength(1);
-    expectHiddenLaneOptions(directCalls[0]!.opts);
-    expectHiddenLaneOptions(shellCalls[0]!.opts);
+    expect(execCalls).toBe(0);
+    expect(resolverInput).toEqual({ command: "tool.cmd", args: dangerous });
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.command).toBe("C:\\Program Files\\nodejs\\node.exe");
+    expect(calls[1]?.args).toEqual(["C:\\npm\\node_modules\\tool\\cli.js", ...dangerous]);
+    expectHiddenLaneOptions(calls[0]!.opts);
+    expectHiddenLaneOptions(calls[1]!.opts);
     expect(direct.stdinEndCount()).toBe(1);
     expect(fallback.stdinEndCount()).toBe(1);
   });

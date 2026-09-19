@@ -18,19 +18,6 @@
 > 2026-09-17, are in [`history/stabilization-plan-2026-09-17.md`](history/stabilization-plan-2026-09-17.md). Delete
 > this pointer when that plan's exit condition is met.
 
-- **The Windows `.cmd` lane fallback reparses dispatched task text in `cmd.exe` (verified
-  2026-09-18, high/security).** `createLaneSpawner` (`src/mcp/lane-runner.ts`) first uses
-  `execFile`, then on Windows `ENOENT` rebuilds the command as one string and passes it to
-  `exec()`. That string uses `quoteCmdArg` from `src/lane-probe.ts`, which wraps each argument in
-  double quotes and replaces an embedded quote with a backslash followed by a quote. Backslash is
-  not `cmd.exe`'s quote escape,
-  so task text containing a quote can terminate the quoted argument and expose shell metacharacters
-  such as `&` or `|`. This is reachable from dispatch: `normalizeOptions` explicitly leaves task
-  text unsanitized and relies on it remaining one argv element. The existing fallback test covers a
-  space only. **Property:** no task/user text is ever reparsed as shell syntax. Prefer a no-shell way
-  to launch Windows command shims; if a shell remains necessary, its encoder and Windows test must
-  prove embedded quotes and `& | < > ^ ( ) % !` stay one literal argument.
-
 - **The default branch does not enforce the CI gate (verified 2026-09-18,
   medium/repository hardening).** GitHub reports `main` as unprotected and the repository has no
   rulesets, so the documented PR gate can still be bypassed by a direct push. The platform half is
