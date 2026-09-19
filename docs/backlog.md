@@ -53,19 +53,6 @@
   parent→grandchild integration test; either create an owned process group/session or enumerate and
   terminate descendants explicitly.
 
-- **Agent-mode dispatch inherits relay credential environment variables (verified 2026-09-18,
-  high/security).** `runMcp` reaches `loadOrExit`, which calls `ensureEnvFileLoaded`; that merges
-  `~/.llm-relay/.env` provider keys into `process.env`. `startLane` then builds every spawned
-  lane's environment from all of `process.env` before applying the rung's deltas. The custody design
-  already states why protected credentials must not be merged into `process.env`: every child
-  inherits it; the lane field notes also record a dispatched lane copying a provider key from its
-  environment into a scratch launcher despite being told not to print it. Keystore-only secrets do
-  not have this problem; env/file-backed ones do. **Property:** relay credentials are absent from a
-  spawned agent's environment unless that rung explicitly declares that it needs them. Build a
-  scrubbed child environment from the configured credential names/aliases, then apply explicit rung
-  env deltas, and test both the default absence and deliberate reintroduction paths without using a
-  real secret.
-
 - **The repository gate has no Windows execution leg and is not enforced on `main` (verified
   2026-09-18, medium/repository hardening).** `.github/workflows/ci.yml` is intentionally Ubuntu-
   only on the assumption that development happens on Windows, while `CONTRIBUTING.md` now invites
