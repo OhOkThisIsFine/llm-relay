@@ -32,6 +32,7 @@ import { flushLaneAffinityPersistence, loadLaneAffinityRows, restoreLaneAffinity
 import { flushDispatchLaneStatsPersistence, loadLaneStatsRows, restoreLaneStatsRows, type DispatchMode } from "./dispatch-lane-stats.js";
 import { McpDispatchServer } from "./mcp/server.js";
 import { readAgyLog } from "./mcp/agy-quota-log.js";
+import { defaultProcessCpuReader } from "./mcp/process-cpu.js";
 import { createJobJournal } from "./mcp/job-journal.js";
 import { createJobArchive } from "./mcp/job-archive.js";
 import type { DispatchedQuotaReport } from "./mcp/lane-runner.js";
@@ -2742,6 +2743,7 @@ export async function runMcp(): Promise<void> {
     reportExhaustion: (report) => reportMcpExhaustion(cfg, report),
     reportTelemetry: (report) => { void reportMcpTelemetry(cfg, report); },
     readLaneActivity: (tag) => readMcpLaneActivity(cfg, tag),
+    readProcessCpu: defaultProcessCpuReader,
     // ⚠ The running-job journal is what makes a restart REPORTABLE. Without it the measured
     // symptom was five lanes disappearing behind a bare `unknown jobId: job-0051` on a routine
     // poll (2026-09-06, ~90 lane-minutes lost). A row survives only while its job runs, so
