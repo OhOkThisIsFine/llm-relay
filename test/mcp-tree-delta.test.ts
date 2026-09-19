@@ -13,6 +13,7 @@ import { parsePorcelainZ, renderTreeDelta, type TreeSnapshot, type TreeSnapshotR
 import type { Config } from "../src/config.js";
 import type { DispatchLane, DispatchView } from "../src/dispatch.js";
 import type { LaneRunResult, LaneSpawner } from "../src/mcp/lane-runner.js";
+import { nullJobJournal, type JobJournal } from "../src/mcp/job-journal.js";
 
 const snap = (entries: Record<string, string>, prefix = ""): TreeSnapshot => ({
   prefix,
@@ -83,7 +84,7 @@ describe("renderTreeDelta", () => {
   });
 });
 
-function harness(opts: { readings: Array<TreeSnapshot | null>; laneMs?: number }) {
+function harness(opts: { readings: Array<TreeSnapshot | null>; laneMs?: number; journal?: JobJournal }) {
   const out: Array<{ id?: number; result?: { content: Array<{ text: string }> } }> = [];
   const lane: DispatchLane = {
     id: "claude-lane",
@@ -113,6 +114,7 @@ function harness(opts: { readings: Array<TreeSnapshot | null>; laneMs?: number }
     buildView: async () => view,
     spawn,
     treeSnapshot,
+    journal: opts.journal,
     cwd: () => process.cwd(),
     write: (chunk) => out.push(JSON.parse(chunk) as (typeof out)[number]),
   });
@@ -147,6 +149,19 @@ describe("dispatch carries the tree delta", () => {
     const answer = harness({ readings: [snap({}), snap({})] });
     await answer.call("dispatch", { task: "t", mode: "answer" });
     expect(answer.reads).toHaveLength(0);
+  });
+
+  it("journals the complete starting snapshot and scope before the lane runs", async () => {
+    let captured: { prefix: string; entries: [string, string][]; scope: readonly string[] | undefined } | undefined;
+    const journal: JobJournal = {
+      ...nullJobJournal,
+      noteStartingTree: (_jobId, tree, scope) => {
+        captured = { prefix: tree.prefix, entries: [...tree.entries], scope };
+      },
+    };
+    const h = harness({ readings: [snap({ "pre.ts": " M" }), snap({ "pre.ts": " M" })], journal });
+    await h.call("dispatch", { task: "t", scope: ["src"] });
+    expect(captured).toEqual({ prefix: "", entries: [["pre.ts", " M"]], scope: ["src"] });
   });
 
   it("records the delta for a cancelled job, and a later dispatch_result shows it", async () => {
