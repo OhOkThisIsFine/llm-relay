@@ -204,7 +204,7 @@ export function pinLane(
   remember(cfg, "pin", tier, laneId, reason, clampWindow(ttlMs, defaultWindowFor("pin")), now);
 }
 
-/** Demote a lane that failed to answer inside its budget, so ready lanes are tried ahead of it. */
+/** Demote a lane on fresh negative evidence (including an idle-stop), so ready lanes lead it. */
 export function demoteLane(
   cfg: Config,
   tier: string | null,

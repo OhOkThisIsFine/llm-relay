@@ -56,8 +56,6 @@ export const OUTCOME_DEFAULT_MS: Record<DispatchOutcome, number> = {
 /** Longest caller-supplied id echoed back in a `reason`. See `describeId`. */
 const MAX_ECHOED_ID = 120;
 
-/** The ceiling a RAISED budget stops at — the same one-hour ceiling `attemptMs` is bounded by. */
-export const MAX_ATTEMPT_BUDGET_MS = 3_600_000;
 /**
  * Own failures in a row after which a lane cannot be relied on to answer. `runWalk` will not stop
  * an earlier lane that is still working in order to reach lanes that are all past this streak.
@@ -104,53 +102,6 @@ export function formatLaneStats(stats: DispatchLaneStats): string {
     `stats: ${stats.calls} calls, ${stats.successes} ok, ${stats.failures} failed, ` +
     `${stats.timeouts} timed out, median ${seconds(stats.medianWallClockMs)}, p95 ${seconds(stats.p95WallClockMs)}`
   );
-}
-
-/**
- * One-line rendering of a lane's walk budget, shared by `dispatch_lanes` and `llm-relay dispatch`
- * so the wording cannot drift between the two surfaces — the `formatLaneStats` precedent.
- *
- * It names the BASIS as well as the number, because the three mean different things: one is derived
- * from this lane's own history and moves as the lane does, one is the operator's flat default
- * standing in until there is history to read, and one is that same flat default winning over a
- * history that IS present and faster than it.
- *
- * ⚠ The `clamped` wording states BOTH facts — the floor applied, AND what the lane's own quantile
- * actually was — because the second is the number the operator came to the ladder to see, and the
- * two-member version of this function hid it behind the word "recorded". See the `basis` doc on
- * `DispatchLane.attemptBudget` for what that cost.
- */
-export function formatAttemptBudget(budget: {
-  ms: number;
-  basis: "history" | "floor" | "clamped";
-  samples: number;
-  quantileMs?: number;
-  raisedBy?: number;
-}): string {
-  const render = (ms: number): string => `${Math.round(ms / 100) / 10}s`;
-  const seconds = render(budget.ms);
-  // The raise is stated BESIDE the basis, never folded into it: the basis says where the base
-  // figure came from, the raise says why the figure served is larger than that base. ⚠ No
-  // multiplier is printed: past the ceiling the figure is capped, and "×1099511627776" beside a
-  // one-hour budget would state a raise that was never applied.
-  const raised = budget.raisedBy
-    ? `; raised after ${budget.raisedBy} abandoned run${budget.raisedBy === 1 ? "" : "s"}, ` +
-      `×2 each, at most ${render(MAX_ATTEMPT_BUDGET_MS)}`
-    : "";
-  switch (budget.basis) {
-    case "history":
-      return `budget: ${seconds} (from ${budget.samples} recorded runs${raised})`;
-    case "clamped":
-      return budget.quantileMs === undefined
-        ? `budget: ${seconds} (flat floor — this lane's ${budget.samples} runs are faster${raised})`
-        : `budget: ${seconds} (flat floor — this lane's ${budget.samples} runs put it at ${render(budget.quantileMs)}${raised})`;
-    case "floor":
-      return `budget: ${seconds} (flat — too few recorded runs, ${budget.samples}${raised})`;
-    default: {
-      const _never: never = budget.basis;
-      return _never;
-    }
-  }
 }
 
 export interface DispatchLane {
@@ -253,55 +204,7 @@ export interface DispatchLane {
    */
   pinned?: { until: string; reason: string };
   /**
-   * How long a dispatch WALK gives this lane to answer before it stops it and starts the next —
-   * derived from THIS lane's own recorded wall-clock history when it has enough of one.
-   *
-   * ⚠ It is computed HERE, in the daemon, because this is where the history lives: the walk runs in
-   * the `llm-relay mcp` child, which holds no stats. Carrying the resolved number on the lane keeps
-   * one definition of the budget and lets an operator read it off the ladder, rather than the child
-   * re-deriving a figure from data it does not have.
-   *
-   * ⚠ `basis` names WHERE THE NUMBER CAME FROM, and there are THREE real cases, not two:
-   * `history` — the lane cleared `attemptMinSamples` and the number IS its own quantile;
-   * `floor` — it did not clear the floor, so the flat `attemptMs` applies, because unmeasured is
-   * "no opinion", never "slow";
-   * `clamped` — it DID clear the floor, its quantile was read, and that quantile came out BELOW
-   * `attemptMs`, so the operator's flat figure won the `Math.max`. There is history, and the
-   * number is not from it.
-   * Absent entirely when the walk is off or unconfigured.
-   *
-   * ⚠⚠ `clamped` exists because it was `history` until 2026-09-08, which reported the operator's
-   * own configured default as a measurement of this lane's runs — the provenance invariant's
-   * exact prohibition, reached by the closed-union collapse this repository records more than any
-   * other defect: three real cases mapped onto a two-member union, with the fall-through resolving
-   * to the STRONGER claim. Measured at the time on a fast answer-mode relay lane (5.7–10.8 s runs
-   * against a 90 s floor), `llm-relay dispatch` printed `budget: 90s (from 25 recorded runs)` when
-   * no run had ever taken anywhere near 90 s. It also hid the very signal the budget exists to
-   * expose: that this lane's real p80 is nine seconds. Found by an adversarial review, and pinned
-   * by `test/dispatch-attempt-budget.test.ts`.
-   */
-  attemptBudget?: {
-    ms: number;
-    basis: "history" | "floor" | "clamped";
-    samples: number;
-    /**
-     * The lane's OWN quantile, present only on `clamped` — where it is the figure the operator
-     * came to read and `ms` is not it. Never a guess: absent unless a quantile was computed.
-     */
-    quantileMs?: number;
-    /**
-     * How many times the budget was DOUBLED because the walk abandoned this lane since its last
-     * success (`LaneStats.abandonedSinceSuccess`). Present only when above zero.
-     *
-     * ⚠ It exists because an abandoned run leaves no duration sample, so a window fed only by runs
-     * that finished inside the budget can never show that the lane needed longer — the floor lock
-     * measured on 2026-09-10 (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §3b). Each abandonment
-     * doubles the next budget, capped at `MAX_ATTEMPT_BUDGET_MS`; one success resets the count.
-     */
-    raisedBy?: number;
-  };
-  /**
-   * This lane recently failed to answer inside the budget a dispatch walk gave it, so ready lanes
+   * This lane was recently abandoned by the dispatch walk after going idle, so ready lanes
    * carrying no demotion are tried ahead of it for a window (`lane-affinity.ts`).
    *
    * ⚠ **It is a FIELD, not a `LaneState` member, and that is load-bearing.** `buildDispatch`
@@ -319,7 +222,7 @@ export interface DispatchLane {
   demoted?: { until: string; reason: string };
   /**
    * The lane's usual time to ANSWER in the requested mode: median and 80th percentile of the
-   * durations in the window its budget was read from — since 2026-09-10 only a COMPLETED run adds
+   * most specific completed-run history window — since 2026-09-10 only a COMPLETED run adds
    * one, and `restoreLaneStatsRows` empties an older window that provably holds anything else.
    * Present only when that window holds a duration. A poll renders it (`describeJob` in `mcp/server.ts`), so a caller can tell a slow
    * lane from a stuck one — 23 of the 182 unanswered dispatches in the 2026-09-10 transcript sweep
@@ -1357,10 +1260,10 @@ export function buildDispatch(
  * The stats windows one lane's facts are read from, MOST SPECIFIC FIRST, existing windows only:
  * (tier, mode) → (tier, legacy) → (no tier, mode) → (no tier, legacy).
  *
- * ⚠ The budget is derived ONLY from runs on the ladder it will be used on, and since 2026-09-10 in
- * the mode it will be used in. A less specific window is a FALLBACK — the legacy rows predate
- * tiering or modes — and a lane's facts always come from ONE window, never a merge: a merged
- * quantile would attribute one tier's or one mode's runs to another, the defect this closes.
+ * The history is resolved most-specific first: this tier+mode, tier-only, mode-only, then the
+ * legacy window. A less specific window is a FALLBACK — older rows predate tiering or modes — and
+ * one lane fact always comes from ONE window, never a merge: a merged statistic would attribute
+ * one tier's or one mode's runs to another.
  */
 function laneWindows(cfg: Config, laneId: string, tier: string | null, mode: DispatchMode | null): LaneStats[] {
   const keys: Array<[string | null, DispatchMode | null]> = [];
@@ -1380,45 +1283,16 @@ function laneWindows(cfg: Config, laneId: string, tier: string | null, mode: Dis
 }
 
 /**
- * Everything the view says about one lane from its OWN recorded runs: the walk budget, the usual
- * time to answer, and the streak of own failures.
+ * Everything the view says about one lane from its OWN recorded runs: its usual time to answer and
+ * its streak of own failures.
  *
- * The BUDGET is how long a dispatch walk gives ONE lane to answer, derived from that lane's own
- * recorded runs on THIS tier's ladder, in THIS mode.
+ * A history window is selected most-specific first. `attemptMinSamples` remains live after the
+ * 2026-09-17 idle-only stopping change: it is the sample floor before a more-specific window is
+ * trusted over a legacy fallback, and it is also the sample floor for recent-vs-history outlier
+ * demotion in `routes/admin.ts`. It no longer has anything to do with a lane stop budget.
  *
- * ⚠ Tier-keyed since 2026-09-09 (backlog item 4) and mode-keyed since 2026-09-10: one tier's or one
- * mode's runs never set another's kill budget. `laneWindows` says how legacy rows are honoured.
- *
- * ⚠ This is the owner's request-path mechanism — a threshold read off what THIS endpoint has
- * actually done — applied to lanes (owner direction 2026-09-08). The METHOD carries over; none of
- * the request path's NUMBERS do, and must not: `latency-demotion.ts`'s 250 ms/token and 30 s
- * ceiling are calibrated for single completions, and a lane legitimately runs an agent loop for
- * minutes. Measured on this machine the same day, a flat 90 s budget sat BELOW the median run of
- * two of the three working lanes and below the free pool's median by a factor of six.
- *
- * ⚠ The quantile defaults to 0.8, not the 0.95 the request path uses, and the data says why: at
- * p90 and p95 the slowest lane's figure IS its own configured timeout, so a budget there could
- * never fire for the lane that most needs bounding. p80 is the highest point still carrying
- * information for every lane measured (165 s, 224 s, 1383 s against timeouts of 1800 s).
- *
- * ⚠ Too little history means the FLAT budget, never a quantile over two samples. Unmeasured is "no
- * opinion", never "slow" — the same asymmetry `latency-demotion.ts` states, and for the same
- * reason: a brand-new lane must not inherit a ceiling drawn from its single unluckiest run.
- *
- * ⚠ The TOKEN-normalised half of the request-path ladder is deliberately absent. A walk budget must
- * fire BEFORE any answer arrives, so there is no output token to normalise by — which is also why
- * `hedge-trigger.ts`'s own per-token rung is documented inert on the hedge path. Token
- * normalisation only has a home in a post-commit policy, which does not exist here.
- *
- * - Samples come from the most specific window holding `attemptMinSamples` completed runs; the
- *   usual time to answer, from that window or else the most specific one holding any.
- * - The failure streak and the abandonment count come from the most specific window that EXISTS,
- *   so a fresh mode window's evidence is never hidden behind a legacy window's samples.
- * - The floor is `agentAttemptMs` for an agent-mode dispatch and `attemptMs` otherwise
- *   (`DispatchWalkSettings.agentAttemptMs` for why there are two).
- * - Each abandonment since the last success DOUBLES the budget, up to `MAX_ATTEMPT_BUDGET_MS`. An
- *   abandoned run leaves no sample, so without the raise the window could never show that the lane
- *   needed longer (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §3b).
+ * Only completed runs enter `wallClockMs`, so the rendered median/p80 describe time to ANSWER,
+ * never time to failure or the relay's own abandonment decision.
  */
 function laneHistoryFacts(
   cfg: Config,
@@ -1426,13 +1300,11 @@ function laneHistoryFacts(
   tier: string | null,
   mode: DispatchMode | null,
 ): {
-  budget: DispatchLane["attemptBudget"];
   timeToAnswer: DispatchLane["timeToAnswer"];
   recentFailures: number;
 } {
   const windows = laneWindows(cfg, laneId, tier, mode);
-  const walk = cfg.routing.dispatchWalk;
-  const minSamples = walk?.attemptMinSamples ?? 5;
+  const minSamples = cfg.routing.dispatchWalk?.attemptMinSamples ?? 5;
   const sampled = windows.find((w) => w.wallClockMs.length >= minSamples);
   const hinted = sampled ?? windows.find((w) => w.wallClockMs.length > 0);
   const timeToAnswer: DispatchLane["timeToAnswer"] =
@@ -1444,41 +1316,10 @@ function laneHistoryFacts(
           samples: hinted.wallClockMs.length,
           mode: hinted.mode,
         };
-  const newest = windows[0];
-  const recentFailures = newest?.consecutiveFailures ?? 0;
-  if (!walk || !walk.enabled) return { budget: undefined, timeToAnswer, recentFailures };
-  const floorMs = mode === "agent" ? Math.max(walk.attemptMs, walk.agentAttemptMs) : walk.attemptMs;
-  const base = budgetFromSamples(sampled?.wallClockMs ?? newest?.wallClockMs ?? [], { ...walk, attemptMs: floorMs });
-  const raisedBy = newest?.abandonedSinceSuccess ?? 0;
-  if (base === undefined || raisedBy <= 0) return { budget: base, timeToAnswer, recentFailures };
-  // The exponent is capped before it is applied, so a long streak cannot overflow to Infinity.
-  const ms = Math.min(MAX_ATTEMPT_BUDGET_MS, base.ms * 2 ** Math.min(raisedBy, 16));
-  return { budget: { ...base, ms, raisedBy }, timeToAnswer, recentFailures };
-}
-
-function budgetFromSamples(
-  samples: readonly number[],
-  walk: { attemptMs: number; attemptMinSamples: number; attemptQuantile: number },
-): DispatchLane["attemptBudget"] {
-  if (samples.length < walk.attemptMinSamples) {
-    return { ms: walk.attemptMs, basis: "floor", samples: samples.length };
-  }
-  const quantile = quantileWallClockMs(samples, walk.attemptQuantile);
-  // A window that cleared the sample floor cannot yield null, but a null here must never become a
-  // zero budget — that would abandon every lane instantly. Fall to the flat figure, the weaker claim.
-  if (quantile === null) return { ms: walk.attemptMs, basis: "floor", samples: samples.length };
-  const own = Math.round(quantile);
-  // ⚠ Never BELOW the flat budget. The floor is what the operator declared a lane is always worth
-  // waiting for; a lane whose history happens to be fast must not be given less than that, or a
-  // single quick run would make the relay impatient with it forever.
-  // ⚠⚠ But the LABEL must follow the number, not the clamp. When the floor wins, the figure served
-  // is the operator's configured default and calling it `history` reports a configuration value as
-  // a measurement of this lane — which is what it did until 2026-09-08. The lane's own quantile
-  // travels beside it, because that is the figure the operator actually wants.
-  if (own < walk.attemptMs) {
-    return { ms: walk.attemptMs, basis: "clamped", samples: samples.length, quantileMs: own };
-  }
-  return { ms: own, basis: "history", samples: samples.length };
+  return {
+    timeToAnswer,
+    recentFailures: windows[0]?.consecutiveFailures ?? 0,
+  };
 }
 
 /** The fields every view carries whatever it selects: `buildDispatch` computes them once. */
@@ -1538,12 +1379,8 @@ function annotateLaneStats(cfg: Config, ladder: DispatchLane[]): void {
 
 /**
  * Fill each lane's history columns from ITS OWN recorded runs on this ladder, in this mode
- * (`laneHistoryFacts`): the walk budget, the usual time to answer, the streak of own failures, and —
+ * (`laneHistoryFacts`): the usual time to answer, the streak of own failures, and —
  * with the walk on — the `failing` mark at `FAILING_LANE_STREAK`.
- *
- * Every lane gets a budget, whether or not it has ever run: a lane with no history takes the flat
- * figure at `floor` basis, so a never-run lane still shows the operator what it will be given.
- * ⚠ The budget reads this ladder's own window — never the cross-tier aggregate in `stats`.
  *
  * ⚠ `failing` is gated on the walk for the reason `annotateAffinity` states: `dispatchWalk: false`
  * restores the pre-walk order exactly, and a mark that reorders lanes is walk behaviour. It goes on a
@@ -1553,7 +1390,6 @@ function annotateLaneHistory(cfg: Config, ladder: DispatchLane[], tier: string |
   const walkOn = cfg.routing.dispatchWalk?.enabled === true;
   for (const lane of ladder) {
     const facts = laneHistoryFacts(cfg, lane.id, tier, mode);
-    if (facts.budget !== undefined) lane.attemptBudget = facts.budget;
     if (facts.timeToAnswer !== undefined) lane.timeToAnswer = facts.timeToAnswer;
     if (facts.recentFailures > 0) lane.recentFailures = facts.recentFailures;
     if (walkOn && facts.recentFailures >= FAILING_LANE_STREAK && isSelectable(lane)) {

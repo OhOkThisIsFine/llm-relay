@@ -238,8 +238,8 @@ const TELEMETRY_FAILURE_KIND = {
   // ⚠ `aborted`, NOT `timeout`. The lane did not exceed its own ceiling — the relay's dispatch
   // walk stopped it because it had not answered inside the budget the walk gave it, and started
   // the next lane instead. `aborted` is the vocabulary's word for "the relay ended this attempt",
-  // and it is the honest one: reporting a 90-second walk budget as the lane's own 35-minute
-  // timeout would label a routing decision as a lane failure.
+  // and it is the honest one: reporting the walk's idle-stop as the lane's own hard timeout would
+  // label a routing decision as a lane failure.
   abandoned: "aborted",
 } as const satisfies Record<DispatchLaneStatus, FailureKind | null>;
 
