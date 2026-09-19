@@ -189,6 +189,52 @@ describe("dispatch lane walk", () => {
     expect(text).toContain("completed after");
   });
 
+  it("completion wins when the lane settles while an activity probe is in flight", async () => {
+    let finishLane: (r: LaneRunResult) => void = () => {};
+    let releaseProbe: () => void = () => {};
+    let probeStarted: () => void = () => {};
+    const probeHasStarted = new Promise<void>((resolve) => { probeStarted = resolve; });
+
+    const started: string[] = [];
+    const killed: string[] = [];
+    const spawn: LaneSpawner = (command) => {
+      started.push(command);
+      if (command === "l1") {
+        const result = new Promise<LaneRunResult>((resolve) => { finishLane = resolve; });
+        return {
+          result,
+          kill: () => killed.push(command),
+        };
+      }
+      return { result: Promise.resolve(ok("second lane should never run")), kill: () => {} };
+    };
+
+    const readLaneActivity = async (): Promise<null> => {
+      probeStarted();
+      await new Promise<void>((resolve) => { releaseProbe = resolve; });
+      return null;
+    };
+
+    const h = new Harness({
+      config: config({ ...WALK, idleMs: 20 }),
+      buildView: async () => view(["l1", "l2"]),
+      spawn,
+      readLaneActivity,
+    });
+
+    const answer = h.tool("dispatch", { task: "do it" });
+    await probeHasStarted;
+    finishLane(ok("finished during the probe"));
+    releaseProbe();
+
+    const { text, isError } = await answer;
+    expect(isError).toBe(false);
+    expect(text).toContain("finished during the probe");
+    expect(started).toEqual(["l1"]);
+    expect(killed).toEqual([]);
+    expect(text).not.toContain("abandoned");
+  });
+
   it("⚠ the LAST lane gets NO budget — it is awaited, not abandoned", async () => {
     // Only l3 answers, and it answers LATE. With a budget applied to the last lane the walk would
     // kill it and return nothing; with no budget it waits, which is the whole point — there is
