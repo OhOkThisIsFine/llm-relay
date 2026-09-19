@@ -60,6 +60,27 @@ describe("lane activity records", () => {
     expect(readLaneActivity(tag(1))).toBeNull();
     expect(readLaneActivity("tag-overflow")).not.toBeNull();
   });
+
+  it("keeps an in-flight tag through overflow when an inactive record can be evicted", () => {
+    let now = 1;
+    const active = beginLaneRequest("tag-active", () => now);
+    const tag = (i: number): string => `tag-${String(i).padStart(8, "0")}`;
+    for (let i = 0; i < MAX_LANE_ACTIVITY_TAGS - 1; i++) {
+      beginLaneRequest(tag(i), () => i + 2).ended();
+    }
+
+    beginLaneRequest("tag-overflow", () => 10_000_000).ended();
+
+    expect(readLaneActivity("tag-active")?.inFlight).toBe(1);
+    expect(readLaneActivity(tag(0))).toBeNull();
+
+    now = 10_000_001;
+    active.wrote();
+    expect(readLaneActivity("tag-active")).toMatchObject({ inFlight: 1, lastActivityAt: now });
+    now = 10_000_002;
+    active.ended();
+    expect(readLaneActivity("tag-active")).toMatchObject({ inFlight: 0, lastActivityAt: now });
+  });
 });
 
 describe("the daemon records a tagged request and answers GET /dispatch/activity", () => {
