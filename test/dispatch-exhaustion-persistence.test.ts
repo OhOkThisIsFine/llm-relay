@@ -10,7 +10,7 @@
  * ⚠ Every test here uses an explicit temp path — same rule as the breaker suite.
  */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -68,17 +68,38 @@ describe("dispatch exhaustion persistence", () => {
     expect(getDispatchExhaustionPath()).toContain("llm-relay-vitest");
   });
 
-  it("round-trips still-future rows and drops lapsed ones at load", () => {
+  it("loads still-future rows and drops lapsed ones from an existing file", () => {
     const now = 1_000_000_000_000;
-    saveExhaustedRows(
-      [
-        { key: "quota:codex-sol", until: now + HOUR },
-        { key: "rung:lapsed", until: now - 1 },
-      ],
-      { path: statePath },
+    writeFileSync(
+      statePath,
+      JSON.stringify({
+        version: CURRENT_DISPATCH_EXHAUSTION_VERSION,
+        rows: [
+          { key: "quota:codex-sol", until: now + HOUR },
+          { key: "rung:lapsed", until: now - 1 },
+        ],
+      }),
     );
     const rows = loadExhaustedRows({ path: statePath, now });
     expect(rows).toEqual([{ key: "quota:codex-sol", until: now + HOUR }]);
+  });
+
+  it("never writes a lapsed row to the persistence file", () => {
+    const now = 1_000_000_000_000;
+    saveExhaustedRows(
+      [
+        { key: "quota:live", until: now + HOUR },
+        { key: "quota:lapsed", until: now - 1 },
+      ],
+      { path: statePath, now },
+    );
+
+    const persisted = JSON.parse(readFileSync(statePath, "utf8")) as {
+      version: number;
+      rows: Array<{ key: string; until: number }>;
+    };
+    expect(persisted.version).toBe(CURRENT_DISPATCH_EXHAUSTION_VERSION);
+    expect(persisted.rows).toEqual([{ key: "quota:live", until: now + HOUR }]);
   });
 
   it("⚠ restores NOTHING from a corrupt file, wrong version, or wrong envelope", () => {

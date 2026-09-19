@@ -71,9 +71,17 @@ export function loadExhaustedRows(opts: { path?: string; now?: number } = {}): E
   return rows.filter((row): row is ExhaustedRow => isExhaustedRow(row) && row.until > now);
 }
 
-export function saveExhaustedRows(rows: readonly ExhaustedRow[], opts: { path?: string } = {}): void {
+export function saveExhaustedRows(
+  rows: readonly ExhaustedRow[],
+  opts: { path?: string; now?: number } = {},
+): void {
   const target = opts.path ?? getDispatchExhaustionPath();
-  const file: DispatchExhaustionFile = { version: CURRENT_DISPATCH_EXHAUSTION_VERSION, rows: [...rows] };
+  const now = opts.now ?? Date.now();
+  // Filter again at the persistence boundary. Most callers pass exportExhaustedRows(), which is
+  // already future-only, but this function is exported and a stale row written here would linger
+  // on disk even though every loader ignores it — exactly the misleading file W0-3 found.
+  const futureRows = rows.filter((row) => Number.isFinite(row.until) && row.until > now);
+  const file: DispatchExhaustionFile = { version: CURRENT_DISPATCH_EXHAUSTION_VERSION, rows: futureRows };
   atomicWriteJsonSync(target, file, { space: 2 });
 }
 
@@ -90,7 +98,10 @@ export function installDispatchExhaustionPersistence(
   const restored = restoreExhaustedRows(cfg, loadExhaustedRows({ path, now: clock() }), clock());
   const timer = installed.register(new WriteBehindTimer());
   onExhaustionChanged(cfg, () => {
-    timer.touch(() => saveExhaustedRows(exportExhaustedRows(cfg, clock()), { path }));
+    timer.touch(() => {
+      const now = clock();
+      saveExhaustedRows(exportExhaustedRows(cfg, now), { path, now });
+    });
   });
   return restored;
 }
