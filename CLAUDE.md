@@ -97,8 +97,8 @@ amount, and a few hundred bytes of build noise is not that. ⚠ Do not chase the
 `observed` block is a record, never an equality check, so a small drift between your machine and
 CI's is expected and means nothing.
 
-⚠⚠ **And the ceiling is now a ROUND NUMBER well clear of the observation (1100000 / 5500000 since
-2026-09-08; 1000000 / 5000000 before, which +32 KB of persisted-cell validators and their `.d.ts`
+⚠⚠ **And the ceiling is now a ROUND NUMBER well clear of the observation (1300000 / 6500000 since
+2026-09-19; 1100000 / 5500000 from 2026-09-08, which +32 KB of persisted-cell validators and their `.d.ts`
 doc comments crossed), not a tight fit — because the tight fit failed a SECOND time, in the very
 lap that wrote the paragraph above.** The second failure had a different cause worth naming: the baseline was measured, and then
 more documentation prose was added, and every added comment lands in a `.d.ts` by the two-pass
