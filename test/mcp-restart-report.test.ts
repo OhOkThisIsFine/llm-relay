@@ -16,10 +16,35 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { LaneJobStore } from "../src/mcp/lane-runner.js";
 import { createJobJournal, nullJobJournal } from "../src/mcp/job-journal.js";
+import { McpDispatchServer } from "../src/mcp/server.js";
+import type { Config } from "../src/config.js";
+import type { TreeSnapshot, TreeSnapshotReader } from "../src/mcp/tree-delta.js";
 
 function tempJournalPath(): { path: string; cleanup: () => void } {
   const dir = mkdtempSync(join(tmpdir(), "llm-relay-mcp-journal-"));
   return { path: join(dir, "mcp-jobs.json"), cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+const snap = (entries: Record<string, string>, prefix = ""): TreeSnapshot => ({
+  prefix,
+  entries: new Map(Object.entries(entries)),
+});
+
+async function killedResult(path: string, jobId: string, treeSnapshot?: TreeSnapshotReader): Promise<string> {
+  const out: Array<{ id?: number; result?: { content: Array<{ text: string }> } }> = [];
+  const server = new McpDispatchServer({
+    config: { host: "127.0.0.1", port: 8791, routing: { default: "x" } } as unknown as Config,
+    buildView: async () => {
+      throw new Error("unused in dispatch_result test");
+    },
+    journal: createJobJournal(path),
+    treeSnapshot,
+    write: (chunk) => out.push(JSON.parse(chunk) as (typeof out)[number]),
+  });
+  await server.ingest(
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "dispatch_result", arguments: { jobId } } }) + "\n",
+  );
+  return out.find((message) => message.id === 1)?.result?.content[0]?.text ?? "";
 }
 
 describe("MCP server restart", () => {
@@ -45,6 +70,58 @@ describe("MCP server restart", () => {
       expect(killed?.error).toMatch(/restart/i);
       // The job that finished is NOT reported as killed.
       expect(second.get(finished.id)).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("renders a recovered tree delta for a job killed by the restart", async () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const first = new LaneJobStore(createJobJournal(path));
+      const job = first.create("lane-a", "pool/high", "C:/tree");
+      first.noteStartingTree(job.id, snap({ "pre.ts": " M" }), ["src"]);
+
+      const text = await killedResult(
+        path,
+        job.id,
+        async () => snap({ "pre.ts": " M", "src/new.ts": "??", "README.md": " M" }),
+      );
+
+      expect(text).toContain("killed");
+      expect(text).toContain("+ src/new.ts [??]");
+      expect(text).toContain("+ README.md [ M]  OUT OF SCOPE");
+      expect(text).toMatch(/measured at restart adoption time, not at the time the job was killed/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("adds no tree delta to an adopted killed job when no starting snapshot was journaled", async () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const first = new LaneJobStore(createJobJournal(path));
+      const job = first.create("lane-a", "pool/high", "C:/tree");
+      const text = await killedResult(path, job.id, async () => snap({ "new.ts": "??" }));
+      expect(text).toContain("killed");
+      expect(text).not.toContain("tree delta");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("stores no truncated starting snapshot when the starting tree exceeds the bound", () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const first = new LaneJobStore(createJobJournal(path));
+      const job = first.create("lane-a", "pool/high", "C:/tree");
+      const entries: Record<string, string> = {};
+      for (let i = 0; i < 501; i++) entries[`path-${i}.ts`] = " M";
+      first.noteStartingTree(job.id, snap(entries), undefined);
+
+      const row = createJobJournal(path).orphans().find((candidate) => candidate.jobId === job.id);
+      expect(row).toBeDefined();
+      expect(row?.startingTree).toBeUndefined();
     } finally {
       cleanup();
     }
@@ -128,6 +205,25 @@ describe("MCP server restart", () => {
       // throw" passes on that bug, so assert the count.
       writeFileSync(path, JSON.stringify({ version: 1, jobs: [{ jobId: "x" }] }));
       expect(createJobJournal(path).orphans()).toEqual([]);
+
+      // A malformed OPTIONAL starting tree drops only that field; the valid death row survives.
+      writeFileSync(
+        path,
+        JSON.stringify({
+          version: 1,
+          jobs: [{
+            jobId: "job-valid",
+            laneId: "lane-a",
+            cwd: "C:/tree",
+            startedAt: 1,
+            startingTree: { prefix: 42, entries: [["a.ts", " M"]] },
+          }],
+        }),
+      );
+      const malformedTree = createJobJournal(path).orphans();
+      expect(malformedTree).toHaveLength(1);
+      expect(malformedTree[0]?.jobId).toBe("job-valid");
+      expect(malformedTree[0]?.startingTree).toBeUndefined();
 
       // And a version this build does not know.
       writeFileSync(path, JSON.stringify({ version: 99, jobs: [{ jobId: "x", laneId: "y", cwd: "z", startedAt: 1 }] }));
