@@ -49,10 +49,22 @@ function touch(tag: string, at: number, change: { inFlight?: number; request?: b
   let record = records.get(tag);
   if (record === undefined) {
     if (records.size >= MAX_LANE_ACTIVITY_TAGS) {
-      // Maps keep insertion order, and a touched record is re-inserted below, so the first key is
-      // the least recently active tag.
-      const oldest = records.keys().next().value;
-      if (oldest !== undefined) records.delete(oldest);
+      // Prefer forgetting a finished tag. Evicting an in-flight record corrupts its count if that
+      // request later writes: the write recreates the tag at inFlight=0 even though it is still
+      // being served. Maps keep insertion order, so the first inactive row found is also the least
+      // recently active inactive row. If every retained tag is genuinely in flight, preserve the
+      // hard cap by falling back to the oldest row rather than growing without bound.
+      let oldest: string | undefined;
+      let evicted = false;
+      for (const [candidate, candidateRecord] of records) {
+        oldest ??= candidate;
+        if (candidateRecord.inFlight === 0) {
+          records.delete(candidate);
+          evicted = true;
+          break;
+        }
+      }
+      if (!evicted && oldest !== undefined) records.delete(oldest);
     }
     record = { inFlight: 0, requests: 0, lastActivityAt: at };
   } else {
