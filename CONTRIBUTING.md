@@ -39,8 +39,9 @@ One command proves a change. Run it before you open a pull request.
 npm run gate
 ```
 
-`npm run gate` is exactly `npm run build && npm run check`. Continuous integration runs the same
-two commands on Linux and nothing else. `npm run check` runs five steps:
+`npm run gate` is exactly `npm run build && npm run check`. Continuous integration runs that full
+gate on Linux. A targeted Windows job separately type-checks the test suite and runs the lane
+process/env/lifecycle tests, including a real local `.cmd` shim smoke test. `npm run check` runs five steps:
 
 | Step | What it proves |
 |---|---|

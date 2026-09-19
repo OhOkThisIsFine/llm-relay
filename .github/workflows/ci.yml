@@ -5,8 +5,10 @@ name: CI
 # i.e. first at the moment a version was already being shipped. This is the gate that runs before
 # that point.
 #
-# Ubuntu only, on purpose: development happens on Windows, so Linux is the platform whose result
-# nobody sees locally. Adding a Windows leg would re-verify what the developer already ran.
+# The full gate runs on Ubuntu. A smaller Windows leg exercises the process-launch boundary that
+# Linux cannot: real .cmd shim resolution plus the lane spawn/env/process-lifecycle tests. Keeping
+# that leg targeted avoids paying for a second dashboard/package build while still testing the
+# platform-specific code third-party contributors cannot be assumed to have run locally.
 
 on:
   push:
@@ -51,3 +53,32 @@ jobs:
         # in the hook would otherwise reach users as a failed `npm i -g`. Exit 0 here also pins the
         # contract that replaced package.json's blanket `|| exit 0`.
         run: node scripts/install-skill.mjs
+
+  windows-process-boundary:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci --ignore-scripts
+
+      # Vitest transpiles rather than type-checks; keep the suite's TypeScript contract live on
+      # Windows before exercising the process boundary.
+      - run: npm run typecheck:test
+
+      - name: Windows process boundary
+        run: >-
+          npx vitest run
+          test/lane-windows-shim.test.ts
+          test/lane-runner.test.ts
+          test/mcp-lane-launch.test.ts
+          test/lane-process-lifecycle.test.ts
+          test/process-cpu.test.ts
+
