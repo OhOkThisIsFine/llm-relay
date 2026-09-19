@@ -222,7 +222,7 @@ describe("dispatch lane walk", () => {
       buildView: async () => view(["l1", "l2"]),
       spawn,
       readLaneActivity,
-      reportTelemetry: (report) => reports.push(report),
+      reportTelemetry: (report) => { reports.push(report); },
     });
 
     const answer = h.tool("dispatch", { task: "do it" });
