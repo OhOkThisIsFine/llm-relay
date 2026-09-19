@@ -23,6 +23,8 @@ const IDLE_MS = 30_000;
 interface LaneScript {
   /** When the lane answers, from its start. */
   answersAfterMs: number;
+  /** Exit code at settlement; absent means a successful answer. */
+  exitCode?: number | null;
   /** Emit output every this many ms while it runs; absent = silent. */
   outputEveryMs?: number;
 }
@@ -61,7 +63,15 @@ function harness(opts: {
         for (const t of timers) clearTimeout(t);
         resolve(r);
       };
-      timers.push(setTimeout(() => settle({ code: 0, stdout: `${command} answered`, stderr: "", timedOut: false }), script.answersAfterMs));
+      timers.push(setTimeout(() => {
+        const code = script.exitCode === undefined ? 0 : script.exitCode;
+        settle({
+          code,
+          stdout: code === 0 ? `${command} answered` : "",
+          stderr: code === 0 ? "" : `${command} failed`,
+          timedOut: false,
+        });
+      }, script.answersAfterMs));
       if (script.outputEveryMs !== undefined) {
         const every = script.outputEveryMs;
         const tick = (): void => {
@@ -558,6 +568,26 @@ describe("the walk stops a lane only when it is idle", () => {
     expect(text).toContain("next answered");
     // Active at the 30 s poll (the change), so stopped at 60 s rather than 30 s.
     expect(text).toContain("1. slow: abandoned after 60s");
+  });
+
+  it("does not credit a later lane with a previous lane's unpolled tree change", async () => {
+    const start: TreeSnapshot = { prefix: "", entries: new Map() };
+    const changed: TreeSnapshot = { prefix: "", entries: new Map([["first-lane-only.ts", "??"]]) };
+    const h = harness({
+      lanes: [cliLane("first"), cliLane("second"), cliLane("next")],
+      // first fails before the 15 s poll, after changing the tree. The reset before second must
+      // absorb that edit into second's baseline rather than report it as second's activity.
+      readings: [start, changed, changed, changed, changed, changed],
+      scripts: {
+        first: { answersAfterMs: 100, exitCode: 1 },
+        second: { answersAfterMs: 20 * IDLE_MS },
+        next: { answersAfterMs: 100 },
+      },
+    });
+    const text = await finish(h, {});
+    expect(h.started).toEqual(["first", "second", "next"]);
+    expect(text).toContain("next answered");
+    expect(text).toContain("2. second: abandoned after 30s");
   });
 
   it("never stops the last lane, however long it is idle", async () => {

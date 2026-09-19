@@ -1040,7 +1040,7 @@ export class McpDispatchServer {
   /** The `git status` each running agent-mode job started from, with the caller's scope. */
   private readonly trees = new Map<
     string,
-    { cwd: string; before: TreeSnapshot; scope: readonly string[] | undefined; lastSeen?: TreeSnapshot }
+    { cwd: string; before: TreeSnapshot; scope: readonly string[] | undefined; activityLastSeen?: TreeSnapshot }
   >();
   /** The activity tag (`lane-activity.ts`) of the lane each running job has started last. */
   private readonly activityTags = new Map<string, string>();
@@ -1535,6 +1535,7 @@ export class McpDispatchServer {
     opts: WalkOptions,
   ): Promise<"done"> {
     await this.startTreeDelta(jobId, opts);
+    let ranAttempt = false;
     for (let i = 0; i < laneIds.length; i++) {
       // A cancellation is checked at the TOP of every iteration, so an operator who stops a walk
       // stops it — rather than watching it advance to the next lane.
@@ -1551,6 +1552,15 @@ export class McpDispatchServer {
       // skips it before anything spawns. `bound` is undefined when the lane runs as configured.
       const readOnly = this.bindReadOnlyOrSkip(jobId, lane, opts);
       if (readOnly.skipped) continue;
+
+      // Tree liveness is ATTEMPT-scoped, unlike the final tree delta. A previous lane can edit and
+      // fail before the first 15 s poll; without a fresh baseline, the next lane's first poll would
+      // credit that previous lane's edit as its own activity and extend an actually idle attempt.
+      if (ranAttempt) {
+        await this.resetLaneTreeActivity(jobId);
+        if (this.jobs.get(jobId)?.status !== "running") return "done";
+      }
+      ranAttempt = true;
 
       // The lane's usual time to answer rides the job, so a poll can tell a slow lane from a stuck one.
       this.jobs.setCurrentLane(jobId, lane.id, lane.spec, lane.timeToAnswer);
@@ -1660,7 +1670,23 @@ export class McpDispatchServer {
   private async startTreeDelta(jobId: string, opts: WalkOptions): Promise<void> {
     if (opts.mode !== "agent") return;
     const before = await this.readTree(opts.cwd);
-    if (before !== null) this.trees.set(jobId, { cwd: opts.cwd, before, scope: opts.scope });
+    if (before !== null) {
+      this.trees.set(jobId, { cwd: opts.cwd, before, scope: opts.scope, activityLastSeen: before });
+    }
+  }
+
+  /**
+   * Reset only the liveness baseline when the walk advances to another lane. The job-wide
+   * `before` snapshot stays untouched so the final tree delta still reports every lane's edits.
+   * A failed read removes the attempt baseline: the next successful poll establishes a baseline
+   * and proves no activity by itself.
+   */
+  private async resetLaneTreeActivity(jobId: string): Promise<void> {
+    const tree = this.trees.get(jobId);
+    if (tree === undefined) return;
+    const reading = await this.readTree(tree.cwd);
+    if (reading === null) delete tree.activityLastSeen;
+    else tree.activityLastSeen = reading;
   }
 
   /**
@@ -1783,13 +1809,17 @@ export class McpDispatchServer {
     const tree = this.trees.get(jobId);
     const reading = tree === undefined ? null : await this.readTree(tree.cwd);
     if (tree !== undefined && reading !== null) {
-      const previous = tree.lastSeen ?? tree.before;
-      tree.lastSeen = reading;
-      seen.push(
-        sameTree(previous, reading)
-          ? { at: newestChangeMs(tree.cwd, reading), source: "a file change" }
-          : { at: now, source: "a working tree change" },
-      );
+      const previous = tree.activityLastSeen;
+      tree.activityLastSeen = reading;
+      // A missing attempt baseline means the preceding baseline read failed. Establish one now,
+      // but do not call the entire accumulated tree difference activity for this lane.
+      if (previous !== undefined) {
+        seen.push(
+          sameTree(previous, reading)
+            ? { at: newestChangeMs(tree.cwd, reading), source: "a file change" }
+            : { at: now, source: "a working tree change" },
+        );
+      }
     }
     return newestActivity(seen);
   }
