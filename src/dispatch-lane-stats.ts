@@ -270,11 +270,10 @@ export function p95WallClockMs(samples: readonly number[]): number | null {
  * — unknown stays null, never 0.
  *
  * ⚠ Nearest-rank, so the answer is always an OBSERVED sample rather than an interpolation between
- * two: a duration nothing ever took, used as a budget, would be a fabricated measurement.
+ * two: a duration nothing ever took would be a fabricated measurement.
  *
- * ⚠ The quantile is bounded to (0, 1] here, and the OPERATOR's guard is elsewhere: `parseRouting`
- * rejects an `attemptQuantile` outside (0, 1) as a hard load error, so a config typo never reaches
- * this function at all. What is left here is a defence for a direct caller.
+ * The quantile is bounded defensively here for direct callers; configuration consumers such as
+ * outlier demotion validate their own declared quantiles before calling it.
  *
  * ⚠⚠ **Do not read the `Math.max(Number.EPSILON, …)` as protection against a quantile of 0 — it
  * changes no answer, and the comment here claimed the opposite until 2026-09-08.** With `q` at
@@ -313,9 +312,8 @@ function freshLaneStats(laneId: string, tier: string | null, mode: DispatchMode 
  * In-memory key for one (lane, tier) window. The same spelling as `memoryKey` in
  * `lane-affinity.ts` minus the memory kind (this store holds one window per key, not one row
  * per kind): the tier is part of it because each tier is its OWN ladder with its own rungs, so
- * a lane that answered a `low` task says nothing about the `xhigh` ladder — and since
- * 2026-09-08 this window sets each lane's walk budget, so sharing it across tiers would let one
- * tier's history must not be reported or judged as another tier's history.
+ * a lane that answered a `low` task says nothing about the `xhigh` ladder. One tier's history
+ * must not be reported or judged as another tier's history.
  *
  * Since 2026-09-10 the dispatch MODE is part of the key too, for the same reason one level down:
  * an answer-mode call and an agent-mode run are two populations (`DispatchMode`). A legacy window

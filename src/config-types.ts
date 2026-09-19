@@ -902,8 +902,8 @@ export interface DispatchWalkSettings {
    */
   attemptMinSamples: number;
   /**
-   * How many lanes one dispatch may try. Bounded so a ladder of a dozen dead rungs cannot spend
-   * a dozen budgets before reporting; the walk states how many it tried and how many it skipped,
+   * How many lanes one dispatch may try. Bounded so a ladder of a dozen dead rungs cannot consume
+   * a dozen attempts before reporting; the walk states how many it tried and how many it skipped,
    * because a silent cap reads as "everything was tried" when it was not.
    */
   maxLanes: number;

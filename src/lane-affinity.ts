@@ -1,6 +1,6 @@
 /**
  * Per-lane ROUTING MEMORY for the dispatch ladder: which lane last answered (a PIN, promote it),
- * and which lane just failed to answer inside its budget (a DEMOTION, order it behind the rest).
+ * and which lane just produced fresh negative evidence (a DEMOTION, order it behind the rest).
  *
  * This is the third per-Config lane store, beside `dispatch.ts`'s host-reported cooldowns and
  * `dispatch-lane-stats.ts`'s advisory counters, and it follows the latter's shape exactly: a
@@ -22,8 +22,8 @@
  * ⚠ **A DEMOTION IS EVIDENCE, NOT A STATISTIC.** `docs/backlog.md` asks for a slow-lane threshold
  * calibrated from the recorded wall-clock window, and warns — correctly, and in bold — never to
  * borrow the HTTP path's numbers, because a lane legitimately runs an agent loop for minutes. This
- * module needs no threshold at all: "this lane did not answer inside the budget the walk gave it,
- * one moment ago" is a first-party measurement of this lane, taken by this relay. No population,
+ * module needs no threshold at all: an idle-stop or failed attempt is first-party evidence about
+ * this lane, taken by this relay moments ago. No population,
  * no calibration, nothing borrowed. The calibrated statistic remains open work; it is not what
  * makes the walk correct.
  *
@@ -48,7 +48,7 @@ import type { Config } from "./config-types.js";
 
 /**
  * Longest window either memory is held for, whatever a caller asks. The ceiling is not cosmetic:
- * a pin is a preference recorded from ONE success, and a demotion from ONE missed budget. Neither
+ * a pin is a preference recorded from ONE success, and a demotion from ONE fresh failure signal. Neither
  * observation supports parking the ladder in a shape for a day. `dispatch.ts`'s `MAX_EXHAUSTED_MS`
  * is 30 days because a vendor STATES a quota window; nothing states one here.
  */
@@ -57,7 +57,7 @@ export const MAX_AFFINITY_MS = 6 * 60 * 60 * 1000;
 /** Pin window when config names none: long enough to cover a burst of related tasks. */
 export const DEFAULT_PIN_MS = 15 * 60 * 1000;
 
-/** Demotion window when config names none. Same default as the pin — one missed budget, one turn. */
+/** Demotion window when config names none. Same default as the pin — one failure signal, one turn. */
 export const DEFAULT_DEMOTE_MS = 15 * 60 * 1000;
 
 /** Longest reason string retained. Bounded because it is rendered on the ladder view. */
@@ -362,7 +362,7 @@ export function recordLaneOutlier(
 
 /**
  * Retract every memory for one lane on one tier. Called when a lane SUCCEEDS: the success
- * disproves the demotion that a previous missed budget recorded, exactly as a served 200 clears
+ * disproves the demotion that previous negative evidence recorded, exactly as a served 200 clears
  * a cooling condition in `target-facts.ts`. It does not touch other lanes or other tiers, because
  * one lane's success says nothing about theirs.
  */

@@ -516,7 +516,7 @@ export const DEFAULT_DISPATCH_WALK: DispatchWalkSettings = {
   enabled: true,
   idleMs: 300_000,
   attemptMs: 90_000,
-  // Agent mode's own floor (`DispatchWalkSettings.agentAttemptMs`): a tool loop runs for minutes.
+  // Historical default retained so old configs deserialize to the same compatibility value.
   agentAttemptMs: 600_000,
   attemptQuantile: 0.8,
   attemptMinSamples: 5,

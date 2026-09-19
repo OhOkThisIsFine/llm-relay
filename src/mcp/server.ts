@@ -886,7 +886,7 @@ function attemptReason(status: DispatchLaneStatus, outcome: LaneAttemptOutcome, 
   if (status === "completed") return undefined;
   if (status === "abandoned") {
     const quiet = idleMs === null ? "a long time" : `${Math.round(idleMs / 1000)}s`;
-    return `no activity for ${quiet} (no relay traffic, output or file change), so the next lane was started`;
+    return `no activity for ${quiet} (no relay traffic, output, process CPU or file change), so the next lane was started`;
   }
   if (outcome.semanticFailure !== undefined) return outcome.semanticFailure;
   if (status === "timed_out") return "the lane exceeded its own configured timeout";

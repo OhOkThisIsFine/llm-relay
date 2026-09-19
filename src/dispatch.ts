@@ -336,8 +336,8 @@ export interface DispatchOptions {
    */
   requester?: "mcp";
   /**
-   * The mode the caller will run lanes in, so each lane's budget comes from runs of the SAME mode
-   * (`attemptBudget`). Absent ⇒ the mode-less legacy window, as before this existed.
+   * The mode the caller will run lanes in, so its time-to-answer history comes from runs of the
+   * SAME mode. Absent ⇒ the mode-less legacy window, as before this existed.
    */
   mode?: DispatchMode;
   /**
