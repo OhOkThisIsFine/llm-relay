@@ -879,7 +879,7 @@ export interface DispatchWalkSettings {
   /**
    * How long a lane may show NO activity before the walk stops it and starts the next one. Default
    * 300000 (5 minutes). Activity is a request the relay daemon serves with the lane's tag, the lane's
-   * own output, or a change in its git working tree (`mcp/server.ts` `latestActivity`).
+   * own output, owned process-tree CPU, or a change in its git working tree (`mcp/server.ts` `latestActivity`).
    *
    * ⚠ Owner decision 2026-09-17: a lane is stopped only when it is IDLE, never because it ran longer
    * than its past runs. The five minutes covers a lane that runs a long command (a test suite) and
@@ -887,59 +887,18 @@ export interface DispatchWalkSettings {
    */
   idleMs: number;
   /**
-   * How long ONE lane gets to answer before the walk kills it and starts the next.
-   *
-   * ⚠ This is a BUDGET the operator sets, not a health threshold derived from measurement — which
-   * is why it may carry a default at all. `docs/backlog.md` warns, correctly, never to point the
-   * HTTP path's calibrated latency numbers at a lane: a lane legitimately runs an agent loop for
-   * minutes, so 250 ms/token and a 30 s ceiling would demote every healthy lane at once. Nothing
-   * here is borrowed from there.
-   *
-   * ⚠ It is NOT the lane's own timeout. A rung's `--timeout` (2100 s on this machine's slowest
-   * rung) still bounds a lane the walk is content to wait for; this bounds how long the WALK
-   * waits before trying someone else.
-   *
-   * Since 2026-09-10 this is the floor for an ANSWER-mode call only; `agentAttemptMs` is the floor
-   * for an agent-mode lane.
+   * Legacy pre-v0.84 attempt-budget floor. Retained and validated so existing configs keep loading,
+   * but it no longer affects lane stopping; an explicit setting produces a load warning.
    */
   attemptMs: number;
-  /**
-   * The FLOOR of an agent-mode lane's walk budget, where `attemptMs` is the floor for an
-   * answer-mode call. Default 600000 (10 minutes).
-   *
-   * ⚠ Two floors because the two modes are two different populations
-   * (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §3): an answer-mode call is one HTTP round trip
-   * that answers in seconds, while an agent-mode lane runs a whole tool loop for minutes. One floor
-   * fitted to both stopped every real agent task on `free-pool` at 90 s, because a burst of short
-   * answer-mode calls had set the lane's p80 to 39.5 s. Like `attemptMs` it is an operator budget,
-   * not a measurement; a lane's own history can only raise it.
-   */
+  /** Legacy agent-mode budget floor; retained for compatibility, no longer used to stop a lane. */
   agentAttemptMs: number;
-  /**
-   * Which point of a lane's OWN recorded wall-clock history the budget sits at, when that lane has
-   * enough history to have one (`attemptMinSamples`). Default 0.8.
-   *
-   * ⚠ This is the owner's own mechanism from the request path — a threshold derived from what THIS
-   * endpoint has actually done — applied to lanes. The METHOD transfers; none of the request path's
-   * NUMBERS do, and must not: a lane legitimately runs an agent loop for minutes.
-   *
-   * ⚠ 0.8 rather than the request path's 0.95, by owner direction 2026-09-08, and the live data
-   * says why: at the 90th and 95th percentiles the slowest lane's figure IS its own timeout, so a
-   * budget there could never fire for the one lane it most needs to bound. p80 is the highest point
-   * that still carries information for every lane measured.
-   *
-   * ⚠ The token-normalised half of the request-path ladder is deliberately NOT carried over. A walk
-   * budget must fire BEFORE any answer arrives, so no output token exists to normalise by — the
-   * same reason `hedge-trigger.ts`'s own per-token rung is inert on the hedge path.
-   */
+  /** Legacy attempt-budget quantile; retained for compatibility, no longer used to stop a lane. */
   attemptQuantile: number;
   /**
-   * How many recorded runs a lane needs before its own history is used at all. Below this the
-   * budget is the flat `attemptMs`. Default 5.
-   *
-   * ⚠ Unmeasured must mean "no opinion", never "slow": a quantile over one or two samples is not a
-   * distribution, and treating it as one would hand a brand-new lane a budget drawn from its single
-   * unluckiest run.
+   * Sample floor before a more-specific lane-history window is trusted over a legacy fallback,
+   * and the minimum samples each side of recent-vs-history outlier demotion needs. Default 5.
+   * Too little history means no opinion, never "slow".
    */
   attemptMinSamples: number;
   /**
@@ -972,8 +931,8 @@ export interface DispatchWalkOutlierSettings {
    */
   recentCount: number;
   /**
-   * Which point of the EARLIER window the recent median is judged against — the budget's own
-   * quantile by default (0.8), for the reason its field doc states. Strictly inside (0, 1).
+   * Which point of the EARLIER window the recent median is judged against. Default 0.8;
+   * strictly inside (0, 1).
    */
   historyQuantile: number;
   /**

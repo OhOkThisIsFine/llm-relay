@@ -196,18 +196,12 @@ export interface LaneStats {
    * so does the failing-lane demotion in `dispatch.ts`.
    */
   consecutiveFailures: number;
-  /**
-   * Walk abandonments since the last `completed` run. Each one DOUBLES the lane's next budget
-   * (`attemptBudget` in `dispatch.ts`): an abandoned run leaves no duration sample, so without this
-   * the window could never show that the lane needed longer.
-   */
-  abandonedSinceSuccess: number;
   /** When this window last recorded a `completed` run, or null. */
   lastSuccessAt: number | null;
   /**
    * Bounded wall-clock sample window, oldest dropped. Since 2026-09-10 ONLY a `completed` run adds a
-   * sample: a failure's or a timeout's wall clock is time to FAILURE, not time to answer, and it gave
-   * the lane that answers least (six 900 s timeouts) the longest budget.
+   * sample: a failure's or timeout's wall clock is time to FAILURE, not time to answer, so it must
+   * never enter a statistic labelled as the lane's time to answer.
    */
   wallClockMs: number[];
   /**
@@ -222,10 +216,9 @@ export interface LaneStats {
 /**
  * Rolling wall-clock window per lane; the bound keeps one chatty lane from growing the file.
  *
- * Raised 25 -> 100 on 2026-09-08 (owner direction) when the walk began deriving each lane's
- * ATTEMPT BUDGET from this window. At 25 samples a p80 rests on the 20th value, so one unusual
- * run moves the budget a long way; at 100 it rests on the 80th. The cost is four numbers a run
- * instead of one — a few kilobytes across the whole ladder.
+ * Raised 25 -> 100 on 2026-09-08 when this history began driving dispatch decisions. The old
+ * attempt-budget consumer was removed after stopping became idle-only; the same bounded window is
+ * still used for time-to-answer reporting and recent-vs-history outlier demotion.
  *
  * ⚠ Raising it is backward compatible in the direction that matters: `isLaneStatsRow` rejects a
  * window LONGER than this bound, so a file written under the old 25 still loads. Lowering it
@@ -309,7 +302,6 @@ function freshLaneStats(laneId: string, tier: string | null, mode: DispatchMode 
     failures: 0,
     timeouts: 0,
     consecutiveFailures: 0,
-    abandonedSinceSuccess: 0,
     lastSuccessAt: null,
     wallClockMs: [],
     wallClockAt: [],
@@ -323,7 +315,7 @@ function freshLaneStats(laneId: string, tier: string | null, mode: DispatchMode 
  * per kind): the tier is part of it because each tier is its OWN ladder with its own rungs, so
  * a lane that answered a `low` task says nothing about the `xhigh` ladder — and since
  * 2026-09-08 this window sets each lane's walk budget, so sharing it across tiers would let one
- * tier's runs set another tier's kill budget.
+ * tier's history must not be reported or judged as another tier's history.
  *
  * Since 2026-09-10 the dispatch MODE is part of the key too, for the same reason one level down:
  * an answer-mode call and an agent-mode run are two populations (`DispatchMode`). A legacy window
@@ -423,7 +415,6 @@ export function recordLaneRun(cfg: Config, report: DispatchedTelemetryReport, no
     case "completed":
       entry.successes += 1;
       entry.consecutiveFailures = 0;
-      entry.abandonedSinceSuccess = 0;
       entry.lastSuccessAt = now;
       break;
     case "failed":
@@ -436,40 +427,19 @@ export function recordLaneRun(cfg: Config, report: DispatchedTelemetryReport, no
       entry.consecutiveFailures += 1;
       break;
     case "abandoned":
-      // ⚠ A failure, but NOT a timeout. The lane did not answer inside the walk's budget, which
-      // is a failure of this attempt; it never reached its own configured ceiling, so counting it
-      // in `timeouts` would inflate a figure that means something narrower.
-      // ⚠ Nor is it one of the lane's OWN failures (`consecutiveFailures` is untouched): the RELAY
-      // stopped it. It raises the next budget instead (`abandonedSinceSuccess`).
+      // A failure, but NOT a timeout: the relay stopped this attempt after observing the lane idle.
+      // Nor is it one of the lane's OWN failures (`consecutiveFailures` is untouched).
       entry.failures += 1;
-      entry.abandonedSinceSuccess += 1;
       break;
     default: {
       const _never: never = report.status;
       throw new Error(`unhandled dispatch lane status: ${String(_never)}`);
     }
   }
-  // ⚠⚠ **An ABANDONED run contributes NO duration sample, and that is load-bearing since the window
-  // began setting each lane's walk budget (2026-09-08).** The relay killed that lane AT its budget,
-  // so `wallClockMs` is by construction the BUDGET, not a duration the lane produced. Feeding it
-  // back in makes the next budget partly a measurement of the relay's own impatience, and it
-  // RATCHETS: a lane slower than its budget is killed at B, B enters the window, the quantile is
-  // pulled toward B, and the lane can never demonstrate that it needed longer — because it is never
-  // allowed to run longer. Measured shape of the harm: `free-pool`'s median run is ~5x the flat 90 s
-  // default, so under a walk it would be killed at 90 s repeatedly, its window would fill with 90 s
-  // samples, and the lane the whole feature exists to route AROUND would instead be locked out.
-  // ⚠ The COUNT still lands (`failures` above) — that a lane did not answer IS first-party evidence
-  // about the lane, and `lane-affinity.ts` acts on it. Only the DURATION is withheld.
-  // ⚠ Exactly the rule `circuit-breaker.ts` already states for a cancelled attempt: `status` is
-  // deliberately absent there so the outcome stays out of `MEASURABLE_CODES`, "so an attempt of
-  // unknown true duration moves uptime and never enters a latency statistic". Same reason here.
-  // ⚠ The timestamp window moves with the duration window, sample for sample: an abandoned
-  // run contributes NEITHER (its wall clock is the relay's own budget, not a lane duration),
-  // so position `i` always names the same run in both windows.
-  // ⚠ Since 2026-09-10 only a COMPLETED run adds a sample. A failure's or a timeout's wall clock is
-  // time to FAILURE, not time to answer: six 900 s timeouts made `opencode-muse-spark`'s budget 900 s
-  // while it answered 0 of 12, so the walk waited longest on the lane that answered least
-  // (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §3c). The abandoned rule above still holds.
+  // Only a COMPLETED run contributes a duration sample. An abandoned wall clock is the relay's
+  // own idle-stop decision, while failed/timed-out wall clocks are times to FAILURE. None of those
+  // is evidence for a statistic labelled "time to answer". Counts above still record the outcome.
+  // The timestamp window moves with the duration window, sample for sample.
   if (report.status === "completed") {
     entry.wallClockMs.push(report.wallClockMs);
     entry.wallClockAt.push(new Date(now).toISOString());
@@ -556,7 +526,8 @@ function notifyLaneStats(cfg: Config): void {
  * `breaker-persistence.ts` rule: bump only when the MEANING of an existing field changes).
  *
  * Since 2026-09-10 `mode`, `consecutiveFailures`, `abandonedSinceSuccess` and `lastSuccessAt` are
- * optional on the wire by the same rule, and an older row loads with them derived at restore. The
+ * optional on the wire. `abandonedSinceSuccess` is retained only as a compatibility field for
+ * files written by the retired attempt-budget mechanism; new rows omit it and restore ignores it. The
  * sample window NARROWED that day — only a completed run adds a sample — and the version still does
  * not bump: a bump would drop every lane's history, while an older row's mixed samples simply age
  * out of the bounded window as new runs arrive.
@@ -588,7 +559,6 @@ export function exportLaneStatsRows(cfg: Config): LaneStatsRow[] {
     failures: s.failures,
     timeouts: s.timeouts,
     consecutiveFailures: s.consecutiveFailures,
-    abandonedSinceSuccess: s.abandonedSinceSuccess,
     lastSuccessAt: s.lastSuccessAt,
     wallClockMs: [...s.wallClockMs],
     wallClockAt: [...s.wallClockAt],
@@ -620,7 +590,7 @@ function isWallClockAt(value: unknown, samples: number): value is (string | null
   return true;
 }
 
-/** The 2026-09-10 counters: each absent (an older row) or a whole count; `lastSuccessAt` a time or null. */
+/** Compatibility counters: each absent or a whole count; `lastSuccessAt` is a time or null. */
 function hasValidStreakFields(row: Record<string, unknown>): boolean {
   for (const key of ["consecutiveFailures", "abandonedSinceSuccess"] as const) {
     if (row[key] !== undefined && !isTokenCount(row[key])) return false;
@@ -707,7 +677,6 @@ export function restoreLaneStatsRows(cfg: Config, rows: readonly LaneStatsRow[])
       // older row cannot tell apart), so its streak is its failure count — and set to 0 otherwise,
       // the weaker claim: an unknown streak must never mark a lane as unable to answer.
       consecutiveFailures: row.consecutiveFailures ?? (row.successes === 0 ? row.failures : 0),
-      abandonedSinceSuccess: row.abandonedSinceSuccess ?? 0,
       lastSuccessAt: row.lastSuccessAt ?? null,
       ...restoredWindow(row),
       lastAt: row.lastAt,

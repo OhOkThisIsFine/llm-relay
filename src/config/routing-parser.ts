@@ -495,19 +495,9 @@ function parseLaneProbe(raw: unknown): LaneProbeSettings {
 }
 
 /**
- * Defaults for the automatic lane walk. **ON**, per the owner's 2026-09-06 request that the relay
- * stop making callers pick lanes by hand.
- *
- * ⚠ `attemptMs` is 90 s, and the figure is REASONED rather than measured — say so, rather than
- * letting a later reader mistake it for a calibration. Two facts bound it. Below, the measured
- * client tool-call ceiling on this machine is between 45 s and 100 s, so a budget near it lets the
- * common case finish inside ONE blocking call rather than degrading to a poll. Above, the recorded
- * lane wall-clock window has a median of 111.5 s, so a much smaller budget would abandon lanes
- * that were about to answer. 90 s sits under the ceiling and just under the median, which is the
- * right side to err on: abandoning costs one wasted lane run, waiting costs the whole turn.
- * ⚠ It is NOT a calibrated statistic and must not be quoted as one — the recorded window mixes
- * several sessions' traffic, which is exactly why `docs/backlog.md` still carries the calibration
- * as open work.
+ * Defaults for the automatic lane walk. **ON**. The three attempt-budget values remain in this
+ * object only for backward-compatible config parsing since v0.84; `idleMs` is the sole walk
+ * stopping policy. `attemptMinSamples` remains live for history fallback and outlier demotion.
  */
 // ⚠ Literals mirroring `DEFAULT_OUTLIER_RECENT_COUNT` / `DEFAULT_OUTLIER_HISTORY_QUANTILE` /
 // `DEFAULT_OUTLIER_FACTOR` in `lane-affinity.ts` (5 / 0.8 / 7.6 — the factor calibrated by
@@ -579,12 +569,11 @@ function parseDispatchWalk(raw: unknown, warnings: string[] = []): DispatchWalkS
     enabled: o.enabled ?? DEFAULT_DISPATCH_WALK.enabled,
     // Floor 30 s: two activity checks (15 s apart) must fit inside it. Ceiling 1 h, as below.
     idleMs: bounded("idleMs", o.idleMs, DEFAULT_DISPATCH_WALK.idleMs, 30_000, 3_600_000),
-    // Floor 1 s: a budget under that abandons every lane before a process can start, which reads
-    // as "every lane is broken". Ceiling 1 h matches the longest a lane rung is configured for.
+    // Legacy compatibility validation. Keep the historical accepted range so an old config does
+    // not change from valid to invalid merely because the setting became inert.
     attemptMs: bounded("attemptMs", o.attemptMs, DEFAULT_DISPATCH_WALK.attemptMs, 1_000, 3_600_000),
     agentAttemptMs: bounded("agentAttemptMs", o.agentAttemptMs, DEFAULT_DISPATCH_WALK.agentAttemptMs, 1_000, 3_600_000),
-    // Not floored to an integer: a quantile is a fraction. Bounded strictly inside (0, 1) — 0 would
-    // take the fastest run ever seen and 1 the slowest, and neither is a budget.
+    // Legacy compatibility validation; the value remains a fraction strictly inside (0, 1).
     attemptQuantile: (() => {
       const v = o.attemptQuantile;
       if (v === undefined) return DEFAULT_DISPATCH_WALK.attemptQuantile;
@@ -593,12 +582,9 @@ function parseDispatchWalk(raw: unknown, warnings: string[] = []): DispatchWalkS
       }
       return v;
     })(),
-    // Bounded 1..1000 rather than against the rolling window size, because this module imports
-    // `config-types.js` and `spec.js` and NOTHING else (the leaf rule, pinned by a test), and
-    // hand-copying `MAX_LANE_STAT_SAMPLES` here would be the copied-constant defect this repository
-    // records against `UNTIL_BASES` and `CooldownSource`. Asking for more samples than the window
-    // holds is safe on its own terms: the lane simply never has enough history and keeps the flat
-    // `attemptMs`, which is the weaker claim and the right fall-through.
+    // Live sample floor for history fallback and outlier demotion. Bounded independently of the
+    // rolling-window constant because this parser is an import leaf; asking for more than the
+    // window holds safely makes the rule silent.
     attemptMinSamples: bounded("attemptMinSamples", o.attemptMinSamples, DEFAULT_DISPATCH_WALK.attemptMinSamples, 1, 1000),
     maxLanes: bounded("maxLanes", o.maxLanes, DEFAULT_DISPATCH_WALK.maxLanes, 1, 20),
     pinMs: bounded("pinMs", o.pinMs, DEFAULT_DISPATCH_WALK.pinMs, 0, 6 * 60 * 60 * 1000),
