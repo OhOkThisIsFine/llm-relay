@@ -135,6 +135,7 @@ const MID_STREAM_ERROR_KIND = "backend_stream_failed";
 /** Beside `MID_STREAM_ERROR_KIND` — the relay's own crawl watchdog ended this attempt, rather
  * than an ordinary mid-stream transport/protocol failure. See `stream-pipeline.ts` `CrawlAbortedError`. */
 const CRAWL_ERROR_KIND = "backend_stream_crawl";
+const FIRST_BYTE_ERROR_KIND = "backend_first_byte_timeout";
 
 export function toolUseIdRewriteField(source: Response): {
   toolUseIdRewrites?: number;
@@ -902,15 +903,6 @@ export interface AttemptRun {
    * the body read exactly as before this existed. `undefined` when no first-byte deadline applies.
    */
   firstByteTimer?: ReturnType<typeof setTimeout> | undefined;
-  /**
-   * Set by the first-byte timer's own callback, before it aborts `controller` — the SAME
-   * controller the total-deadline `timer` above aborts, so a caller reading
-   * `controller.signal.aborted` alone cannot tell which deadline fired. The metadata-only log
-   * distinction (`first-byte deadline <n>ms`, never a new outcome kind) reads this flag.
-   */
-  firstByteTimedOut?: boolean;
-  /** The first-byte deadline that fired, carried only for the log's reason string above. */
-  firstByteTimeoutMs?: number;
 }
 
 /**
@@ -932,7 +924,12 @@ function firstByteFetch(fetchFn: typeof fetch, onFirstByte: () => void): typeof 
   };
 }
 
-export function beginAttemptRun(res: ServerResponse, offer: ResolvedAttempt, wantsStream: boolean): AttemptRun {
+export function beginAttemptRun(
+  res: ServerResponse,
+  offer: ResolvedAttempt,
+  wantsStream: boolean,
+  trace: RequestAttemptTrace,
+): AttemptRun {
   const target = offer.target;
   const controller = new AbortController();
   const callerController = new AbortController();
@@ -954,9 +951,8 @@ export function beginAttemptRun(res: ServerResponse, offer: ResolvedAttempt, wan
   // its pre-head wait is governed by `timer` plus the commit probe exactly as before this existed.
   const firstByteTimeoutMs = wantsStream ? undefined : target.firstByteTimeoutMs;
   if (firstByteTimeoutMs !== undefined) {
-    run.firstByteTimeoutMs = firstByteTimeoutMs;
     run.firstByteTimer = setTimeout(() => {
-      run.firstByteTimedOut = true;
+      trace.recordFirstByteTimeout();
       controller.abort();
     }, firstByteTimeoutMs);
     run.fetchFn = firstByteFetch(fetch, () => {
@@ -1252,7 +1248,7 @@ export function endWalk(
   // both fronts ship the identical `baseLog(...)` record and a field added twice is a field that
   // will eventually be spelled two ways. The served body already carries it inside `message`; this
   // is the machine-readable twin, and it is the half the metadata log was missing entirely.
-  const record = log();
+  const record = attemptTrace.withDiagnostics(log());
   h.logger.write(exit.streamStopCause ? { ...record, streamStopCause: exit.streamStopCause } : record);
   return false;
 }
@@ -1664,6 +1660,19 @@ function recordCall(
 
 export class RequestAttemptTrace {
   private readonly entries: RequestAttemptLog[] = [];
+  private readonly diagnosticKinds = new Set<string>();
+
+  recordFirstByteTimeout(): void {
+    this.diagnosticKinds.add(FIRST_BYTE_ERROR_KIND);
+  }
+
+  withDiagnostics(record: RequestLog): RequestLog {
+    if (this.diagnosticKinds.size === 0) return record;
+    return {
+      ...record,
+      errorKinds: [...new Set([...this.diagnosticKinds, ...record.errorKinds])],
+    };
+  }
 
   record(target: ResolvedTarget, status: RequestAttemptStatus, started: number, completedAt: number): void {
     if (this.entries.length >= MAX_LOG_ATTEMPTS) return;
