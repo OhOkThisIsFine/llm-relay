@@ -907,7 +907,17 @@ export const IDLE_POLL_MS = 15_000;
 /** The header line Claude Code adds to every request, from `ANTHROPIC_CUSTOM_HEADERS`. */
 function withActivityHeader(existing: string | undefined, tag: string): string {
   const line = `${LANE_ACTIVITY_HEADER}: ${tag}`;
-  return existing === undefined || existing.trim() === "" ? line : `${existing}\n${line}`;
+  if (existing === undefined || existing.trim() === "") return line;
+  // A nested dispatch can inherit ANTHROPIC_CUSTOM_HEADERS from its parent lane. One attempt must
+  // carry exactly one activity tag: duplicate copies may be joined by Node into a value that fails
+  // laneActivityTag's closed-token parser, making the daemon lose the strongest activity signal.
+  // Preserve every unrelated custom header verbatim apart from normalizing line separators.
+  const kept = existing.split(/\r?\n/).filter((headerLine) => {
+    const colon = headerLine.indexOf(":");
+    if (colon < 0) return true;
+    return headerLine.slice(0, colon).trim().toLowerCase() !== LANE_ACTIVITY_HEADER;
+  });
+  return [...kept, line].join("\n");
 }
 
 /** The newest usable activity time in `seen`, or null when none is a finite number. */
