@@ -1980,6 +1980,12 @@ environment, or removed when the reference does not resolve. An AGY lane gets th
 `--add-dir <cwd>`, and its task starts with `Work in this directory: <cwd>`; without it AGY works in
 its own scratch directory.
 
+**Provider credentials are not inherited by agent-mode lanes.** Environment variables that the
+loaded relay config can use as provider credentials (including the real legacy alias set) are
+removed from the spawned lane's copy of the MCP process environment. An explicit non-null value in
+that rung's own `env` block opts that variable back in; explicit fleet slots use only their exact
+configured names, matching their no-alias credential resolution.
+
 **The answer lists what the lane changed in the git tree.** For an agent-mode dispatch whose `cwd`
 is inside a git work tree, the relay reads `git status` before the first lane starts and again when
 the job ends (completed, failed, timed out or cancelled). The answer then ends with a
