@@ -263,7 +263,7 @@ export async function transparentPath(
     completeAttemptSuccess(h, ctx.attempt, backendRes.status);
     recordStickySuccess(h, ctx.sticky, ctx.target, backendRes.status);
   }
-  h.logger.write({
+  h.logger.write(ctx.attempt.trace.withDiagnostics({
     ...baseLog(
       ctx.started,
       ctx.path,
@@ -278,7 +278,7 @@ export async function transparentPath(
     ),
     toolUseCount, uncheckableCount, errorKinds,
     ...toolUseIdRewriteField(ctx.reportedModelSource),
-  });
+  }));
 }
 
 export async function repairPath(
@@ -471,7 +471,7 @@ export async function repairStreamingPath(
     completeAttemptSuccess(h, ctx.attempt, backendRes.status);
     recordStickySuccess(h, ctx.sticky, ctx.target, backendRes.status);
   }
-  h.logger.write({
+  h.logger.write(ctx.attempt.trace.withDiagnostics({
     ...baseLog(
       ctx.started,
       ctx.path,
@@ -486,7 +486,7 @@ export async function repairStreamingPath(
     ),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
     ...toolUseIdRewriteField(ctx.reportedModelSource),
-  });
+  }));
 }
 
 export async function repairBufferedPath(
@@ -611,7 +611,7 @@ export async function repairBufferedPath(
     return { validated, toolUseCount, uncheckableCount, errorKinds };
   }
 
-  h.logger.write({
+  h.logger.write(ctx.attempt.trace.withDiagnostics({
     ...baseLog(
       ctx.started,
       ctx.path,
@@ -626,7 +626,7 @@ export async function repairBufferedPath(
     ),
     toolUseCount, uncheckableCount, errorKinds, repair: repairOutcome,
     ...toolUseIdRewriteField(ctx.reportedModelSource),
-  });
+  }));
   return null;
 }
 
@@ -727,7 +727,7 @@ export async function anthropicMessagesPath(
         malformedProvenance: relayAuthoredResponse(run.target.kind, "anthropic-messages"),
       });
 
-    const primaryRun = beginAttemptRun(res, primaryOffer, ctx.wantsStream);
+    const primaryRun = beginAttemptRun(res, primaryOffer, ctx.wantsStream, attemptTrace);
     let resolvedAttempt = primaryRun.resolvedAttempt;
     let target = primaryRun.target;
     let timer = primaryRun.timer;
@@ -766,7 +766,7 @@ export async function anthropicMessagesPath(
             estimatedInputTokens: ctx.estimatedInputTokens,
             tracker: pool429,
             startRun: (offer) => {
-              const hedgeRun = beginAttemptRun(res, offer, ctx.wantsStream);
+              const hedgeRun = beginAttemptRun(res, offer, ctx.wantsStream, attemptTrace);
               try {
                 return { run: hedgeRun, promise: startAttempt(hedgeRun, buildForwardHeaders(ctx.req.headers, offer)) };
               } catch {
@@ -1098,7 +1098,7 @@ export async function anthropicMessagesPath(
             "llm-relay: tool call could not be repaired (failed)",
             Object.keys(headers).length > 0 ? headers : undefined,
           );
-          h.logger.write({
+          h.logger.write(attemptTrace.withDiagnostics({
             ...baseLog(
               ctx.started,
               ctx.path,
@@ -1114,7 +1114,7 @@ export async function anthropicMessagesPath(
             uncheckableCount: repairResult.uncheckableCount,
             errorKinds: repairResult.errorKinds,
             repair: "failed",
-          });
+          }));
           return;
         }
 

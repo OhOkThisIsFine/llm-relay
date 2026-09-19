@@ -1507,22 +1507,64 @@ describe("first-byte deadline — non-streamed attempts only (backlog item 1)", 
     });
   }
 
-  it("kills a non-streamed attempt whose headers never arrive, well before the total deadline — the next candidate serves", async () => {
-    const dead = await hangsForever();
-    const ok = await scripted(() => ({ body: OK_BODY }));
-    const cfg = poolCfg([`http://127.0.0.1:${port(dead.server)}`, `http://127.0.0.1:${port(ok.server)}`]);
-    cfg.providers["p1"]!.firstByteTimeoutMs = 300; // p1's own timeoutMs stays poolCfg's 5000ms
-    const p = port(await startProxy(cfg));
-
-    const started = Date.now();
-    const resp = await chat(p);
-    const elapsed = Date.now() - started;
-    expect(resp.status).toBe(200);
-    expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
-    expect(dead.calls()).toBe(1);
-    expect(ok.calls()).toBe(1);
-    expect(elapsed).toBeLessThan(2500); // half of p1's 5000ms total deadline
+  const ANTHROPIC_OK_BODY = JSON.stringify({
+    id: "msg_ok",
+    type: "message",
+    role: "assistant",
+    model: "m2",
+    content: [{ type: "text", text: "served" }],
+    stop_reason: "end_turn",
+    stop_sequence: null,
+    usage: { input_tokens: 1, output_tokens: 1 },
   });
+  const FIRST_BYTE_FRONTS = [
+    { name: "OpenAI", kind: "openai" as const, request: chat, okBody: OK_BODY },
+    { name: "Anthropic", kind: "anthropic" as const, request: messages, okBody: ANTHROPIC_OK_BODY },
+  ];
+
+  it.each(FIRST_BYTE_FRONTS)(
+    "$name front logs a first-byte deadline distinctly and serves the next candidate",
+    async ({ kind, request, okBody }) => {
+      const logDir = mkdtempSync(join(tmpdir(), "llm-relay-first-byte-test-"));
+      const logFile = join(logDir, "log.ndjson");
+      try {
+        const dead = await hangsForever();
+        const ok = await scripted(() => ({ body: okBody }));
+        const cfg = poolCfg(
+          [`http://127.0.0.1:${port(dead.server)}`, `http://127.0.0.1:${port(ok.server)}`],
+          kind,
+        );
+        cfg.providers["p1"]!.firstByteTimeoutMs = 300; // p1's own timeoutMs stays poolCfg's 5000ms
+        cfg.log = { level: "metadata", file: logFile };
+        const p = port(await startProxy(cfg));
+
+        const started = Date.now();
+        const resp = await request(p);
+        const elapsed = Date.now() - started;
+        expect(resp.status).toBe(200);
+        expect(resp.headers.get(SERVED_BY_HEADER)).toBe("p2/m2");
+        await resp.text();
+        expect(dead.calls()).toBe(1);
+        expect(ok.calls()).toBe(1);
+        expect(elapsed).toBeLessThan(2500); // half of p1's 5000ms total deadline
+
+        const rows = readFileSync(logFile, "utf8").trim().split("\n").filter(Boolean)
+          .map((line) => JSON.parse(line) as {
+            servedProvider?: string | null;
+            errorKinds?: string[];
+            attempts?: Array<{ provider: string; status: number | string }>;
+          });
+        const served = rows.find((row) => row.servedProvider === "p2");
+        expect(served?.errorKinds, JSON.stringify(rows)).toContain("backend_first_byte_timeout");
+        expect(served?.attempts?.map(({ provider, status }) => ({ provider, status }))).toEqual([
+          { provider: "p1", status: 504 },
+          { provider: "p2", status: 200 },
+        ]);
+      } finally {
+        rmSync(logDir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it("does NOT kill a non-streamed attempt whose headers arrive at once but whose body is merely slow", async () => {
     const slow = await slowBody(500, OK_BODY); // body finishes at 500ms > firstByteTimeoutMs (300ms)

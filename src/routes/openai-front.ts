@@ -264,7 +264,7 @@ export async function openAiFrontPath(
       });
     };
 
-    const primaryRun = beginAttemptRun(res, primaryOffer, ctx.wantsStream);
+    const primaryRun = beginAttemptRun(res, primaryOffer, ctx.wantsStream, attemptTrace);
     let resolvedAttempt = primaryRun.resolvedAttempt;
     let target = primaryRun.target;
     let timer = primaryRun.timer;
@@ -312,7 +312,7 @@ export async function openAiFrontPath(
             attemptTrace,
             tracker: pool429,
             startRun: (offer) => {
-              const hedgeRun = beginAttemptRun(res, offer, ctx.wantsStream);
+              const hedgeRun = beginAttemptRun(res, offer, ctx.wantsStream, attemptTrace);
               try {
                 return { run: hedgeRun, promise: startAttempt(hedgeRun, buildForwardHeaders(ctx.inboundHeaders, offer)) };
               } catch {
@@ -756,13 +756,13 @@ export async function openAiFrontPath(
         ),
         ...toolUseIdRewriteField(reportedModelSource),
       };
-      h.logger.write(audit ? {
+      h.logger.write(attemptTrace.withDiagnostics(audit ? {
         ...log,
         toolUseCount: audit.toolUseCount,
         uncheckableCount: audit.uncheckableCount,
         errorKinds: audit.errorKinds,
         repair: audit.repair,
-      } : log);
+      } : log));
       return;
     } finally {
       if (!credentialRecorded && attempt) {

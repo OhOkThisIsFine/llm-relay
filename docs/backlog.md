@@ -32,8 +32,8 @@
   `strengthAllowedForEffort` (a pool rung takes its pool's band), states the basis, and treats an
   unmatched model as unknown (no limit). Design: item D6 of `history/stabilization-plan-2026-09-17.md`.
 
-- **The stabilization plan holds work that has no entry here (2026-09-17).** Packet W0-2,
-  S3 to S5, M1 and R1, operator tasks O2 to O5, and design items D1, D2 and D5 of
+- **The stabilization plan holds work that has no entry here (2026-09-17).** Packets S4 to S5,
+  M1 and R1, operator tasks O2 to O5, and design items D1, D2 and D5 of
   `history/stabilization-plan-2026-09-17.md`. **Property:** each of those packets is shipped, or the owner
   declined it and the plan says so.
 
