@@ -31,6 +31,8 @@ export interface ProviderTelemetry {
 
 export interface TelemetryReport {
   timestamp: string;
+  /** Version loaded by the running relay process; "unknown" only for an unversioned embed. */
+  version: string;
   activeProvidersCount: number;
   healthyProvidersCount: number;
   unmeasuredProvidersCount: number;
@@ -108,6 +110,7 @@ export function getTelemetryReport(
   cb: CircuitBreaker,
   now = Date.now(),
   accounting: WriterHealth | null = null,
+  version = "unknown",
 ): TelemetryReport {
   const providers: ProviderTelemetry[] = [];
   const deployments = deploymentAggregates(cb);
@@ -165,6 +168,7 @@ export function getTelemetryReport(
 
   return {
     timestamp: new Date(now).toISOString(),
+    version,
     activeProvidersCount,
     healthyProvidersCount,
     unmeasuredProvidersCount,

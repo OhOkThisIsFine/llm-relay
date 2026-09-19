@@ -1010,7 +1010,7 @@ export function runProxy() {
     catalog,
     accountingRecorder: accountingStore,
     accountingReader: accountingStore,
-    dashboardRelayVersion: currentVersion(),
+    relayVersion: currentVersion(),
     // The projector aggregates every labeled attribution by default; query filters narrow it.
     dashboardAttributionPolicy: "include_all_labeled",
     onStop: () => shutdown("POST /stop"),
@@ -1261,22 +1261,35 @@ async function tryServer(cfg: Config, path: string, init?: RequestInit): Promise
 }
 
 /**
- * Ask a running relay whether the config it loaded still matches the file on disk, and warn on
- * stderr when it does not. Best-effort and silent otherwise: no relay running, an unreachable
- * relay, or a malformed response all mean nothing to say — a config-reading command must still
- * work with no relay running, and its own stdout output is unaffected either way (stderr only,
- * the same rule `printFirstRunNotice` follows: these commands are JSON surfaces on stdout).
+ * Ask a running relay whether either the config or code it loaded is stale, and warn on stderr.
+ * Best-effort and silent when no relay answers or a field is unknown: these commands must still
+ * work offline, and their stdout remains a machine-readable surface.
  */
-async function warnIfConfigStaleOnRunningRelay(cfg: Config): Promise<void> {
+async function warnIfRunningRelayNeedsRestart(cfg: Config): Promise<void> {
   const live = await tryServer(cfg, "/telemetry");
   if (live === null || typeof live !== "object") return;
-  const config = (live as { config?: unknown }).config;
+  const report = live as { config?: unknown; version?: unknown };
+  const config = report.config;
   if (
     config !== null &&
     typeof config === "object" &&
     (config as { changedOnDisk?: unknown }).changedOnDisk === true
   ) {
     process.stderr.write(`llm-relay: ${CONFIG_STALENESS_NOTICE}\n`);
+  }
+
+  const runningVersion = report.version;
+  if (typeof runningVersion !== "string" || runningVersion.length === 0 || runningVersion === "unknown") return;
+  let installedVersion: string;
+  try {
+    installedVersion = currentVersion();
+  } catch {
+    return;
+  }
+  if (runningVersion !== installedVersion) {
+    process.stderr.write(
+      `llm-relay: the running relay is v${runningVersion}; the installed package is v${installedVersion} — restart the relay to load it\n`,
+    );
   }
 }
 
@@ -1291,7 +1304,11 @@ export interface TelemetryDeps {
 export async function runTelemetry(deps: TelemetryDeps = {}): Promise<void> {
   const cfg = (deps.loadConfig ?? loadOrExit)();
   const live = await (deps.request ?? ((config) => tryServer(config, "/telemetry")))(cfg);
-  const report = live ?? (deps.localReport ? deps.localReport(cfg) : getTelemetryReport(cfg, globalCircuitBreaker));
+  const report =
+    live ??
+    (deps.localReport
+      ? deps.localReport(cfg)
+      : getTelemetryReport(cfg, globalCircuitBreaker, Date.now(), null, currentVersion()));
   (deps.write ?? ((text) => process.stdout.write(text)))(`${JSON.stringify(report, null, 2)}\n`);
 }
 
@@ -3154,7 +3171,7 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
     printFirstRunNotice(undefined, cfg);
     // Only worth asking when a relay just answered the /offload query above — no relay means
     // nothing to warn about, and it would just be a second doomed round trip.
-    if (live !== null) await warnIfConfigStaleOnRunningRelay(cfg);
+    if (live !== null) await warnIfRunningRelayNeedsRestart(cfg);
   }
   const hostRouting = detectHostRouting();
   if (hostRouting.state === "bypassed" && state.enabled) {
@@ -3918,7 +3935,7 @@ export async function runConfigCommand(): Promise<void> {
     const value = target ? readConfigPath(document, target) : document;
     if (target && value === undefined) configCommandError(`config ${action}: no value at "${target}"`);
     outputJson(value);
-    await warnIfConfigStaleOnRunningRelay(cfg);
+    await warnIfRunningRelayNeedsRestart(cfg);
     return;
   }
 
@@ -3958,7 +3975,7 @@ export async function runRoutingCommand(): Promise<void> {
   if (action === "show" || action === "get") {
     outputJson(cfg.routing);
     printFirstRunNotice(undefined, cfg);
-    await warnIfConfigStaleOnRunningRelay(cfg);
+    await warnIfRunningRelayNeedsRestart(cfg);
     return;
   }
 
