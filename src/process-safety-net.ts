@@ -38,16 +38,18 @@ const TRANSPORT_ERROR_CODES = new Set([
   "UND_ERR_ABORTED",
 ]);
 
-// Matched only against Node/undici-authored error messages that ship without a usable code
-// (e.g. fetch's `TypeError: fetch failed` wrapper). Provider response text never reaches an
-// uncaught handler, so this is not provider-message inference.
-const TRANSPORT_MESSAGE_HINTS = [
-  "fetch failed",
-  "other side closed",
-  "socket hang up",
-  "terminated",
-  "premature close",
-  "econnreset",
+// Exact fallbacks for Node/undici-authored transport errors that sometimes ship without a usable
+// code. These are deliberately NOT substring hints: an arbitrary application error such as
+// "worker terminated after invariant failure" must remain fatal. A chain that contains ANY code is
+// handled by the code allowlist above instead; a non-transport code must never be overridden by a
+// generic outer message such as TypeError("terminated").
+const TRANSPORT_MESSAGE_PATTERNS = [
+  /^fetch failed$/i,
+  /^other side closed$/i,
+  /^socket hang up$/i,
+  /^terminated$/i,
+  /^premature close$/i,
+  /^(?:read |write )?econnreset$/i,
 ];
 
 // undici wraps the real socket error in `err.cause`, sometimes nested. Bounded, cycle-safe.
@@ -73,11 +75,21 @@ function walkErrorChain(err: unknown): ChainLink[] {
 export function isTransportError(err: unknown): boolean {
   if (err == null) return false;
   const links = walkErrorChain(err);
+  let sawCode = false;
   for (const { code } of links) {
-    if (code && TRANSPORT_ERROR_CODES.has(code)) return true;
+    if (!code) continue;
+    sawCode = true;
+    if (TRANSPORT_ERROR_CODES.has(code)) return true;
   }
-  const joined = links.map((l) => l.message ?? "").join(" | ").toLowerCase();
-  return TRANSPORT_MESSAGE_HINTS.some((h) => joined.includes(h));
+
+  // Message matching is a fallback ONLY for genuinely code-less chains. If a cause identifies
+  // itself with a different code (for example ERR_INVALID_ARG_TYPE), preserve fail-fast even when
+  // an outer undici wrapper happens to say "terminated" or "fetch failed".
+  if (sawCode) return false;
+  return links.some(({ message }) => {
+    const normalized = message?.trim();
+    return normalized !== undefined && TRANSPORT_MESSAGE_PATTERNS.some((pattern) => pattern.test(normalized));
+  });
 }
 
 export type ProcessErrorDecision = "swallow" | "fatal";
