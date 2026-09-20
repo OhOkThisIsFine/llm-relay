@@ -1,6 +1,6 @@
 /**
- * The walk stops a lane only when it is IDLE, and never moves a packet to a rung that declares a
- * lower capability (2026-09-17). Owner decision the same day: a lane is stopped after
+ * The walk stops a lane only when it is IDLE, and never moves a packet to a rung whose derived
+ * capability is lower than the packet tier. Owner decision: a lane is stopped after
  * `routing.dispatchWalk.idleMs` with no activity — no request the relay daemon serves with the
  * lane's tag, no output, no owned process CPU increase, no change in its working tree — never because it ran longer than its past
  * runs. Measured 2026-09-16: the old budget stopped `free-pool` at its 789 s p80 with +203 lines
@@ -512,16 +512,16 @@ describe("the walk stops a lane only when it is idle", () => {
 
 describe("the walk never moves a packet to a lower-capability rung", () => {
   const lanes = (): DispatchLane[] => [
-    cliLane("weak", { capability: "medium" }),
-    cliLane("strong", { capability: "xhigh" }),
-    cliLane("plain"),
+    cliLane("weak", { capability: "medium", capabilityBasis: "snapshot" }),
+    cliLane("strong", { capability: "xhigh", capabilityBasis: "snapshot" }),
+    cliLane("plain", { capabilityBasis: "unknown" }),
   ];
 
-  it("skips a rung that declares a capability below the dispatch tier", async () => {
+  it("skips a rung whose derived capability is below the dispatch tier", async () => {
     const h = harness({ lanes: lanes(), tier: "high", scripts: {} });
     const text = await finish(h, {});
     expect(h.started).toEqual(["strong"]);
-    expect(text).toContain('lane "weak" declares capability medium, below this high dispatch');
+    expect(text).toContain('lane "weak" has derived capability medium (snapshot), below this high dispatch');
   });
 
   it("runs the rung for a tier at or below its capability", async () => {
@@ -531,14 +531,18 @@ describe("the walk never moves a packet to a lower-capability rung", () => {
   });
 
   it("runs the rung when the caller named it", async () => {
-    const h = harness({ lanes: [cliLane("weak", { capability: "low" })], tier: "xhigh", scripts: {} });
+    const h = harness({
+      lanes: [cliLane("weak", { capability: "low", capabilityBasis: "snapshot" })],
+      tier: "xhigh",
+      scripts: {},
+    });
     const text = await finish(h, { lane: "weak" });
     expect(h.started).toEqual(["weak"]);
     expect(text).toContain("weak answered");
   });
 });
 
-describe("rung capability in config", () => {
+describe("legacy rung capability in config", () => {
   const base = (rung: Record<string, unknown>) => ({
     providers: { a: { base: "http://127.0.0.1:1", kind: "openai" } },
     routing: {
@@ -548,12 +552,17 @@ describe("rung capability in config", () => {
     repair: { maxAttempts: 1, destructiveTools: [] },
   });
 
-  it("parses a known tier and refuses anything else by name", () => {
+  it("accepts a known legacy tier with a no-effect warning and still refuses typos", () => {
     const dir = mkdtempSync(join(tmpdir(), "capability-"));
     try {
       const good = join(dir, "good.json");
       writeFileSync(good, JSON.stringify(base({ capability: "medium" })));
-      expect(loadConfig(good).routing.ladder?.[0]?.capability).toBe("medium");
+      const loaded = loadConfig(good);
+      expect(loaded.routing.ladder?.[0]?.capability).toBeUndefined();
+      expect(loaded.warnings ?? []).toEqual(
+        expect.arrayContaining([expect.stringContaining('capability "medium" has no effect')]),
+      );
+
       const bad = join(dir, "bad.json");
       writeFileSync(bad, JSON.stringify(base({ capability: "hi" })));
       expect(() => loadConfig(bad)).toThrow(/routing\.ladder\[0\]\.capability must be one of low, medium, high, xhigh \(rung "r"\)/);
