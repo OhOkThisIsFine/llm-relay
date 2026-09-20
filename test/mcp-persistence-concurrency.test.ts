@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -149,6 +149,26 @@ describe("cross-process MCP persistence", () => {
       await Promise.all(workers.map(waitForExit));
     } finally {
       stopWorkers(workers);
+      cleanup();
+    }
+  });
+
+  it("ignores an abandoned unpublished claim directory", () => {
+    const { dir, cleanup } = tempDir();
+    try {
+      const path = join(dir, "state.json");
+      const abandoned = `${path}.lock.dead-process.claim`;
+      mkdirSync(abandoned, { recursive: true });
+      writeFileSync(join(abandoned, "owner.json"), "{ incomplete");
+
+      expect(
+        transactionalUpdateJsonSync(path, () => ({ value: 1 }), {
+          strict: true,
+          lock: { retryMs: 10, timeoutMs: 500 },
+        }),
+      ).toBe(true);
+      expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ value: 1 });
+    } finally {
       cleanup();
     }
   });

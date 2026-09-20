@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /**
@@ -91,10 +91,11 @@ function reclaimDeadLock(lockPath: string, observed: LockOwner, isAlive: (pid: n
 /**
  * Run work while holding an adjacent cross-process lock directory.
  *
- * mkdir is the portable exclusive acquisition primitive on both Windows and POSIX. The owner
- * record lets a later process recover a lock left by a process that died inside the critical
- * section. An unreadable/malformed owner is never stolen automatically: uncertainty fails closed
- * instead of risking two writers entering together.
+ * A fully-populated claim directory is published to the stable lock path by one atomic rename, so
+ * the stable path never has an ownerless acquisition window. The owner record lets a later process
+ * recover a lock left by a process that died inside the critical section. An unreadable/malformed
+ * owner is never stolen automatically: uncertainty fails closed instead of risking two writers
+ * entering together.
  */
 export function withFileLockSync<T>(
   targetPath: string,
@@ -102,7 +103,6 @@ export function withFileLockSync<T>(
   options: FileLockOptions = {},
 ): T {
   const lockPath = `${targetPath}.lock`;
-  const ownerPath = join(lockPath, "owner.json");
   const retryMs = Math.max(1, Math.floor(options.retryMs ?? DEFAULT_RETRY_MS));
   const timeoutMs = Math.max(retryMs, Math.floor(options.timeoutMs ?? DEFAULT_TIMEOUT_MS));
   const isAlive = options.isAlive ?? defaultIsAlive;
@@ -114,34 +114,46 @@ export function withFileLockSync<T>(
     instance: `${process.pid}-${startedAt.toString(36)}-${lockInstanceCounter.toString(36)}`,
     acquiredAt: startedAt,
   };
+  const claimPath = `${lockPath}.${owner.instance}.claim`;
+  const claimOwnerPath = join(claimPath, "owner.json");
 
   mkdirSync(dirname(targetPath), { recursive: true });
 
-  for (;;) {
-    try {
-      mkdirSync(lockPath);
+  // Build the complete lock off to the side, then publish it with ONE directory rename. The stable
+  // lock path is therefore never visible without a valid owner record: a process killed before the
+  // rename leaves only its uniquely-named claim directory, which does not block another writer.
+  mkdirSync(claimPath);
+  try {
+    writeFileSync(claimOwnerPath, JSON.stringify(owner) + "\n", {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+
+    for (;;) {
       try {
-        writeFileSync(ownerPath, JSON.stringify(owner) + "\n", {
-          encoding: "utf8",
-          flag: "wx",
-          mode: 0o600,
-        });
+        renameSync(claimPath, lockPath);
+        break;
       } catch (err) {
-        rmSync(lockPath, { recursive: true, force: true });
-        throw err;
-      }
-      break;
-    } catch (err) {
-      if (errorCode(err) !== "EEXIST") throw err;
+        // POSIX commonly reports ENOTEMPTY and Windows commonly reports EEXIST/EPERM when the
+        // destination directory already exists. The filesystem state, not that platform-specific
+        // spelling, decides whether this was ordinary contention.
+        if (!existsSync(lockPath)) throw err;
 
-      const observed = readOwner(lockPath);
-      if (observed !== null && reclaimDeadLock(lockPath, observed, isAlive)) continue;
+        const observed = readOwner(lockPath);
+        if (observed !== null && reclaimDeadLock(lockPath, observed, isAlive)) continue;
 
-      if (Date.now() - startedAt >= timeoutMs) {
-        throw new Error(`Timed out acquiring file lock for ${targetPath}`);
+        if (Date.now() - startedAt >= timeoutMs) {
+          throw new Error(`Timed out acquiring file lock for ${targetPath}`);
+        }
+        sleepSync(retryMs);
       }
-      sleepSync(retryMs);
     }
+  } catch (err) {
+    // If the claim was never published, it is private debris and safe to remove. After a successful
+    // rename it no longer exists here, so this cannot remove another process's stable lock.
+    if (existsSync(claimPath)) rmSync(claimPath, { recursive: true, force: true });
+    throw err;
   }
 
   try {
