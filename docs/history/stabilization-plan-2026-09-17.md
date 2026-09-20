@@ -407,6 +407,13 @@ the owner these questions.
   a cheap packet. S4 measured on 2026-09-19 that the lane dies with its MCP parent on Windows.
 - **Recommendation.** Design (b) in its own lap; S4 proves re-adoption without detachment is
   insufficient.
+- **DESIGNED 2026-09-20.** The independent lifetime is a daemon-owned, token-gated lane-execution
+  broker rather than pid adoption or ordinary child detachment. The daemon resolves only configured
+  lanes, owns/reaps the process tree, and lets replacement MCP processes observe/collect the same
+  execution through a journaled execution id. Full design:
+  [mcp-restart-safe-lane-execution-design-2026-09-20.md](mcp-restart-safe-lane-execution-design-2026-09-20.md).
+  Implementation is split into four phases; Phase 1 is protocol/store only and changes no MCP
+  dispatch behavior.
 
 ### D2 The daemon does not reload `config.json`
 - **True now.** An edit takes effect at the next restart. `/telemetry` and three CLI commands
