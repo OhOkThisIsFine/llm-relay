@@ -130,6 +130,33 @@ describe("CircuitBreaker.endRateLimitCooldown — which cooldowns a 200 probe ma
     expect(cb.endRateLimitCooldown(cell("p"), now + 2)).toBe(false);
   });
 
+  it("ends an escalated 5xx or 402 cooldown after a 200 probe, but not an ineligible status", () => {
+    const cb = new CircuitBreaker();
+
+    for (let i = 0; i < 3; i += 1) {
+      cb.recordOutcome(cell("five"), { ok: false, status: 500, elapsedMs: 5, at: now + i });
+    }
+    expect(cb.getState(cell("five"))!.cooldownSource).toBe("failure-escalation");
+    expect(cb.endRateLimitCooldown(cell("five"), now + 3)).toBe(true);
+    expect(cb.isHealthy(cell("five"), now + 3)).toBe(true);
+
+    // 402's fixed 1h floor masks the first two escalation steps; the fifth failure reaches 6h.
+    for (let i = 0; i < 5; i += 1) {
+      cb.recordOutcome(cell("pay"), { ok: false, status: 402, elapsedMs: 5, at: now + 10 + i });
+    }
+    expect(cb.getState(cell("pay"))!.cooldownSource).toBe("failure-escalation");
+    expect(cb.endRateLimitCooldown(cell("pay"), now + 20)).toBe(true);
+
+    // Same source, wrong status: the source alone is not enough to retract a cooldown.
+    for (let i = 0; i < 3; i += 1) {
+      cb.recordOutcome(cell("bad-status"), { ok: false, status: 500, elapsedMs: 5, at: now + 30 + i });
+    }
+    cb.recordOutcome(cell("bad-status"), { ok: false, status: 401, elapsedMs: 5, at: now + 33 });
+    expect(cb.getState(cell("bad-status"))!.cooldownSource).toBe("failure-escalation");
+    expect(cb.getState(cell("bad-status"))!.lastStatus).toBe(401);
+    expect(cb.endRateLimitCooldown(cell("bad-status"), now + 34)).toBe(false);
+  });
+
   it("never touches a credential fault, an unknown cell, a lapsed cooldown or a sibling cell", () => {
     const cb = new CircuitBreaker();
     cb.recordCredentialFault(cell("p"), 401, now);
@@ -180,6 +207,26 @@ describe("CircuitBreaker.rateLimitCoolingCells — which cooldowns the loop spen
     cb.recordOutcome(cell("pay"), { ok: false, status: 402, elapsedMs: 5, at: now });
     cb.recordOutcome(cell("old"), { ok: false, status: 429, elapsedMs: 5, at: now - 10 * MINUTE });
     expect(cb.rateLimitCoolingCells(now + 1)).toEqual([]);
+  });
+
+  it("lists relay-invented repeated-failure cooldowns for 5xx and 402 recovery probes", () => {
+    const cb = new CircuitBreaker();
+    for (let i = 0; i < 3; i += 1) {
+      cb.recordOutcome(cell("five"), { ok: false, status: 503, elapsedMs: 5, at: now + i });
+    }
+    for (let i = 0; i < 5; i += 1) {
+      cb.recordOutcome(cell("pay"), { ok: false, status: 402, elapsedMs: 5, at: now + 10 + i });
+    }
+    for (let i = 0; i < 3; i += 1) {
+      cb.recordOutcome(cell("wrong"), { ok: false, status: 500, elapsedMs: 5, at: now + 20 + i });
+    }
+    cb.recordOutcome(cell("wrong"), { ok: false, status: 401, elapsedMs: 5, at: now + 23 });
+
+    const cells = cb.rateLimitCoolingCells(now + 24);
+    expect(cells.map((c) => [c.provider, c.source]).sort()).toEqual([
+      ["five", "failure-escalation"],
+      ["pay", "failure-escalation"],
+    ]);
   });
 
   it("both tables are TOTAL over CooldownSource and closed with `satisfies` — no fall-through", () => {
