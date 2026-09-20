@@ -213,8 +213,8 @@ export function classifyLaneAttempt(
   return run.code === 0 && opts.semanticFailure === undefined ? "completed" : "failed";
 }
 
-export type LaneActivityState = "starting" | "active" | "quiet" | "idle" | "unmonitored";
-export type LaneWalkVerdict = "keep-running" | "stop-idle" | "no-idle-stop";
+export type LaneActivityState = "starting" | "active" | "quiet" | "advancing" | "unmonitored";
+export type LaneWalkVerdict = "keep-running" | "no-idle-stop";
 
 /**
  * The walk's OWN liveness decision for the attempt running now.
@@ -229,10 +229,15 @@ export interface LaneLiveness {
   verdict: LaneWalkVerdict;
   /** When the walk last evaluated/published this snapshot. */
   checkedAt: number;
-  /** Newest activity timestamp the walk has accepted for this attempt, when one exists. */
+  /**
+   * Timestamp the idle timer is anchored to. Starts at attempt launch so a new lane gets a full
+   * idle window even before it emits observable activity; moves forward when real activity arrives.
+   */
+  idleBaselineAt: number;
+  /** Newest REAL activity timestamp the walk accepted for this attempt, or null before any. */
   lastActivityAt: number | null;
-  /** Which first-party signal supplied `lastActivityAt`, when known. */
-  source?: string;
+  /** What established the current idle baseline: attempt-start or a first-party activity signal. */
+  source: string;
   /** Idle cutoff applied to this attempt; null means the walk will not idle-stop it. */
   idleMs: number | null;
 }
