@@ -376,8 +376,9 @@ const TOOLS: ToolDefinition[] = [
       "Report a dispatched job. While it runs, `walk-verdict` is the authoritative liveness " +
       "decision: keep-running means continue polling; no-idle-stop means this attempt is exempt " +
       "from idle stopping; unavailable means another MCP process owns the live job, so keep polling. " +
-      "Elapsed time, output silence, historical duration and last-activity are " +
-      "diagnostics only. Once it has ended: its full answer, exactly as dispatch_result returns it. Wait at least a few " +
+      "Activity may read advancing while the walk changes lanes; keep-running still means poll. " +
+      "Elapsed time, output silence, historical duration and activity diagnostics are diagnostics only. " +
+      "Once it has ended: its full answer, exactly as dispatch_result returns it. Wait at least a few " +
       "seconds between polls. Without jobId: list the recent jobs of every llm-relay MCP server " +
       "on this machine, so a lost jobId can be found again.",
     inputSchema: {
