@@ -213,8 +213,8 @@ export function classifyLaneAttempt(
   return run.code === 0 && opts.semanticFailure === undefined ? "completed" : "failed";
 }
 
-export type LaneActivityState = "starting" | "active" | "quiet" | "idle" | "unmonitored";
-export type LaneWalkVerdict = "keep-running" | "stop-idle" | "no-idle-stop";
+export type LaneActivityState = "starting" | "active" | "quiet" | "advancing" | "unmonitored";
+export type LaneWalkVerdict = "keep-running" | "no-idle-stop";
 
 /**
  * The walk's OWN liveness decision for the attempt running now.
