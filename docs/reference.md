@@ -1751,18 +1751,25 @@ sessions can therefore each run up to `maxConcurrent` jobs against the same rung
 for up to `2 × maxConcurrent` together; this is the stated limit of what one process can observe,
 not a claim about the rung's real-world concurrency everywhere it might be dispatched from.
 
-#### Rung capability (`capability`) and the budget extension
+#### Derived rung capability
 
-A rung may declare `capability`, one of `low`, `medium`, `high`, `xhigh`: the highest dispatch
-tier the operator trusts that lane with. A dispatch WALK at a higher tier SKIPS the rung and records
-the reason `lane "<id>" declares capability <c>, below this <tier> dispatch`. The skip works like a
-`maxConcurrent` skip: nothing starts, nothing is demoted, and the rung counts as not tried. A rung
-the caller names with `lane` always runs. Absent means no limit. Any other value is a load error
-that names the rung.
+A lane's dispatch ceiling is derived from synced capability evidence; it is not an operator-set
+trust value. For a direct relay model or a CLI rung with `--model`, the relay uses the highest
+`low|medium|high|xhigh` band for which `getStrength` has an exact SKU match with at least three
+published signals and `strengthAllowedForEffort` admits the model. A dynamic `pool/<name>` rung
+uses that pool policy's declared `effort` band.
 
-```jsonc
-{ "id": "opencode-muse-spark", "kind": "cli", "command": "opencode", "args": ["run", "{task}"], "capability": "medium" }
-```
+A higher-tier walk skips a lane with a lower derived ceiling. The skip starts nothing, demotes
+nothing, and counts as not tried; a caller-forced `lane` still runs. Fuzzy matches, unmatched
+models, models with insufficient evidence, CLI rungs with no model, and pools with no effort policy
+are `unknown` and impose **no limit** — unknown is never classified as weak.
+
+`dispatch_lanes` shows both the result and its basis, for example `capability: high (snapshot)`,
+`capability: medium (pool-band)`, or `capability: unknown (no evidence-qualified limit)`.
+
+The old rung `capability` key remains parseable for compatibility only. A valid legacy value loads
+with a warning that it has no effect and is not stored on the rung; an invalid value is still a load
+error so a typo cannot look like a setting that took effect.
 
 
 #### Host-adaptive lanes (`routing.cliLane`)
