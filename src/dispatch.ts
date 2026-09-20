@@ -67,7 +67,6 @@ export const LANE_UNRELIABLE_STREAK = 3;
 export const FAILING_LANE_STREAK = 5;
 
 export type LaneState = "ready" | "exhausted" | "disabled" | "not-servable";
-
 /**
  * Advisory per-lane execution stats for one ladder rung: how often this config took the lane
  * and how long it took. The median is over the rolling wall-clock window held by
@@ -127,7 +126,7 @@ export interface DispatchLane {
   /** Highest dispatch tier supported by synced capability evidence; absent means unknown/no limit. */
   capability?: EffortLevel;
   /** Why capability is known, or "unknown" when no evidence-qualified limit can be stated. */
-  capabilityBasis?: "snapshot" | "pool-band" | "unknown";
+  capabilityBasis?: CapabilityBasis;
   /** When an exhausted rung becomes eligible again (ISO 8601). */
   readyAt?: string;
   /**
