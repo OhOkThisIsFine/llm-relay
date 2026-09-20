@@ -12,7 +12,10 @@ import { createHash } from "node:crypto";
 
 export const LANE_EXECUTION_SCHEMA = "mcp.lane-execution.v1" as const;
 export const MAX_BROKER_TERMINAL_EXECUTIONS = 100;
-export const MAX_BROKER_TASK_CHARS = 4096;
+// The HTTP server already caps the entire request body at 36 MiB by default. Keep only enough
+// headroom here to reject a pathological programmatic call without imposing the old 4 KiB packet
+// limit on MCP dispatch, which historically accepted much larger task text.
+export const MAX_BROKER_TASK_CHARS = 32 * 1024 * 1024;
 export const MAX_BROKER_PATH_CHARS = 4096;
 export const MAX_BROKER_ID_CHARS = 200;
 export const MAX_BROKER_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -302,6 +305,14 @@ function parseStart(value: Record<string, unknown>): LaneExecutionStartRequest |
   const readOnly = value["readOnly"];
   if (readOnly !== undefined && typeof readOnly !== "boolean") return null;
   if (!optionalBoundedString(value["callerRoot"], MAX_BROKER_PATH_CHARS)) return null;
+  // The daemon cannot reconstruct the caller's protected tree from its own cwd. A brokered
+  // read-only start without this fact would silently weaken the mechanism the local MCP path uses.
+  if (
+    readOnly === true &&
+    (typeof value["callerRoot"] !== "string" || value["callerRoot"].length === 0)
+  ) {
+    return null;
+  }
   if (
     value["host"] !== undefined &&
     value["host"] !== "routed" &&
