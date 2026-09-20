@@ -110,6 +110,7 @@ import { countRequestSamples } from "./ping/probe-cache.js";
 import { detectOpenAiFrontProtocol, openAiFrontPath } from "./routes/openai-front.js";
 import { anthropicMessagesPath } from "./routes/messages.js";
 import { beginLaneRequest, LANE_ACTIVITY_HEADER, laneActivityTag } from "./lane-activity.js";
+import type { LaneExecutionBrokerPort } from "./lane-execution-broker.js";
 
 export { baseLog, logSafePath } from "./request-log.js";
 export { DEFAULT_MAX_BODY_BYTES } from "./stream-pipeline.js";
@@ -129,6 +130,7 @@ const CONTROL_ROUTES = new Set([
   "/cooldowns/clear",
   "/dispatch/telemetry",
   "/dispatch/activity",
+  "/mcp/lane-execution",
   "/registry",
   "/ping",
   "/health/stats",
@@ -253,6 +255,11 @@ export interface ProxyDeps {
   dashboardRelayVersion?: string;
   dashboardAttributionPolicy?: AttributionPolicy;
   controlAuthorization?: ControlAuthorizationPort | null;
+  /**
+   * D1 Phase 1: optional daemon-owned lane execution broker. Production MCP does not use it yet;
+   * tests inject it to pin the admitted control route before the ownership switchover.
+   */
+  laneExecutionBroker?: LaneExecutionBrokerPort;
   /** Optional shutdown callback — called by POST /stop after responding 202. A bare programmatic proxy with no onStop answers 503. */
   onStop?: () => void;
 }
@@ -373,6 +380,7 @@ export interface Handlers {
   dashboardRead: ReturnType<typeof createDashboardSnapshotReadPort>;
   stickySessions?: StickySessionManager;
   controlAuthorization?: ControlAuthorizationPort;
+  laneExecutionBroker?: LaneExecutionBrokerPort;
   server: Server;
   quotaDemotion: QuotaDemotionFn;
   latencyDemotion: LatencyDemotionFn;
@@ -1024,6 +1032,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       ...(stickySessions ? { stickySessions } : {}),
       server,
       ...(controlAuthorization ? { controlAuthorization } : {}),
+      ...(deps.laneExecutionBroker ? { laneExecutionBroker: deps.laneExecutionBroker } : {}),
       quotaDemotion,
       latencyDemotion,
       probation,

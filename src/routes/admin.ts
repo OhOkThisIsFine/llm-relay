@@ -28,6 +28,10 @@ import {
 } from "../dispatch-lane-stats.js";
 import { laneActivityTag, readLaneActivity } from "../lane-activity.js";
 import { clearLaneAffinity, demoteLane, forgetLaneMemory, lanePin, MAX_AFFINITY_MS, pinLane, recordLaneOutlier } from "../lane-affinity.js";
+import {
+  parseLaneExecutionBrokerRequest,
+  type LaneExecutionBrokerPort,
+} from "../lane-execution-broker.js";
 
 const MAX_TASK_LEN = 4096;
 
@@ -177,6 +181,8 @@ export interface AdminHandlers {
    * the shared no-op recorder — the same default `createProxy` uses.
    */
   accountingRecorder: AccountingRecorder;
+  /** D1 Phase 1: injected execution broker; absent means the route fails closed with 503. */
+  laneExecutionBroker?: LaneExecutionBrokerPort;
   /** Optional shutdown callback — called by POST /stop after responding 202. A bare programmatic proxy with no onStop answers 503. */
   onStop?: () => void;
   /** True the first time GET /telemetry observes the loaded config changed on disk, false on
@@ -766,6 +772,21 @@ export async function handleAdminRoutes(
   }
 
   if (pathname === "/dispatch/activity") return answerDispatchActivity(req.method, path, ok, bad);
+
+  if (pathname === "/mcp/lane-execution") {
+    if (req.method !== "POST") {
+      return bad(404, `${req.method} /mcp/lane-execution is not a route — POST a broker action`);
+    }
+    const request = parseLaneExecutionBrokerRequest(reqJson);
+    if (request === null) {
+      return bad(400, "POST /mcp/lane-execution body is not a valid broker action");
+    }
+    if (h.laneExecutionBroker === undefined) {
+      return bad(503, "lane execution broker is unavailable");
+    }
+    const result = await h.laneExecutionBroker.handle(request);
+    return result.ok ? ok({ execution: result.execution }, true) : bad(result.status, result.message);
+  }
 
   if ((req.method === "GET" || req.method === "HEAD") && pathname === "/dispatch/telemetry") {
     // POST-only, like `/cooldowns/clear`: an explicit 404 rather than the model-path
