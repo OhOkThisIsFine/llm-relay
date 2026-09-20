@@ -120,11 +120,15 @@ For a running job, **`walk-verdict` is the authoritative liveness decision**:
 - `unavailable` — another live MCP process owns the job, so this process cannot observe the
   verdict. Continue polling; do not infer from elapsed time or silence.
 
-The neighboring `activity`, `activity-basis`, `last-activity`, `idle-stop-in`, elapsed time,
-output progress, and historical time-to-answer fields are diagnostics. **Do not combine them to
-reconstruct liveness.** Status polling is observational: it does not itself sample relay traffic,
-owned-process CPU, or the working tree, so polling cannot consume evidence the walk needs for its
-own keep/stop decision.
+The neighboring `activity`, `activity-basis`, `last-activity-at-check`,
+`idle-stop-in-at-check`, elapsed time, output progress, and historical time-to-answer fields are
+diagnostics. `activity: advancing` means the walk has already decided to leave the current lane
+and is handing the same job off to the next one; the caller still follows
+`walk-verdict: keep-running` and keeps polling. The two `*-at-check` values are frozen to the
+same probe snapshot as the verdict — only `activity-checked` ages between probes. **Do not combine
+diagnostics to reconstruct liveness.** Status polling is observational: it does not itself sample
+relay traffic, owned-process CPU, or the working tree, so polling cannot consume evidence the walk
+needs for its own keep/stop decision.
 
 `dispatch_lanes()` shows the ladder if you want to choose deliberately.
 
