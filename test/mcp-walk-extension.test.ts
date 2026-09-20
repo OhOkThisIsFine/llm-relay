@@ -51,6 +51,8 @@ function harness(opts: {
   traffic?: (tag: string, now: number) => LaneTraffic | null;
   /** Cumulative CPU milliseconds for the owned process tree; absent = no CPU reader. */
   cpu?: (pids: readonly number[], now: number) => number | null;
+  /** Test-only observation point invoked synchronously when a spawned handle is killed/reaped. */
+  onKill?: (command: string) => void;
 }) {
   const out: Array<{ id?: number; result?: { content: Array<{ text: string }> } }> = [];
   const started: string[] = [];
@@ -87,7 +89,10 @@ function harness(opts: {
     });
     return {
       result,
-      kill: () => settle({ code: null, stdout: "", stderr: "killed", timedOut: false }),
+      kill: () => {
+        opts.onKill?.(command);
+        settle({ code: null, stdout: "", stderr: "killed", timedOut: false });
+      },
       ...(script.pids === undefined ? {} : { pids: () => script.pids ?? [] }),
     };
   };
@@ -235,10 +240,84 @@ describe("the walk stops a lane only when it is idle", () => {
     await vi.advanceTimersByTimeAsync(IDLE_POLL_MS);
     const status = h.call("dispatch_status", { jobId });
     await status.done;
-    expect(status.text()).toContain("activity: active");
-    expect(status.text()).toContain("walk-verdict: keep-running");
-    expect(status.text()).toContain("activity-basis: relay-in-flight");
-    expect(status.text()).toContain("idle-stop-in:");
+    const firstText = status.text();
+    expect(firstText).toContain("activity: active");
+    expect(firstText).toContain("walk-verdict: keep-running");
+    expect(firstText).toContain("activity-basis: relay-in-flight");
+    const headroom = firstText.split("\n").find((line) => line.startsWith("idle-stop-in-at-check:"));
+    const lastActivity = firstText.split("\n").find((line) => line.startsWith("last-activity-at-check:"));
+    expect(headroom).toBeDefined();
+    expect(lastActivity).toBeDefined();
+
+    // A status poll does not advance either diagnostic: they describe the same probe snapshot.
+    await vi.advanceTimersByTimeAsync(8_000);
+    const later = h.call("dispatch_status", { jobId });
+    await later.done;
+    expect(later.text()).toContain(headroom as string);
+    expect(later.text()).toContain(lastActivity as string);
+  });
+
+  it("publishes advancing/keep-running during an idle lane handoff, never stop-idle", async () => {
+    let h!: ReturnType<typeof harness>;
+    let jobId: string | undefined;
+    let statusAtFirstKill: { done: Promise<void>; text: () => string } | undefined;
+    h = harness({
+      lanes: [cliLane("slow"), cliLane("next")],
+      scripts: { slow: { answersAfterMs: 10 * IDLE_MS }, next: { answersAfterMs: 100 } },
+      onKill: () => {
+        if (statusAtFirstKill !== undefined || jobId === undefined) return;
+        statusAtFirstKill = h.call("dispatch_status", { jobId });
+      },
+    });
+
+    const first = h.call("dispatch", { task: "t", waitMs: 1_000 });
+    await vi.advanceTimersByTimeAsync(1_500);
+    await first.done;
+    jobId = /jobId "(job-\d+)"/.exec(first.text())?.[1] ?? /job: (job-\d+)/.exec(first.text())?.[1];
+    expect(jobId).toBeDefined();
+
+    await vi.advanceTimersByTimeAsync(IDLE_MS + 1_000);
+    expect(statusAtFirstKill).toBeDefined();
+    await statusAtFirstKill?.done;
+    const text = statusAtFirstKill?.text() ?? "";
+    expect(text).toContain("lane: slow");
+    expect(text).toContain("activity: advancing");
+    expect(text).toContain("walk-verdict: keep-running");
+    expect(text).not.toContain("stop-idle");
+    expect(text).not.toContain("idle-stop-in-at-check:");
+  });
+
+  it("freezes idle headroom and does not fabricate last activity from attempt start", async () => {
+    const h = harness({
+      lanes: [cliLane("slow"), cliLane("next")],
+      scripts: { slow: { answersAfterMs: 10 * IDLE_MS }, next: { answersAfterMs: 100 } },
+    });
+    const first = h.call("dispatch", { task: "t", waitMs: 1_000 });
+    await vi.advanceTimersByTimeAsync(1_500);
+    await first.done;
+    const jobId = /jobId "(job-\d+)"/.exec(first.text())?.[1] ?? /job: (job-\d+)/.exec(first.text())?.[1];
+    expect(jobId).toBeDefined();
+
+    await vi.advanceTimersByTimeAsync(IDLE_POLL_MS);
+    const firstStatus = h.call("dispatch_status", { jobId });
+    await firstStatus.done;
+    const firstText = firstStatus.text();
+    expect(firstText).toContain("activity: quiet");
+    expect(firstText).toContain("activity-basis: attempt-start");
+    expect(firstText).not.toContain("last-activity-at-check:");
+    const headroom = firstText.split("\n").find((line) => line.startsWith("idle-stop-in-at-check:"));
+    expect(headroom).toBeDefined();
+
+    // No new walk probe occurs in this interval. Only activity-checked may age; the headroom from
+    // the verdict snapshot stays fixed, and attempt start never turns into fake observed activity.
+    await vi.advanceTimersByTimeAsync(8_000);
+    const laterStatus = h.call("dispatch_status", { jobId });
+    await laterStatus.done;
+    const laterText = laterStatus.text();
+    expect(laterText).toContain(headroom as string);
+    expect(laterText).not.toContain("last-activity-at-check:");
+    expect(laterText).not.toContain("last-activity: ");
+    expect(laterText).not.toContain("idle-stop-in: ");
   });
 
   it("dispatch_status is observational and never consumes relay, CPU, or tree liveness evidence", async () => {
