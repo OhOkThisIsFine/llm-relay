@@ -236,7 +236,7 @@ export const MCP_INSTRUCTIONS =
   "`walk-verdict`: `keep-running` means continue polling, `no-idle-stop` means the walk will " +
   "not stop this attempt for idleness, and `unavailable` means another MCP process owns the live " +
   "job so you should keep polling rather than infer. Do not infer liveness from elapsed time, output silence, " +
-  "historical duration, or last-activity diagnostics. Follow the advice at the end of a " +
+  "historical duration, or activity diagnostics. Follow the advice at the end of a " +
   "reply: when it says a lane was stopped while it was still working, dispatch again with that " +
   "lane named so it can finish; when it says every lane ran and failed, do the work here — " +
   "re-dispatching the same task picks the same lanes. To run one specific model instead of the " +
@@ -376,8 +376,9 @@ const TOOLS: ToolDefinition[] = [
       "Report a dispatched job. While it runs, `walk-verdict` is the authoritative liveness " +
       "decision: keep-running means continue polling; no-idle-stop means this attempt is exempt " +
       "from idle stopping; unavailable means another MCP process owns the live job, so keep polling. " +
-      "Elapsed time, output silence, historical duration and last-activity are " +
-      "diagnostics only. Once it has ended: its full answer, exactly as dispatch_result returns it. Wait at least a few " +
+      "Activity may read advancing while the walk changes lanes; keep-running still means poll. " +
+      "Elapsed time, output silence, historical duration and activity diagnostics are diagnostics only. " +
+      "Once it has ended: its full answer, exactly as dispatch_result returns it. Wait at least a few " +
       "seconds between polls. Without jobId: list the recent jobs of every llm-relay MCP server " +
       "on this machine, so a lost jobId can be found again.",
     inputSchema: {
@@ -622,14 +623,18 @@ function describeLiveness(job: LaneJob, now: number): string[] {
     `walk-verdict: ${liveness.verdict}`,
     `activity-checked: ${checkedAgo}s ago`,
   ];
-  if (liveness.source !== undefined) lines.push(`activity-basis: ${liveness.source}`);
+  lines.push(`activity-basis: ${liveness.source}`);
   if (liveness.lastActivityAt !== null) {
-    const activityAgo = Math.max(0, Math.round((now - liveness.lastActivityAt) / 1000));
-    lines.push(`last-activity: ${activityAgo}s ago`);
-    if (liveness.verdict === "keep-running" && liveness.idleMs !== null) {
-      const remaining = Math.max(0, liveness.idleMs - (now - liveness.lastActivityAt));
-      lines.push(`idle-stop-in: ${Math.ceil(remaining / 1000)}s`);
-    }
+    // Keep diagnostics in the SAME snapshot as the verdict. If a status poll arrives between walk
+    // probes, only activity-checked ages; the activity age/headroom below stay exactly what the
+    // walk knew when it made that verdict instead of drifting toward an apparent contradiction.
+    const activityAgeAtCheck = Math.max(0, liveness.checkedAt - liveness.lastActivityAt);
+    lines.push(`last-activity-at-check: ${Math.round(activityAgeAtCheck / 1000)}s ago`);
+  }
+  if (liveness.verdict === "keep-running" && liveness.idleMs !== null && liveness.activity !== "advancing") {
+    const baselineAgeAtCheck = Math.max(0, liveness.checkedAt - liveness.idleBaselineAt);
+    const remainingAtCheck = Math.max(0, liveness.idleMs - baselineAgeAtCheck);
+    lines.push(`idle-stop-in-at-check: ${Math.ceil(remainingAtCheck / 1000)}s`);
   }
   return lines;
 }
@@ -2028,7 +2033,9 @@ export class McpDispatchServer {
         activity: "unmonitored",
         verdict: "no-idle-stop",
         checkedAt: attemptStart,
+        idleBaselineAt: attemptStart,
         lastActivityAt: null,
+        source: "attempt-start",
         idleMs: null,
       });
       return guarded;
@@ -2037,7 +2044,9 @@ export class McpDispatchServer {
       activity: "starting",
       verdict: "keep-running",
       checkedAt: attemptStart,
-      lastActivityAt: attemptStart,
+      idleBaselineAt: attemptStart,
+      lastActivityAt: null,
+      source: "attempt-start",
       idleMs,
     });
 
@@ -2053,7 +2062,8 @@ export class McpDispatchServer {
     });
     // The lane counts as active at its start, so a lane is never stopped before `idleMs` has passed.
     let lastActive = attemptStart;
-    let lastSource: string | undefined;
+    let lastRealActivity: number | null = null;
+    let lastSource = "attempt-start";
     for (;;) {
       const raced = await Promise.race([settled, pollTimer(Math.min(IDLE_POLL_MS, idleMs))]);
       if (raced.kind === "settled") return raced.outcome;
@@ -2070,19 +2080,36 @@ export class McpDispatchServer {
       const fresh = seen !== null && seen.at > lastActive;
       if (fresh && seen !== null) {
         lastActive = seen.at;
+        lastRealActivity = seen.at;
         lastSource = seen.source;
       }
       const checkedAt = this.now();
       const idle = checkedAt - lastActive >= idleMs;
+      if (idle) {
+        // The idle decision is internal routing state. Publish only what the CALLER should do:
+        // keep polling while the walk kills this attempt, records it, resets attempt-scoped state,
+        // and points the same job handle at the next lane. Exposing "stop-idle" here created a
+        // transient public verdict no wrapper knew how to act on.
+        this.jobs.noteLiveness(jobId, {
+          activity: "advancing",
+          verdict: "keep-running",
+          checkedAt,
+          idleBaselineAt: lastActive,
+          lastActivityAt: lastRealActivity,
+          source: lastSource,
+          idleMs,
+        });
+        break;
+      }
       this.jobs.noteLiveness(jobId, {
-        activity: idle ? "idle" : fresh ? "active" : "quiet",
-        verdict: idle ? "stop-idle" : "keep-running",
+        activity: fresh ? "active" : "quiet",
+        verdict: "keep-running",
         checkedAt,
-        lastActivityAt: lastActive,
-        ...(lastSource === undefined ? {} : { source: lastSource }),
+        idleBaselineAt: lastActive,
+        lastActivityAt: lastRealActivity,
+        source: lastSource,
         idleMs,
       });
-      if (idle) break;
     }
 
     // The lane was idle for `idleMs` and another lane remains. Kill this one and move on. `guarded`

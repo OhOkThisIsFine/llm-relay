@@ -62,6 +62,8 @@ describe("relay agent provenance", () => {
     expect(text).toContain("no-idle-stop");
     expect(text).toContain("unavailable");
     expect(text).toMatch(/never infer liveness from elapsed time, output silence, historical duration/i);
+    expect(text).toContain("activity diagnostics");
+    expect(text).not.toContain("last-activity");
   });
 
   it("strips the caller's mode tag through one shared helper, not a prompt-only instruction", () => {
