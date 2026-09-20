@@ -80,6 +80,55 @@ describe("MCP server restart", () => {
     }
   });
 
+  it("does not block MCP initialization on killed-job tree recovery", async () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const first = new LaneJobStore(createJobJournal(path));
+      const job = first.create("lane-a", "pool/high", "C:/tree");
+      first.noteStartingTree(job.id, snap({ "pre.ts": " M" }), undefined);
+
+      let finishTreeRead!: (value: TreeSnapshot | null) => void;
+      const treeSnapshot: TreeSnapshotReader = () =>
+        new Promise<TreeSnapshot | null>((resolve) => {
+          finishTreeRead = resolve;
+        });
+      const out: Array<{ id?: number; result?: unknown }> = [];
+      const server = new McpDispatchServer({
+        config: { host: "127.0.0.1", port: 8791, routing: { default: "x" } } as unknown as Config,
+        buildView: async () => {
+          throw new Error("unused in initialize test");
+        },
+        journal: createJobJournal(path),
+        treeSnapshot,
+        write: (chunk) => out.push(JSON.parse(chunk) as (typeof out)[number]),
+      });
+
+      const initialize = server.ingest(
+        JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) + "\n",
+      );
+      await Promise.race([
+        initialize,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("initialize waited on killed-job tree recovery")), 250),
+        ),
+      ]);
+      expect(out.some((message) => message.id === 1 && message.result !== undefined)).toBe(true);
+
+      // Let the background enrichment finish before cleaning up the fixture.
+      finishTreeRead(snap({ "pre.ts": " M", "new.ts": "??" }));
+      await server.ingest(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: { name: "dispatch_result", arguments: { jobId: job.id } },
+        }) + "\n",
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
   it("renders a recovered tree delta for a job killed by the restart", async () => {
     const { path, cleanup } = tempJournalPath();
     try {
