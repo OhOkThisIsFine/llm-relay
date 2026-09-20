@@ -113,10 +113,13 @@ type BrokerRequest =
       task: string;
       cwd: string;
       timeoutMs: number;
+      // Current MCP recursion depth; daemon writes depth + 1 into the spawned lane.
+      depth: number;
       tier?: string;
       readOnly?: boolean;
+      // Required when readOnly is true; the daemon cannot infer the caller's protected tree.
       callerRoot?: string;
-      host?: "native" | "bypassed" | "unknown";
+      host?: "routed" | "bypassed" | "unknown";
       entrypoint?: string;
     }
   | { action: "status"; executionId: string }
