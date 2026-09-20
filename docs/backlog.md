@@ -73,9 +73,3 @@
   returns the version and provenance from a dispatch lane).
 
 
-- **A job killed by an MCP server restart carries no tree delta (2026-09-17, low).** Since
-  2026-09-17 a completed, failed, timed-out or cancelled agent-mode job ends with a `tree delta`
-  block (`src/mcp/tree-delta.ts`). A `killed` job does not: the `git status` it started from lives
-  only in the process that died. **Property:** the running-job journal (`job-journal.ts`) keeps a
-  bounded copy of the starting status, and orphan adoption renders the delta for the killed job.
-
