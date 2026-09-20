@@ -6,9 +6,12 @@ import type { MetadataLogger } from "../log.js";
 import { buildRegistry } from "../registry.js";
 import { buildCandidates } from "../candidates.js";
 import { offloadState, setOffload } from "../offload.js";
-import { loadLaneManifest } from "../lane-manifest.js";
-import { buildDispatch, describeId, findLadderRung, lookupLadderRung, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, resolveAutoSpec, resolveLaneLauncherPath, specContextWindow, type DispatchOptions, type DispatchOutcome } from "../dispatch.js";
+import { describeId, findLadderRung, lookupLadderRung, markExhausted, clearExhausted, OUTCOME_DEFAULT_MS, resolveAutoSpec, specContextWindow, type DispatchOutcome } from "../dispatch.js";
 import { parseHostRoutingState } from "../host-routing.js";
+import {
+  buildDaemonDispatchView,
+  type DaemonDispatchOptions,
+} from "../daemon-dispatch-view.js";
 import { contextWindowResolver, type ContextWindowSource } from "../metadata.js";
 import { snapshotContextWindow } from "../tier-data.js";
 import { observedContextLimit } from "../context-limits.js";
@@ -732,11 +735,9 @@ export async function handleAdminRoutes(
     // value and falls back to "unknown" (pre-existing behaviour) for anything it cannot parse.
     const hostParam = parseHostRoutingState(pickQuery(path, "host"));
     const entrypointParam = pickQuery(path, "entrypoint");
-    const view = buildDispatch(
+    const view = buildDaemonDispatchView(
       cfg,
       {
-        // Cached manifest only — the request path never probes. Absent ⇒ nothing is evicted.
-        manifest: loadLaneManifest(),
         ...(taskParam ? { task: taskParam } : {}),
         ...(pickQuery(path, "lane") ? { lane: pickQuery(path, "lane") as string } : {}),
         ...(pickQuery(path, "after") ? { after: pickQuery(path, "after") as string } : {}),
@@ -747,27 +748,12 @@ export async function handleAdminRoutes(
         // Passed through raw and validated by `buildDispatch` (`normalizeOptions`): an unknown
         // requester or mode reads as ABSENT — the behaviour before these existed — and an unknown
         // model spec yields no lane and a reason, never a guess.
-        ...(pickQuery(path, "requester") ? { requester: pickQuery(path, "requester") as NonNullable<DispatchOptions["requester"]> } : {}),
-        ...(pickQuery(path, "mode") ? { mode: pickQuery(path, "mode") as NonNullable<DispatchOptions["mode"]> } : {}),
+        ...(pickQuery(path, "requester") ? { requester: pickQuery(path, "requester") as NonNullable<DaemonDispatchOptions["requester"]> } : {}),
+        ...(pickQuery(path, "mode") ? { mode: pickQuery(path, "mode") as NonNullable<DaemonDispatchOptions["mode"]> } : {}),
         ...(pickQuery(path, "model") ? { model: pickQuery(path, "model") as string } : {}),
-        // `cachedLimits` never fetches, so a cold cache degrades to "no window stated" rather than
-        // turning a dispatch query into a blocking upstream round-trip — same rule as the request
-        // -path context guardrail this reads the numbers from.
-        publishedContextWindow: contextWindowResolver(
-          (provider, model) => h.catalog.cachedLimits(provider, model)?.contextLength ?? null,
-          snapshotContextWindow,
-          observedContextLimit,
-        ),
       },
-      process.platform,
-      // The DAEMON'S own `/dispatch` view — the surface `mcp/server.ts` actually reaches over HTTP
-      // for a running relay (CLAUDE.md: "buildView reaches the daemon over HTTP"). Resolving the
-      // launcher path here is what makes a `routing.cliLane` transposition, and any future `cli`
-      // ladder rung an operator forgets to wrap by hand, inherit the same windowless-console
-      // protection every hand-authored agy/opencode rung already has.
-      resolveLaneLauncherPath(),
+      { catalog: h.catalog },
     );
-    view.source = "daemon";
     return ok(view, true);
   }
 
