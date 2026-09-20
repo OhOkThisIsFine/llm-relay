@@ -443,7 +443,9 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
   private prune(): void {
     if (this.maxTerminal < 0) return;
     const terminal = [...this.executions.values()]
-      .filter((execution) => execution.status !== "running")
+      // A cancelled execution is caller-terminal BEFORE its child necessarily settles. Never prune
+      // an entry while the broker still owns the handle that may need to finish/clean up.
+      .filter((execution) => execution.status !== "running" && execution.handle === null)
       .sort((a, b) => (a.endedAt ?? Number.MAX_SAFE_INTEGER) - (b.endedAt ?? Number.MAX_SAFE_INTEGER));
     const drop = terminal.length - this.maxTerminal;
     for (let i = 0; i < drop; i += 1) this.executions.delete(terminal[i]!.executionId);
