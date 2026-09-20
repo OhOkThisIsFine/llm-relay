@@ -139,6 +139,30 @@ if (mode === "transaction") {
   });
   writeFileSync(done, "done");
   waitForFile(release);
+} else if (mode === "journal-tree") {
+  const journalPath = arg(1);
+  const id = arg(2);
+  const ready = arg(3);
+  const start = arg(4);
+  const done = arg(5);
+  const release = arg(6);
+  const journal = createJobJournal(journalPath);
+  journal.note({
+    jobId: id,
+    laneId: "lane-tree",
+    cwd: process.cwd(),
+    startedAt: Date.now(),
+    label: "t".repeat(128 * 1024),
+  });
+  writeFileSync(ready, "ready");
+  waitForFile(start);
+  journal.noteStartingTree?.(
+    id,
+    { prefix: "", entries: new Map([["pre.ts", " M"]]) },
+    ["src"],
+  );
+  writeFileSync(done, "done");
+  waitForFile(release);
 } else if (mode === "hold-lock") {
   const path = arg(1);
   const ready = arg(2);
