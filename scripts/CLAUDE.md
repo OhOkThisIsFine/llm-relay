@@ -67,6 +67,13 @@ red without anyone invoking a script by hand:
   `--only` name, or any other argument, exits 2 touching nothing.
 
 Offline / unit-test-safe (no external creds):
+- `measure-lane-orphan.mjs` (Windows only; run `npm run build:server` first) — S4's real
+  process-lifetime measurement. It starts the built `llm-relay mcp` on an isolated config/port,
+  dispatches a fake CLI lane that writes once per second for 60 seconds, force-kills ONLY the MCP
+  PID with `taskkill /F` (deliberately no `/T`), then reports whether the lane survived the
+  parent, finished, and produced all 60 lines. This is a measurement harness, not a CI regression
+  test; a temporary CI invocation may be used to capture a Windows result, but do not leave the
+  one-minute measurement on the normal gate.
 - `calibrate-lane-outlier.mjs` (`node scripts/calibrate-lane-outlier.mjs [--file <dispatch-lane-stats.json>]
   [--recent 5] [--quantile 0.8] [--min-samples 5]`) — fits
   `routing.dispatchWalk.outlier.outlierFactor` (backlog item 9, 2026-09-09: a `cli` lane whose RECENT
