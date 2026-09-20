@@ -76,11 +76,18 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   the old behavior; failure 3 onward gains a 10m → 1h → 6h → 24h recovery floor, without ever
   removing the member from failover. The background recovery loop re-probes relay-invented
   `failure-escalation` cooldowns, and a 200 probe can end one early for 402/5xx.
-- **Immediate next.** M1 starts with an evidence check, not code: read one real archived
-  `agy-gemini` job and confirm the exact success-envelope key set before writing the narrow
-  `lane-envelope.ts` parser. If that archive is unavailable in the current environment, move to
-  D1's detached-lane design rather than guessing the AGY schema. Separately open: repository CI
-  enforcement, Route B's vendor blocker, owner-driven Codex/Code-tab checks, and D1/D2/D5.
+- **M1 remains evidence-blocked.** Its first required input is one raw archived AGY success
+  envelope; neither the repository nor available connected context contains one, so no parser is
+  being written from an assumed schema.
+- **D1 is now designed.** S4's Windows result rules out ordinary child detachment as sufficient.
+  The design uses a token-gated daemon-owned execution broker: the daemon resolves only configured
+  lanes and owns the process tree; the journal carries an opaque execution id so a replacement MCP
+  process can observe/collect the same run without pid adoption or persisting the task.
+  See `docs/history/mcp-restart-safe-lane-execution-design-2026-09-20.md`.
+- **Immediate next.** Implement D1 Phase 1: broker protocol + daemon execution store + admitted
+  control route, unused by MCP until the protocol/store is pinned. Separately open: repository CI
+  enforcement, Route B's vendor blocker, owner-driven Codex/Code-tab checks, D2/D5, and M1 when its
+  first-party AGY evidence becomes available.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
