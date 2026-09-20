@@ -1149,7 +1149,7 @@ export class McpDispatchServer {
   private readonly activityTags = new Map<string, string>();
   /** Last cumulative process-tree CPU reading for the current attempt of each job. */
   private readonly processCpu = new Map<string, number>();
-  /** Startup adoption work that must settle before the first request reads a killed job. */
+  /** Startup adoption work; only reads of restored terminal jobs wait for it. */
   private readonly startup: Promise<void>;
 
   constructor(private readonly deps: McpServerDeps) {
@@ -1174,7 +1174,7 @@ export class McpDispatchServer {
     this.buffer += chunk;
     const { lines, rest } = splitMessages(this.buffer);
     this.buffer = rest;
-    return this.startup.then(() => Promise.all(lines.map((line) => this.handleLine(line)))).then(() => undefined);
+    return Promise.all(lines.map((line) => this.handleLine(line))).then(() => undefined);
   }
 
   /**
@@ -1319,8 +1319,13 @@ export class McpDispatchServer {
       case "dispatch":
         return this.toolDispatch(args, ctx);
       case "dispatch_status":
+        // A restarted process may still be enriching killed jobs with their adoption-time tree
+        // delta. Status/result are the only surfaces that need that fidelity; never make MCP
+        // initialization, tool discovery, cancellation or a fresh dispatch wait on git.
+        await this.startup;
         return this.toolStatus(args);
       case "dispatch_result":
+        await this.startup;
         return this.toolResult(args);
       case "dispatch_cancel":
         return this.toolCancel(args);
