@@ -354,9 +354,9 @@ export function parseRouting(
   if (Object.keys(pools).length > 0) routing.pools = pools;
   if (Object.keys(poolPolicies).length > 0) routing.poolPolicies = poolPolicies;
   if (Object.keys(subagents).length > 0) routing.subagents = subagents;
-  const ladder = parseLadder(r.ladder, "config.routing.ladder");
+  const ladder = parseLadder(r.ladder, "config.routing.ladder", warnings);
   if (ladder.length > 0) routing.ladder = ladder;
-  const ladders = parseLadders(r.ladders);
+  const ladders = parseLadders(r.ladders, warnings);
   if (Object.keys(ladders).length > 0) routing.ladders = ladders;
   const cliLane = parseCliLane(r.cliLane, "config.routing.cliLane");
   if (cliLane) routing.cliLane = cliLane;
@@ -1128,17 +1128,20 @@ function applyCliMaxConcurrent(rung: LadderRung, raw: unknown, where: string, id
 }
 
 /**
- * Validate and apply a rung's `capability` — the highest dispatch tier it may take. Mutating, for
- * the same reason as `applyCliMaxConcurrent`: `parseLadder` stays one statement longer and no more
- * complex. An unknown tier is a hard load error naming the key and the rung: an ignored typo would
- * read as a limit while limiting nothing.
+ * Accept the legacy rung `capability` key only for compatibility, but give it no routing effect.
+ *
+ * Capability is derived from the synced model snapshot in dispatch.ts. Silently accepting the old
+ * key would make an operator believe it still controls routing, so a valid legacy value warns; a
+ * typo remains a hard load error just as before.
  */
-function applyRungCapability(rung: LadderRung, raw: unknown, where: string, id: string): void {
+function ignoreRungCapability(raw: unknown, where: string, id: string, warnings: string[]): void {
   if (raw === undefined) return;
   if (typeof raw !== "string" || !EFFORT_LEVEL_SET.has(raw)) {
     throw new Error(`${where}.capability must be one of ${EFFORT_LEVELS.join(", ")} (rung "${id}")`);
   }
-  rung.capability = raw as EffortLevel;
+  warnings.push(
+    `${where}.capability "${raw}" has no effect — lane capability is derived from synced capability data`,
+  );
 }
 
 /**
@@ -1146,7 +1149,7 @@ function applyRungCapability(rung: LadderRung, raw: unknown, where: string, id: 
  * is a configuration mistake, and discovering it only when the host is mid-fallback is exactly
  * when it is least useful. Absent/empty is legal and simply means "no opinion".
  */
-function parseLadder(raw: unknown, root: string): LadderRung[] {
+function parseLadder(raw: unknown, root: string, warnings: string[] = []): LadderRung[] {
   if (raw === undefined || raw === null) return [];
   if (!Array.isArray(raw)) throw new Error(`${root} must be an array of rungs`);
 
@@ -1170,7 +1173,7 @@ function parseLadder(raw: unknown, root: string): LadderRung[] {
     const rung: LadderRung = { id, kind, enabled: e.enabled !== false };
     if (typeof e.quota === "string" && e.quota.length > 0) rung.quota = e.quota;
     if (typeof e.note === "string" && e.note.length > 0) rung.note = e.note;
-    applyRungCapability(rung, e.capability, where, id);
+    ignoreRungCapability(e.capability, where, id, warnings);
 
     if (kind === "cli") {
       if (typeof e.command !== "string" || e.command.length === 0) {
@@ -1207,13 +1210,13 @@ function parseLadder(raw: unknown, root: string): LadderRung[] {
  * parses to zero rungs is a hard error, because a key that resolves to nothing was clearly meant
  * to name something.
  */
-function parseLadders(raw: unknown): Record<string, LadderRung[]> {
+function parseLadders(raw: unknown, warnings: string[] = []): Record<string, LadderRung[]> {
   if (raw !== undefined && (typeof raw !== "object" || raw === null || Array.isArray(raw))) {
     throw new Error(`config.routing.ladders must be an object of named ladder arrays`);
   }
   const ladders: Record<string, LadderRung[]> = {};
   for (const [tier, rawLadder] of Object.entries((raw ?? {}) as Record<string, unknown>)) {
-    const parsed = parseLadder(rawLadder, `config.routing.ladders.${tier}`);
+    const parsed = parseLadder(rawLadder, `config.routing.ladders.${tier}`, warnings);
     if (parsed.length === 0) throw new Error(`config.routing.ladders.${tier} must contain at least one rung`);
     ladders[tier] = parsed;
   }
