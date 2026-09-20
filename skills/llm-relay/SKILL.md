@@ -90,7 +90,7 @@ Claude Code workflows and subagents can delegate tasks to llm-relay lanes via th
 - While it polls a running job, `walk-verdict` is authoritative. `keep-running` and
   `no-idle-stop` mean continue polling; `unavailable` means another MCP process owns the job, so
   continue polling rather than infer. Do not infer liveness from elapsed time, output silence,
-  historical duration, or `last-activity` diagnostics.
+  historical duration, or activity diagnostics such as `last-activity-at-check`.
 - The Claude relay wrapper defaults to the cheap `haiku` alias so polling does not spend the
   calling session's expensive model. `llm-relay setup --relay-model <alias>` changes that
   installed default, and a single Agent/`agent()` call may still override `model`.
