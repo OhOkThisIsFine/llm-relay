@@ -208,6 +208,51 @@ describe("cross-process MCP persistence", () => {
     }
   });
 
+  it("preserves a starting-tree snapshot when another process updates the shared journal", async () => {
+    const { dir, cleanup } = tempDir();
+    const workers: Worker[] = [];
+    try {
+      const journalPath = join(dir, "mcp-jobs.json");
+      const start = join(dir, "start");
+      const release = join(dir, "release");
+      const treeReady = join(dir, "tree-ready");
+      const updateReady = join(dir, "update-ready");
+      const treeDone = join(dir, "tree-done");
+      const updateDone = join(dir, "update-done");
+
+      workers.push(
+        spawnWorker(["journal-tree", journalPath, "job-tree", treeReady, start, treeDone, release]),
+        spawnWorker(["journal-update", journalPath, "job-other", updateReady, start, updateDone, release]),
+      );
+
+      await waitForFiles([treeReady, updateReady], workers);
+      writeFileSync(start, "go");
+      await waitForFiles([treeDone, updateDone], workers);
+
+      const stored = JSON.parse(readFileSync(journalPath, "utf8")) as {
+        jobs: Array<{
+          jobId: string;
+          laneId: string;
+          startingTree?: { prefix: string; entries: [string, string][]; scope?: string[] };
+        }>;
+      };
+      expect(new Set(stored.jobs.map((row) => row.jobId))).toEqual(new Set(["job-tree", "job-other"]));
+      const treeRow = stored.jobs.find((row) => row.jobId === "job-tree");
+      expect(treeRow?.startingTree).toEqual({
+        prefix: "",
+        entries: [["pre.ts", " M"]],
+        scope: ["src"],
+      });
+      expect(stored.jobs.find((row) => row.jobId === "job-other")?.laneId).toBe("lane-after-update");
+
+      writeFileSync(release, "done");
+      await Promise.all(workers.map(waitForExit));
+    } finally {
+      stopWorkers(workers);
+      cleanup();
+    }
+  });
+
   it("never steals a live lock and recovers the same lock after its owner dies", async () => {
     const { dir, cleanup } = tempDir();
     const workers: Worker[] = [];
