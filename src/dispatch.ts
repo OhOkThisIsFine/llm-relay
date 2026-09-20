@@ -1,12 +1,14 @@
 import { existsSync } from "node:fs";
 import { AUTO_MODEL, expandPoolSpecs, offloadRule, splitSpec, POOL_PREFIX } from "./config.js";
-import type { Config, LadderRung } from "./config-types.js";
+import { EFFORT_LEVELS, type Config, type EffortLevel, type LadderRung } from "./config-types.js";
+import { getStrength, strengthAllowedForEffort } from "./benchmarks.js";
 import type { HostRoutingState } from "./host-routing.js";
 import type { ContextWindowSource, ResolvedContextWindow } from "./metadata.js";
 import { unsupportedArgValues, verifyModel, type LaneManifest } from "./lane-manifest.js";
 import { allLaneStats, DISPATCH_MODES, laneStatsFor, medianWallClockMs, p95WallClockMs, quantileWallClockMs, type DispatchMode, type LaneStats } from "./dispatch-lane-stats.js";
 import { laneDemotion, lanePin, type LaneAffinityRow } from "./lane-affinity.js";
 import { relayStatePath } from "./state-paths.js";
+import type { TierData } from "./tier-data.js";
 
 /**
  * The dispatch ladder: which LANE a host agent should hand a delegated task to, in what order,
@@ -122,8 +124,10 @@ export interface DispatchLane {
    * that count itself alongside this figure rather than this module inventing one.
    */
   maxConcurrent?: number | null;
-  /** The highest dispatch tier the rung may take (`LadderRung.capability`); absent = no limit. */
-  capability?: LadderRung["capability"];
+  /** Highest dispatch tier supported by synced capability evidence; absent means unknown/no limit. */
+  capability?: EffortLevel;
+  /** Why capability is known, or "unknown" when no evidence-qualified limit can be stated. */
+  capabilityBasis?: "snapshot" | "pool-band" | "unknown";
   /** When an exhausted rung becomes eligible again (ISO 8601). */
   readyAt?: string;
   /**
@@ -304,6 +308,12 @@ export interface DispatchOptions {
    * rung is UNKNOWN and nothing is evicted.
    */
   manifest?: LaneManifest | null;
+  /**
+   * Synced capability snapshot used to derive lane capability. Undefined loads the memoized
+   * repository snapshot through getStrength(); null deliberately means "no snapshot" for tests and
+   * embedders. A missing/unmatched model is UNKNOWN and therefore imposes no dispatch ceiling.
+   */
+  tierData?: TierData | null;
   /** Host override: return THIS lane as `next`, whatever the order says. */
   lane?: string;
   /** Walk the ladder: pick the first ready rung strictly after this one. */
@@ -1018,9 +1028,62 @@ function unreachableReason(host: HostRoutingState | undefined, who: string): str
     : `${who} does not route its traffic through this relay, so a subagent cannot reach`;
 }
 
-/** The rung's `capability` as a spreadable field — no key at all when the rung declares none. */
-function rungCapability(rung: LadderRung): Pick<DispatchLane, "capability"> {
-  return rung.capability === undefined ? {} : { capability: rung.capability };
+export type CapabilityBasis = "snapshot" | "pool-band" | "unknown";
+
+export interface DerivedLaneCapability {
+  tier: EffortLevel | null;
+  basis: CapabilityBasis;
+  /** Routing/model identifier whose evidence was consulted, when one exists. */
+  model: string | null;
+}
+
+/**
+ * Derive a lane's capability from synced model evidence, never from a hand-authored rung field.
+ *
+ * Dynamic pool rungs use their policy's declared effort band: the band is the pool's requested
+ * capability contract and stays stable even when availability appends a lower-band degradation
+ * tail. Direct relay specs and CLI --model values use the highest evidence-qualified effort band.
+ * Unknown, fuzzy, or under-evidenced models impose NO ceiling — unknown is never treated as weak.
+ */
+export function derivedCapability(
+  rung: LadderRung,
+  cfg: Config,
+  tierData?: TierData | null,
+): DerivedLaneCapability {
+  const relaySpec = rung.kind === "relay" ? rung.spec ?? null : null;
+  if (relaySpec?.startsWith(`${POOL_PREFIX}/`)) {
+    const pool = relaySpec.slice(POOL_PREFIX.length + 1);
+    const effort = cfg.routing.poolPolicies?.[pool]?.effort;
+    return effort === undefined
+      ? { tier: null, basis: "unknown", model: relaySpec }
+      : { tier: effort, basis: "pool-band", model: relaySpec };
+  }
+
+  const model = rung.kind === "relay" ? relaySpec : rungModel(rung);
+  if (model === null || model.startsWith(`${POOL_PREFIX}/`)) {
+    return { tier: null, basis: "unknown", model };
+  }
+
+  const strength = getStrength(model, tierData);
+  for (let i = EFFORT_LEVELS.length - 1; i >= 0; i -= 1) {
+    const effort = EFFORT_LEVELS[i] as EffortLevel;
+    if (strengthAllowedForEffort(strength, effort)) {
+      return { tier: effort, basis: "snapshot", model };
+    }
+  }
+  return { tier: null, basis: "unknown", model };
+}
+
+function rungCapability(
+  rung: LadderRung,
+  cfg: Config,
+  tierData?: TierData | null,
+): Pick<DispatchLane, "capability" | "capabilityBasis"> {
+  const derived = derivedCapability(rung, cfg, tierData);
+  return {
+    capabilityBasis: derived.basis,
+    ...(derived.tier === null ? {} : { capability: derived.tier }),
+  };
 }
 
 function toLane(
@@ -1038,7 +1101,13 @@ function toLane(
   const until = cooldownUntil(cfg, rung, now);
   const state: LaneState = !rung.enabled ? "disabled" : until !== null ? "exhausted" : "ready";
 
-  const lane: DispatchLane = { id: rung.id, kind: rung.kind, position, state, ...rungCapability(rung) };
+  const lane: DispatchLane = {
+    id: rung.id,
+    kind: rung.kind,
+    position,
+    state,
+    ...rungCapability(rung, cfg, opts.tierData),
+  };
   if (rung.quota) lane.quota = rung.quota;
   if (rung.note) lane.note = rung.note;
   if (until !== null) lane.readyAt = new Date(until).toISOString();
