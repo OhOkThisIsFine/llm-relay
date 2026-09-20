@@ -1346,10 +1346,10 @@ export class LaneJobStore {
       // Nothing of ours ran for this job. Reported rather than omitted, so "no owned process" and
       // "we forgot to look" cannot read the same way.
       job.process = { pids, survivors: [], terminated: false };
-      // Archive BEFORE clearing the running row. A crash between the two then leaves both records,
-      // and restore already gives the terminal archive precedence; the old order could leave neither.
-      this.archive.record(job);
-      this.journal.clear(id);
+      // Archive BEFORE clearing the running row, and clear ONLY after the archive confirms its
+      // atomic write committed. If persistence is temporarily unavailable, the journal row is the
+      // weaker fallback: a restart may call the job killed, but it cannot lose the handle entirely.
+      if (this.archive.record(job)) this.journal.clear(id);
       return;
     }
     try {
@@ -1360,9 +1360,9 @@ export class LaneJobStore {
     job.process = { pids, survivors: pids.filter((pid) => this.isAlive(pid)), terminated: true };
     // ⚠ After the process report, so what is archived is the whole terminal record — and eagerly,
     // because the restart this guards against runs no shutdown handler (job-archive.ts).
-    // Archive before clearing for the same crash-consistency reason as the no-process branch above.
-    this.archive.record(job);
-    this.journal.clear(id);
+    // A failed archive commit deliberately leaves the journal row in place; losing fidelity on
+    // restart ("killed" instead of this terminal status) is preferable to losing the job entirely.
+    if (this.archive.record(job)) this.journal.clear(id);
   }
 
 
@@ -1465,7 +1465,11 @@ export class LaneJobStore {
     const job = this.jobs.get(id);
     if (!job) return;
     job.treeDelta = text;
-    if (job.status !== "running") this.archive.record(job);
+    if (job.status !== "running" && this.archive.record(job)) {
+      // This is also an opportunistic retry of a terminal archive write that may have failed in
+      // reap(). Once the richer row commits, the running-journal fallback is no longer needed.
+      this.journal.clear(id);
+    }
   }
 
   /** Publish the walk's liveness decision for the attempt now running. Pure status data only. */
