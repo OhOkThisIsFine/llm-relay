@@ -1080,6 +1080,13 @@ function laneSummary(lane: DispatchLane, inFlight: number): string {
   if (lane.notServable) bits.push(`not servable: ${lane.notServable}`);
   if (lane.unreachable) bits.push(`unreachable: ${lane.unreachable}`);
   if (lane.note) bits.push(lane.note);
+  if (lane.capabilityBasis !== undefined) {
+    bits.push(
+      lane.capability === undefined
+        ? "capability: unknown (no evidence-qualified limit)"
+        : `capability: ${lane.capability} (${lane.capabilityBasis})`,
+    );
+  }
   // The routing memory from previous walks, on the lane rather than only in the selection reason —
   // an operator reading `dispatch_lanes` to understand an unexpected order needs to see it here.
   bits.push(...laneEvidenceBits(lane));
@@ -1917,7 +1924,9 @@ export class McpDispatchServer {
       spec: lane.spec,
       status: SKIPPED_LANE_STATUS,
       elapsedMs: 0,
-      reason: `lane "${lane.id}" declares capability ${lane.capability}, below this ${opts.tier} dispatch`,
+      reason:
+        `lane "${lane.id}" has derived capability ${lane.capability}` +
+        `${lane.capabilityBasis ? ` (${lane.capabilityBasis})` : ""}, below this ${opts.tier} dispatch`,
     });
     this.jobs.noteSkippedLane(jobId);
     return true;

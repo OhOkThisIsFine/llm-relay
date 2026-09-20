@@ -65,11 +65,11 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   [docs/history/stabilization-plan-2026-09-17.md](docs/history/stabilization-plan-2026-09-17.md) splits every open
   backlog entry, the stated residues and the findings of a live survey into packets for cheap
   models, in waves. Start with packet W0-1: the package ceiling has room for two more entries.
-- **Owner correction (2026-09-17 closeout): do NOT hand-set a rung's `capability`.** The value
-  must come from the synced capability data (`docs/tier-data.json`), which the v0.84.0 design
-  does not do. Design item D6 of the plan above replaces it. Also decided: `POST /reload` is
-  approved for design (D2), growing cooldowns for repeated 5xx and 402 are approved (packet S5),
-  and operator-declared prices are declined (D4).
+- **Lane capability now comes from synced capability data, never a hand-set rung value.**
+  Direct/CLI models use evidence-qualified `getStrength` bands; dynamic pool rungs use their
+  declared effort band; unknown or under-evidenced models impose no limit. A legacy `capability`
+  key loads with a no-effect warning. `POST /reload` remains approved for design (D2), growing
+  cooldowns for repeated 5xx and 402 remain packet S5, and operator-declared prices are declined (D4).
 - **Immediate next.** After the owner restarts Claude Desktop: run a Code tab
   dispatch of a pool task that takes more than 60 s, and confirm it answers in one call and that a
   running status reports `walk-verdict: keep-running` with relay activity as its basis rather than

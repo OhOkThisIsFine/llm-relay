@@ -25,13 +25,6 @@
   **Property:** the default branch requires the CI gate before changes can land, through branch
   protection or a repository ruleset.
 
-- **A lane's `capability` is a hand-set config value, but it must come from the synced capability
-  data (owner correction, 2026-09-17, high).** `applyRungCapability` (`src/config/routing-parser.ts`)
-  reads it from config; nothing derives it from `docs/tier-data.json`. **Property:** `buildDispatch`
-  derives each lane's capability from the lane's model through `getStrength` and
-  `strengthAllowedForEffort` (a pool rung takes its pool's band), states the basis, and treats an
-  unmatched model as unknown (no limit). Design: item D6 of `history/stabilization-plan-2026-09-17.md`.
-
 - **The stabilization plan holds work that has no entry here (2026-09-17).** Packet S5,
   M1 and R1, operator tasks O2 to O5, and design items D1, D2 and D5 of
   `history/stabilization-plan-2026-09-17.md`. **Property:** each of those packets is shipped, or the owner
