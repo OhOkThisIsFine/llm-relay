@@ -314,7 +314,7 @@ describe("install-skill postinstall hook", () => {
       expect(r.status).toBe(0);
       const content = readFileSync(paths.relayAgent, "utf8");
       expect(content).toContain('name = "relay"');
-      expect(content).toContain("# llm-relay:codex-relay-agent v3");
+      expect(content).toContain("# llm-relay:codex-relay-agent v4");
       // v2 (2026-09-10): the description no longer calls the pools free, because paid DeepSeek
       // leads them (owner decision: correct every text that calls that lane free).
       expect(content).not.toMatch(/free model pools/i);
@@ -329,6 +329,11 @@ describe("install-skill postinstall hook", () => {
       expect(content).toContain(RELAY_DISPATCH_UNAVAILABLE_TOKEN);
       expect(content).toContain(RELAY_DISPATCH_FAILED_TOKEN);
       expect(content).toMatch(/still running/i);
+      expect(content).toContain("walk-verdict");
+      expect(content).toContain("keep-running");
+      expect(content).toContain("no-idle-stop");
+      expect(content).toContain("unavailable");
+      expect(content).toMatch(/never infer liveness from elapsed time, output silence, historical duration/i);
       // The whole point: no line pins a model or provider for this agent.
       const lines = content.split("\n").map((l) => l.trim());
       expect(lines.some((l) => l.startsWith("model ="))).toBe(false);
@@ -382,7 +387,7 @@ describe("install-skill postinstall hook", () => {
 
       expect(r.status).toBe(0);
       const afterContent = readFileSync(paths.relayAgent, "utf8");
-      expect(afterContent).toContain("# llm-relay:codex-relay-agent v3");
+      expect(afterContent).toContain("# llm-relay:codex-relay-agent v4");
       expect(afterContent).not.toContain("codex-relay-agent v0");
       expect(afterContent).not.toContain("old rule text");
       expect(r.stderr).toContain(`Codex relay agent updated at ${paths.relayAgent}`);
