@@ -232,7 +232,10 @@ export const MCP_INSTRUCTIONS =
   "Call dispatch instead. If this MCP server is unavailable, run `llm-relay dispatch " +
   "--next-command -t <task>` and follow its returned command or target; do not guess from the host.\n\n" +
   "Let dispatch choose the lane. If a lane stops showing activity, dispatch moves to the next one " +
-  "itself and prefers the lane that answered on your next call. Follow the advice at the end of a " +
+  "itself and prefers the lane that answered on your next call. For a running job, follow " +
+  "`walk-verdict`: `keep-running` means continue polling, and `no-idle-stop` means the walk will " +
+  "not stop this attempt for idleness. Do not infer liveness from elapsed time, output silence, " +
+  "historical duration, or last-activity diagnostics. Follow the advice at the end of a " +
   "reply: when it says a lane was stopped while it was still working, dispatch again with that " +
   "lane named so it can finish; when it says every lane ran and failed, do the work here — " +
   "re-dispatching the same task picks the same lanes. To run one specific model instead of the " +
@@ -369,8 +372,10 @@ const TOOLS: ToolDefinition[] = [
     name: "dispatch_status",
     title: "Check a dispatched job",
     description:
-      "Report a dispatched job. While it runs: its lane, elapsed time and output so far. Once it " +
-      "has ended: its full answer, exactly as dispatch_result returns it. Wait at least a few " +
+      "Report a dispatched job. While it runs, `walk-verdict` is the authoritative liveness " +
+      "decision: keep-running means continue polling; no-idle-stop means this attempt is exempt " +
+      "from idle stopping. Elapsed time, output silence, historical duration and last-activity are " +
+      "diagnostics only. Once it has ended: its full answer, exactly as dispatch_result returns it. Wait at least a few " +
       "seconds between polls. Without jobId: list the recent jobs of every llm-relay MCP server " +
       "on this machine, so a lost jobId can be found again.",
     inputSchema: {
@@ -601,6 +606,32 @@ function relayProvenanceLines(job: LaneJob): string[] {
   return lines;
 }
 
+function describeLiveness(job: LaneJob, now: number): string[] {
+  if (job.status !== "running") return [];
+  const liveness = job.liveness;
+  // A status call can race the walk between job creation and the first attempt entering runOneLane.
+  // That brief pre-attempt state is still a keep decision; importantly, this renderer NEVER probes.
+  if (liveness === undefined) {
+    return ["activity: starting", "walk-verdict: keep-running", "activity-checked: pending"];
+  }
+  const checkedAgo = Math.max(0, Math.round((now - liveness.checkedAt) / 1000));
+  const lines = [
+    `activity: ${liveness.activity}`,
+    `walk-verdict: ${liveness.verdict}`,
+    `activity-checked: ${checkedAgo}s ago`,
+  ];
+  if (liveness.source !== undefined) lines.push(`activity-basis: ${liveness.source}`);
+  if (liveness.lastActivityAt !== null) {
+    const activityAgo = Math.max(0, Math.round((now - liveness.lastActivityAt) / 1000));
+    lines.push(`last-activity: ${activityAgo}s ago`);
+    if (liveness.verdict === "keep-running" && liveness.idleMs !== null) {
+      const remaining = Math.max(0, liveness.idleMs - (now - liveness.lastActivityAt));
+      lines.push(`idle-stop-in: ${Math.ceil(remaining / 1000)}s`);
+    }
+  }
+  return lines;
+}
+
 function describeJob(job: LaneJob, now: number): string {
   const elapsed = Math.round(((job.endedAt ?? now) - job.startedAt) / 1000);
   const head = [
@@ -621,10 +652,7 @@ function describeJob(job: LaneJob, now: number): string {
   }
   if (job.readOnly) head.push(`read-only: ${job.readOnly.binding}`);
   if (job.launch?.length) head.push(`launch: ${job.launch.join("; ")}`);
-  if (job.status === "running" && job.lastActive) {
-    const ago = Math.max(0, Math.round((now - job.lastActive.at) / 1000));
-    head.push(`last activity: ${ago}s ago (${job.lastActive.source})`);
-  }
+  head.push(...describeLiveness(job, now));
   // While it runs: the lane's usual time to answer, from its own completed runs, so a caller can tell
   // a slow lane from a stuck one instead of giving up (`LaneJob.expected`).
   const usually = runningTimeToAnswer(job);
@@ -1336,7 +1364,7 @@ export class McpDispatchServer {
     const walk = this.deps.config.routing?.dispatchWalk;
     const rule =
       walk?.enabled === true
-        ? `\nwalk: a lane is stopped after ${Math.round(walk.idleMs / 1000)}s with no activity (relay traffic, output or file change); the last lane is never stopped`
+        ? `\nwalk: a lane is stopped after ${Math.round(walk.idleMs / 1000)}s with no activity (relay traffic, output, owned process CPU or file change); the last lane is never stopped`
         : "\nwalk: off — only the first lane runs";
     return textResult(`tier: ${view.tier ?? "default"}${rule}\n\n${lines.join("\n")}${next}`);
   }
@@ -1396,10 +1424,13 @@ export class McpDispatchServer {
         `lane: ${elsewhere.laneId}${elsewhere.spec ? ` (${elsewhere.spec})` : ""}`,
         "status: running",
         `elapsed: ${elapsed}s`,
+        "activity: unavailable",
+        "walk-verdict: unavailable",
         `record: running in another llm-relay MCP server process (pid ${elsewhere.pid})`,
       ].join("\n") +
-        "\n\nThis process cannot report its progress or cancel it. Poll again: its answer appears " +
-        "here once it ends.",
+        "\n\nThis process cannot observe that process's live activity or cancel it. " +
+        "`walk-verdict: unavailable` means keep polling rather than infer from elapsed time or silence; " +
+        "its answer appears here once it ends.",
     );
   }
 
@@ -1866,15 +1897,15 @@ export class McpDispatchServer {
   private async latestActivity(jobId: string): Promise<{ at: number; source: string } | null> {
     const now = this.now();
     const seen: Array<{ at: number | null | undefined; source: string }> = [
-      { at: this.jobs.get(jobId)?.activity?.lastOutputAt, source: "lane output" },
+      { at: this.jobs.get(jobId)?.activity?.lastOutputAt, source: "lane-output" },
     ];
     const tag = this.activityTags.get(jobId);
     if (tag !== undefined && this.deps.readLaneActivity !== undefined) {
       const traffic = await this.deps.readLaneActivity(tag).catch(() => null);
       seen.push(
         traffic !== null && traffic.inFlight > 0
-          ? { at: now, source: "a request in flight at the relay" }
-          : { at: traffic?.lastActivityAt, source: "relay traffic" },
+          ? { at: now, source: "relay-in-flight" }
+          : { at: traffic?.lastActivityAt, source: "relay-traffic" },
       );
     }
     const early = newestActivity(seen);
@@ -1891,7 +1922,7 @@ export class McpDispatchServer {
         const previous = this.processCpu.get(jobId);
         this.processCpu.set(jobId, cpuMs);
         if (previous !== undefined && cpuMs - previous >= PROCESS_CPU_ACTIVITY_MS) {
-          seen.push({ at: this.now(), source: "process CPU time" });
+          seen.push({ at: this.now(), source: "process-cpu" });
         }
       }
     }
@@ -1909,8 +1940,8 @@ export class McpDispatchServer {
       if (previous !== undefined) {
         seen.push(
           sameTree(previous, reading)
-            ? { at: newestChangeMs(tree.cwd, reading), source: "a file change" }
-            : { at: now, source: "a working tree change" },
+            ? { at: newestChangeMs(tree.cwd, reading), source: "file-change" }
+            : { at: now, source: "working-tree" },
         );
       }
     }
@@ -1990,7 +2021,23 @@ export class McpDispatchServer {
         semanticFailure: e.message,
       }),
     );
-    if (idleMs === null) return guarded;
+    if (idleMs === null) {
+      this.jobs.noteLiveness(jobId, {
+        activity: "unmonitored",
+        verdict: "no-idle-stop",
+        checkedAt: attemptStart,
+        lastActivityAt: null,
+        idleMs: null,
+      });
+      return guarded;
+    }
+    this.jobs.noteLiveness(jobId, {
+      activity: "starting",
+      verdict: "keep-running",
+      checkedAt: attemptStart,
+      lastActivityAt: attemptStart,
+      idleMs,
+    });
 
     // Keep the settled value beside the race. An activity probe is asynchronous (daemon traffic
     // and git status), so the lane can finish while `latestActivity()` is still in flight. Without
@@ -2004,6 +2051,7 @@ export class McpDispatchServer {
     });
     // The lane counts as active at its start, so a lane is never stopped before `idleMs` has passed.
     let lastActive = attemptStart;
+    let lastSource: string | undefined;
     for (;;) {
       const raced = await Promise.race([settled, pollTimer(Math.min(IDLE_POLL_MS, idleMs))]);
       if (raced.kind === "settled") return raced.outcome;
@@ -2017,11 +2065,22 @@ export class McpDispatchServer {
       if (afterProbe.kind === "settled") return afterProbe.outcome;
       if (settledOutcome !== null) return settledOutcome;
       if (this.jobs.get(jobId)?.status !== "running") break;
-      if (seen !== null && seen.at > lastActive) {
+      const fresh = seen !== null && seen.at > lastActive;
+      if (fresh && seen !== null) {
         lastActive = seen.at;
-        this.jobs.noteLastActivity(jobId, seen.at, seen.source);
+        lastSource = seen.source;
       }
-      if (this.now() - lastActive >= idleMs) break;
+      const checkedAt = this.now();
+      const idle = checkedAt - lastActive >= idleMs;
+      this.jobs.noteLiveness(jobId, {
+        activity: idle ? "idle" : fresh ? "active" : "quiet",
+        verdict: idle ? "stop-idle" : "keep-running",
+        checkedAt,
+        lastActivityAt: lastActive,
+        ...(lastSource === undefined ? {} : { source: lastSource }),
+        idleMs,
+      });
+      if (idle) break;
     }
 
     // The lane was idle for `idleMs` and another lane remains. Kill this one and move on. `guarded`
