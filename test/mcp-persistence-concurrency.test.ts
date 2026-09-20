@@ -296,7 +296,10 @@ describe("cross-process MCP persistence", () => {
       foreignRows: () => [],
     };
     const archive: JobArchive = {
-      record: () => calls.push("archive"),
+      record: () => {
+        calls.push("archive");
+        return true;
+      },
       restore: () => ({ jobs: [], lastSeq: 0 }),
       flush: () => {},
       lookup: () => undefined,
@@ -308,5 +311,64 @@ describe("cross-process MCP persistence", () => {
 
     store.complete(job.id, { code: 0, stdout: "done", stderr: "", timedOut: false });
     expect(calls).toEqual(["archive", "clear"]);
+  });
+
+  it("keeps the running journal row when the terminal archive commit fails", () => {
+    const calls: string[] = [];
+    const journal: JobJournal = {
+      note: () => calls.push("note"),
+      clear: () => calls.push("clear"),
+      orphans: () => [],
+      foreign: () => undefined,
+      foreignRows: () => [],
+    };
+    const archive: JobArchive = {
+      record: () => {
+        calls.push("archive-failed");
+        return false;
+      },
+      restore: () => ({ jobs: [], lastSeq: 0 }),
+      flush: () => {},
+      lookup: () => undefined,
+      all: () => [],
+    };
+    const store = new LaneJobStore(journal, archive, () => "job-retained");
+    const job = store.create("lane", undefined, "C:/tree");
+    calls.length = 0;
+
+    store.complete(job.id, { code: 0, stdout: "done", stderr: "", timedOut: false });
+    expect(calls).toEqual(["archive-failed"]);
+  });
+
+  it("clears a retained journal fallback after a later terminal archive retry succeeds", () => {
+    const calls: string[] = [];
+    let archiveAttempts = 0;
+    const journal: JobJournal = {
+      note: () => calls.push("note"),
+      clear: () => calls.push("clear"),
+      orphans: () => [],
+      foreign: () => undefined,
+      foreignRows: () => [],
+    };
+    const archive: JobArchive = {
+      record: () => {
+        archiveAttempts += 1;
+        calls.push(`archive-${archiveAttempts}`);
+        return archiveAttempts > 1;
+      },
+      restore: () => ({ jobs: [], lastSeq: 0 }),
+      flush: () => {},
+      lookup: () => undefined,
+      all: () => [],
+    };
+    const store = new LaneJobStore(journal, archive, () => "job-retry");
+    const job = store.create("lane", undefined, "C:/tree");
+    calls.length = 0;
+
+    store.complete(job.id, { code: 0, stdout: "done", stderr: "", timedOut: false });
+    expect(calls).toEqual(["archive-1"]);
+
+    store.noteTreeDelta(job.id, "tree delta: clean");
+    expect(calls).toEqual(["archive-1", "archive-2", "clear"]);
   });
 });

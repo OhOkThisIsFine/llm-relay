@@ -63,8 +63,15 @@ export function jobArchivePath(env: NodeJS.ProcessEnv = process.env): string {
 
 /** The archive seam. Injected so the suite proves the restart path against a temp file. */
 export interface JobArchive {
-  /** Persist a job that has reached a terminal state. Written at once. */
-  record(job: LaneJob): void;
+  /**
+   * Persist a job that has reached a terminal state. Written at once.
+   *
+   * Returns true when the terminal row is durably committed. Callers that also remove a running
+   * journal row use this as the commit point: a failed archive write must leave the journal as the
+   * weaker-but-recoverable fallback instead of making the job disappear from both stores.
+   * Running jobs are a successful no-op.
+   */
+  record(job: LaneJob): boolean;
   /** What a previous process left; lastSeq is legacy v1 compatibility only. */
   restore(): { jobs: ArchivedJob[]; lastSeq: number };
   /** Run any pending debounced write now — the shutdown seam. */
@@ -80,7 +87,8 @@ export interface JobArchive {
 
 /** An archive that keeps nothing. The default for an embedder that declines one. */
 export const nullJobArchive: JobArchive = {
-  record: () => {},
+  // An embedder that chooses the null archive has explicitly declined terminal persistence.
+  record: () => true,
   restore: () => ({ jobs: [], lastSeq: 0 }),
   flush: () => {},
   lookup: () => undefined,
@@ -143,7 +151,7 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
    * here overlays disk, so an older archive instance cannot overwrite a fresher same-id row merely
    * because it later records some unrelated job. Lock acquisition defines same-id last-write-wins.
    */
-  const write = (row: ArchivedJob): void => {
+  const write = (row: ArchivedJob): boolean => {
     const transaction: { committed: JobArchiveFile | null } = { committed: null };
     try {
       const ok = transactionalUpdateJsonSync<JobArchiveFile>(
@@ -168,14 +176,16 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
         { validator: isJobArchiveFile, strict: true },
       );
       const committed = transaction.committed;
-      if (!ok || committed === null) return;
+      if (!ok || committed === null) return false;
 
       lastSeq = committed.lastSeq;
       rows.clear();
       for (const saved of committed.jobs) rows.set(saved.id, saved);
+      return true;
     } catch {
-      // Best-effort: a full disk or unusable lock must not become a dispatch failure. The report
-      // still exists in memory for as long as this process lives, exactly as before the archive.
+      // Best-effort: a full disk or unusable lock must not become a dispatch failure. Returning
+      // false lets LaneJobStore keep the running journal row as a weaker durable fallback.
+      return false;
     }
   };
 
@@ -183,12 +193,13 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
   return {
     record(job) {
       readOnce();
-      if (job.status === "running" || job.endedAt === undefined) return;
+      if (job.status === "running" || job.endedAt === undefined) return true;
       const archived = boundOutput(job as ArchivedJob);
       rows.set(job.id, archived);
       // ⚠ Eager, see the module header: the case this exists for is a process killed with no
-      // handler, where a delayed write is a lost report.
-      write(archived);
+      // handler, where a delayed write is a lost report. The boolean is the semantic commit point
+      // used by LaneJobStore before it clears the running journal row.
+      return write(archived);
     },
     restore() {
       readOnce();
