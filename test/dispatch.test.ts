@@ -12,8 +12,11 @@ import {
   clearExhausted,
   MAX_EXHAUSTED_MS,
   normalizeCliCommand,
+  derivedCapability,
 } from "../src/dispatch.js";
 import { parseTelemetryReport, recordLaneRun } from "../src/dispatch-lane-stats.js";
+import type { LadderRung } from "../src/config-types.js";
+import type { TierData, TierModel } from "../src/tier-data.js";
 
 /** Just enough of the `/dispatch` payload for the assertions below — `Response.json()` is
  *  `unknown`, and an untyped `any` here would let a renamed field pass silently. */
@@ -54,6 +57,30 @@ function cfgWith(routing: Record<string, unknown> = {}): Config {
   const p = join(dir, `c${n++}.json`);
   writeFileSync(p, JSON.stringify({ ...BASE, routing: { ...BASE.routing, ...routing } }, null, 2));
   return loadConfig(p);
+}
+
+function fakeTierData(models: TierModel[]): TierData {
+  const byNorm = models.map((rec) => ({ norm: rec.norm.toLowerCase(), rec }));
+  return {
+    models,
+    byNorm,
+    exactByNorm: new Map(byNorm.map(({ norm, rec }) => [norm, rec])),
+    revision: "test",
+  };
+}
+
+function evidenceModel(
+  norm: string,
+  efforts: Array<"low" | "medium" | "high" | "xhigh">,
+  publishedSignalCount = 4,
+): TierModel {
+  return {
+    norm,
+    strength: 0.9,
+    signal_count: publishedSignalCount,
+    published_signal_count: publishedSignalCount,
+    effort_eligibility: efforts,
+  };
 }
 
 // No global cooldown reset here on purpose. Cooldowns are scoped to the Config they were reported
@@ -152,6 +179,133 @@ describe("dispatch ladder — cli rung env", () => {
  * `in flight:` count) is pinned in test/mcp-server.test.ts; this is only about what `toLane`
  * carries onto `DispatchLane` from `LadderRung`.
  */
+describe("dispatch ladder — derived capability", () => {
+  it("uses the highest evidence-qualified effort for a direct relay model", () => {
+    const cfg = cfgWith();
+    const data = fakeTierData([evidenceModel("model-strong", ["low", "medium", "high"])]);
+    const rung: LadderRung = { id: "direct", kind: "relay", enabled: true, spec: "nim/model-strong" };
+
+    expect(derivedCapability(rung, cfg, data)).toEqual({
+      tier: "high",
+      basis: "snapshot",
+      model: "nim/model-strong",
+    });
+  });
+
+  it("derives a CLI --model through the same exact matcher, including a price suffix", () => {
+    const cfg = cfgWith();
+    const data = fakeTierData([evidenceModel("muse-spark-1.3", ["low", "medium"])]);
+    const rung: LadderRung = {
+      id: "cli",
+      kind: "cli",
+      enabled: true,
+      command: "opencode",
+      args: ["run", "{task}", "--model", "muse-spark-1.3-contributor-free"],
+    };
+
+    expect(derivedCapability(rung, cfg, data)).toEqual({
+      tier: "medium",
+      basis: "snapshot",
+      model: "muse-spark-1.3-contributor-free",
+    });
+  });
+
+  it("treats fuzzy, under-evidenced and unmatched models as unknown, never weak", () => {
+    const cfg = cfgWith();
+    const fuzzy = fakeTierData([evidenceModel("model-fuzzy-pro", ["low", "medium", "high"])]);
+    const thin = fakeTierData([evidenceModel("model-thin", ["low", "medium", "high"], 2)]);
+    const direct = (model: string): LadderRung => ({
+      id: model,
+      kind: "relay",
+      enabled: true,
+      spec: `nim/${model}`,
+    });
+
+    expect(derivedCapability(direct("model-fuzzy"), cfg, fuzzy).tier).toBeNull();
+    expect(derivedCapability(direct("model-thin"), cfg, thin).tier).toBeNull();
+    expect(derivedCapability(direct("missing-model"), cfg, fuzzy)).toMatchObject({
+      tier: null,
+      basis: "unknown",
+    });
+  });
+
+  it("uses a dynamic pool's declared effort band instead of transient member capability", () => {
+    const cfg = cfgWith({
+      pools: {
+        strong: {
+          preferred: ["nim/z-ai/glm-5.2"],
+          include: "free",
+          effort: "high",
+        },
+      },
+    });
+    const rung: LadderRung = { id: "pool", kind: "relay", enabled: true, spec: "pool/strong" };
+
+    expect(derivedCapability(rung, cfg, null)).toEqual({
+      tier: "high",
+      basis: "pool-band",
+      model: "pool/strong",
+    });
+  });
+
+  it("gives a static pool with no effort policy no capability ceiling", () => {
+    const cfg = cfgWith({ pools: { static: ["nim/z-ai/glm-5.2"] } });
+    const rung: LadderRung = { id: "pool", kind: "relay", enabled: true, spec: "pool/static" };
+    expect(derivedCapability(rung, cfg, null)).toEqual({
+      tier: null,
+      basis: "unknown",
+      model: "pool/static",
+    });
+  });
+
+  it("ignores a programmatic/manual capability value in favor of synced evidence", () => {
+    const cfg = cfgWith();
+    const rung: LadderRung = {
+      id: "manual",
+      kind: "relay",
+      enabled: true,
+      spec: "nim/unknown-model",
+      capability: "xhigh",
+    };
+    expect(derivedCapability(rung, cfg, null)).toEqual({
+      tier: null,
+      basis: "unknown",
+      model: "nim/unknown-model",
+    });
+  });
+
+  it("wires the derived capability and its basis onto the dispatch view", () => {
+    const cfg = cfgWith({
+      ladder: [{ id: "direct", kind: "relay", spec: "nim/model-strong" }],
+    });
+    const data = fakeTierData([evidenceModel("model-strong", ["low", "medium", "high"])]);
+    const lane = buildDispatch(cfg, { tierData: data }).next;
+
+    expect(lane?.capability).toBe("high");
+    expect(lane?.capabilityBasis).toBe("snapshot");
+  });
+
+  it("loads a legacy manual capability with an explicit no-effect warning", () => {
+    const cfg = cfgWith({
+      ladder: [{ id: "legacy", kind: "relay", spec: "nim/model-strong", capability: "xhigh" }],
+    });
+    expect(cfg.routing.ladder?.[0]?.capability).toBeUndefined();
+    expect(cfg.warnings ?? []).toEqual(
+      expect.arrayContaining([expect.stringContaining("capability \"xhigh\" has no effect")]),
+    );
+    expect(buildDispatch(cfg, { tierData: null }).next?.capability).toBeUndefined();
+    expect(buildDispatch(cfg, { tierData: null }).next?.capabilityBasis).toBe("unknown");
+  });
+
+  it("still rejects a typo in the legacy capability key instead of silently ignoring it", () => {
+    expect(() =>
+      cfgWith({
+        ladder: [{ id: "legacy", kind: "relay", spec: "nim/model-strong", capability: "ultra" }],
+      }),
+    ).toThrow(/capability must be one of low, medium, high, xhigh/);
+  });
+});
+
 describe("dispatch ladder — maxConcurrent on the view", () => {
   it("carries a configured cap onto the lane", () => {
     const view = buildDispatch(cfgWith({ ladder: [{ id: "capped", kind: "cli", command: "agy", args: ["{task}"], maxConcurrent: 2 }] }));
