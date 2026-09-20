@@ -72,11 +72,14 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   transition; restart-killed jobs recover a bounded tree delta measured at adoption time; the
   Windows S4 measurement proved a lane dies with its MCP parent; and lane capability is now derived
   from synced model evidence. The legacy `capability` key loads with a no-effect warning.
-- **Immediate next.** Packet S5 is the next concrete code item: repeated 5xx/402 failures get growing
-  cooldowns while remaining in the walk, with probe success able to end the escalated cooldown.
-  Separately open: repository CI enforcement, Route B's vendor-qualification blocker, the
-  owner-driven Codex Desktop relay check, and design items D1/D2/D5. The Code-tab long-walk
-  verification remains an owner action.
+- **Repeated 5xx/402 failure escalation is shipped with this lap (S5).** Failures 1–2 keep
+  the old behavior; failure 3 onward gains a 10m → 1h → 6h → 24h recovery floor, without ever
+  removing the member from failover. The background recovery loop re-probes relay-invented
+  `failure-escalation` cooldowns, and a 200 probe can end one early for 402/5xx.
+- **Immediate next.** R1: remove the two remaining stale documentation claims named in the
+  stabilization plan. Then M1 can proceed only after one real archived AGY job confirms the exact
+  response-envelope shape. Separately open: repository CI enforcement, Route B's vendor blocker,
+  owner-driven Codex/Code-tab checks, and design items D1/D2/D5.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
