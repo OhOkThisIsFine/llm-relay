@@ -319,14 +319,14 @@ describe("setup-claude", () => {
   // calls the pools free, because paid DeepSeek leads them (owner decision 2026-09-10: correct every
   // text that calls that lane free). Flipped here in the same commit as the source, per the
   // standing protocol.
-  it("(j) the marker is bumped to v8", () => {
-    expect(RELAY_AGENT_MARKER).toContain("v8");
-    expect(RELAY_AGENT_MARKER).not.toContain("v7");
+  it("(j) the marker is bumped to v9", () => {
+    expect(RELAY_AGENT_MARKER).toContain("v9");
+    expect(RELAY_AGENT_MARKER).not.toContain("v8");
     const injectedHome = join(dir, "injected-home-j");
     installRelayAgent({ homeDir: injectedHome });
     const agentPath = join(injectedHome, ".claude", "agents", "relay.md");
     const content = readFileSync(agentPath, "utf8");
-    expect(content).toContain("<!-- llm-relay:relay-agent v8 -->");
+    expect(content).toContain("<!-- llm-relay:relay-agent v9 -->");
     expect(content).not.toMatch(/free model pools/i);
   });
 
@@ -461,7 +461,7 @@ describe("setup-claude", () => {
     expect(res.success).toBe(true);
     const content = readFileSync(agentPath, "utf8");
     expect(content).toBe(RELAY_AGENT_TEMPLATE);
-    expect(content).toContain("<!-- llm-relay:relay-agent v8 -->");
+    expect(content).toContain("<!-- llm-relay:relay-agent v9 -->");
     expect(content).not.toContain("model: inherit");
   });
 
