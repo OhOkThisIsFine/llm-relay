@@ -175,12 +175,19 @@ describe("dispatch_status and dispatch_result across hosts", () => {
         createJobArchive(join(dir, "mcp-job-archive.json")),
       );
       const live = other.create("free-pool", "pool/high", "C:/tree");
+      // The owning walk advanced after creation. A different MCP process must not keep reporting
+      // the stale first rung from the original journal row.
+      other.setCurrentLane(live.id, "agy", undefined);
       const { server, out } = serverOver(dir, () => true);
       for (const tool of ["dispatch_status", "dispatch_result"]) {
         const body = await call(server, out, tool, { jobId: live.id });
+        const text = body.result.content[0]?.text ?? "";
         expect(body.result.isError).toBe(false);
-        expect(body.result.content[0]?.text).toContain("status: running");
-        expect(body.result.content[0]?.text).toContain(`another llm-relay MCP server process (pid ${OTHER_PID})`);
+        expect(text).toContain("lane: agy");
+        expect(text).toContain("status: running");
+        expect(text).toContain("activity: unavailable");
+        expect(text).toContain("walk-verdict: unavailable");
+        expect(text).toContain(`another llm-relay MCP server process (pid ${OTHER_PID})`);
       }
       server.shutdown();
     } finally {
