@@ -18,7 +18,7 @@
  * ⚠ Ownership boundary, same as `lane-runner.ts`: this process is launched by the HOST, never by
  * the relay daemon, so it writes its own file under the cache directory and touches no relay state.
  */
-import { atomicWriteJsonSync, safeReadJsonSync } from "../storage/json-store.js";
+import { safeReadJsonSync, transactionalUpdateJsonSync } from "../storage/json-store.js";
 import { relayStatePath } from "../state-paths.js";
 
 /** One running job, as the journal records it. */
@@ -141,10 +141,7 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
   // report.test.ts` caught it (the corrupt-JSON case passed regardless — `JSON.parse` throws on
   // its own — and only the version-99 case distinguished); `tsc` reports it too, as TS2561.
   const readDisk = (): JournalRow[] | null => {
-    const parsed = safeReadJsonSync<JournalFile>(path, {
-      validator: (v): v is JournalFile =>
-        isRecord(v) && v["version"] === JOB_JOURNAL_VERSION && Array.isArray(v["jobs"]),
-    });
+    const parsed = safeReadJsonSync<JournalFile>(path, { validator: isJournalFile });
     return parsed ? parsed.jobs.filter(isJournalRow) : null;
   };
 
@@ -173,35 +170,45 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
   };
 
   /**
-   * Rewrite the file as: every row another live process owns, plus this journal's own rows. Read
-   * again at write time, because the other process writes too; the previous version wrote only its
-   * own rows and so erased the other's. The adopted orphans are dropped here, which is what stops a
-   * later start from reporting the same death twice.
+   * Rewrite the file as: every row another live process owns, plus this journal's own rows.
    *
-   * ⚠ Not locked: two writes in the same instant can still lose one row. The row costs one
-   * unreported death at most, the same budget the module header states for a full disk.
+   * The whole read/merge/rewrite now runs under the shared JSON transaction lock. The previous
+   * merge-before-write narrowed the race but could still have two processes read the same snapshot
+   * and overwrite each other's new row. Lock acquisition is the mutation order; this journal's
+   * rows win same-id conflicts for this mutation, and clear preserves a same-id row another live
+   * owner published after us.
    */
-  const flush = (): void => {
+  const persist = (): void => {
     try {
-      const others = (readDisk() ?? []).filter(ownedElsewhere);
-      atomicWriteJsonSync(path, { version: JOB_JOURNAL_VERSION, jobs: [...others, ...rows.values()] });
+      transactionalUpdateJsonSync<JournalFile>(
+        path,
+        (diskFile) => {
+          const merged = new Map<string, JournalRow>();
+          for (const row of diskFile?.jobs ?? []) {
+            if (isJournalRow(row) && ownedElsewhere(row)) merged.set(row.jobId, row);
+          }
+          for (const row of rows.values()) merged.set(row.jobId, row);
+          return { version: JOB_JOURNAL_VERSION, jobs: [...merged.values()] };
+        },
+        { validator: isJournalFile, strict: true },
+      );
     } catch {
       // Best-effort by construction: the journal only ever IMPROVES the report of a crash, so a
-      // full disk must not become a dispatch failure. The property it protects is stated in
-      // `describeJob` when a survivor or an orphan exists — never inferred from a write.
+      // full disk or unusable lock must not become a dispatch failure.
     }
   };
+
 
   return {
     note(row) {
       readOnce();
       rows.set(row.jobId, { ...row, owner: { pid, instance } });
-      flush();
+      persist();
     },
     clear(jobId) {
       readOnce();
       if (!rows.delete(jobId)) return;
-      flush();
+      persist();
     },
     orphans() {
       readOnce();
@@ -219,6 +226,10 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
       return (readDisk() ?? []).filter((row) => !rows.has(row.jobId) && ownedElsewhere(row));
     },
   };
+}
+
+function isJournalFile(value: unknown): value is JournalFile {
+  return isRecord(value) && value["version"] === JOB_JOURNAL_VERSION && Array.isArray(value["jobs"]);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

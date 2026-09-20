@@ -1334,9 +1334,10 @@ export class LaneJobStore {
     const kill = this.kills.get(id);
     this.kills.delete(id);
     this.owned.delete(id);
-    // The job is no longer running, so it is no longer something a restart could kill.
-    this.journal.clear(id);
-    if (!job) return;
+    if (!job) {
+      this.journal.clear(id);
+      return;
+    }
     // The attempt is over, so neither stream progress nor a running-attempt verdict describes it.
     delete job.activity;
     delete job.liveness;
@@ -1345,7 +1346,10 @@ export class LaneJobStore {
       // Nothing of ours ran for this job. Reported rather than omitted, so "no owned process" and
       // "we forgot to look" cannot read the same way.
       job.process = { pids, survivors: [], terminated: false };
+      // Archive BEFORE clearing the running row. A crash between the two then leaves both records,
+      // and restore already gives the terminal archive precedence; the old order could leave neither.
       this.archive.record(job);
+      this.journal.clear(id);
       return;
     }
     try {
@@ -1355,9 +1359,12 @@ export class LaneJobStore {
     }
     job.process = { pids, survivors: pids.filter((pid) => this.isAlive(pid)), terminated: true };
     // ⚠ After the process report, so what is archived is the whole terminal record — and eagerly,
-    // because the restart this guards against runs no shutdown handler (`job-archive.ts`).
+    // because the restart this guards against runs no shutdown handler (job-archive.ts).
+    // Archive before clearing for the same crash-consistency reason as the no-process branch above.
     this.archive.record(job);
+    this.journal.clear(id);
   }
+
 
   /**
    * Every process this dispatcher started for a TERMINAL job, keyed by job id — so a stale lane can

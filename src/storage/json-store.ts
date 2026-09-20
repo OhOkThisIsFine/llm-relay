@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { withFileLockSync, type FileLockOptions } from "./file-lock.js";
 
 /**
  * Options for atomic JSON serialization and file writes.
@@ -80,3 +81,47 @@ export function safeReadJsonSync<T = unknown>(targetPath: string, options: SafeJ
   }
 }
 
+
+
+/**
+ * Options for a synchronous read/update/write transaction over one JSON file.
+ *
+ * The lock covers the read as well as the atomic rename. That is the part an atomic writer alone
+ * cannot provide: without it, two processes can both read snapshot N and each replace it with a
+ * different N+1, losing whichever row the earlier rename introduced.
+ */
+export interface TransactionalJsonUpdateOptions<T> extends AtomicJsonWriteOptions {
+  readonly validator?: ((data: unknown) => data is T) | undefined;
+  readonly lock?: FileLockOptions | undefined;
+}
+
+/**
+ * Serialize one JSON mutation across processes, then commit it with the existing atomic writer.
+ *
+ * A failed lock/read/write is best-effort by default, matching atomicWriteJsonSync. strict=true
+ * makes the failure visible to a caller that wants to decide its own fallback policy.
+ */
+export function transactionalUpdateJsonSync<T>(
+  targetPath: string,
+  update: (current: T | null) => T,
+  options: TransactionalJsonUpdateOptions<T> = {},
+): boolean {
+  try {
+    return withFileLockSync(
+      targetPath,
+      () => {
+        const current = safeReadJsonSync<T>(targetPath, { validator: options.validator });
+        const next = update(current);
+        return atomicWriteJsonSync(targetPath, next, {
+          space: options.space,
+          mode: options.mode,
+          strict: true,
+        });
+      },
+      options.lock,
+    );
+  } catch (err) {
+    if (options.strict) throw err;
+    return false;
+  }
+}
