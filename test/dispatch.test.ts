@@ -586,7 +586,16 @@ describe("dispatch ladder — order, never execution", () => {
     // element and no field carries a pre-joined command line — so a new structured field is an
     // update, not a weakening. Keep the exact-key list: it is what would catch a convenience
     // "commandLine" string.
-    expect(Object.keys(lane).sort()).toEqual(["id", "invoke", "kind", "maxConcurrent", "position", "quota", "state"]);
+    expect(Object.keys(lane).sort()).toEqual([
+      "capabilityBasis",
+      "id",
+      "invoke",
+      "kind",
+      "maxConcurrent",
+      "position",
+      "quota",
+      "state",
+    ]);
     expect(lane.invoke?.args).toEqual(["-p", "rm -rf /; echo $(whoami)", "--model", "g-flash"]);
     for (const value of Object.values(view)) {
       expect(typeof value === "string" ? value : "").not.toContain("rm -rf /;");
