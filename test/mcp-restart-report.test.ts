@@ -201,6 +201,43 @@ describe("MCP server restart", () => {
     }
   });
 
+  it("persists a daemon broker execution reference across a running row repoint", () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const journal = createJobJournal(path);
+      journal.note({
+        jobId: "job-broker-reference",
+        laneId: "lane-a",
+        spec: "pool/high",
+        cwd: "C:/tree",
+        startedAt: 1,
+      });
+      journal.noteBrokerExecution?.("job-broker-reference", {
+        kind: "daemon-v1",
+        executionId: "exec-00112233445566778899aabbccddeeff",
+      });
+      // The walk moving to another lane must not erase the job-wide recovery reference.
+      journal.note({
+        jobId: "job-broker-reference",
+        laneId: "lane-b",
+        spec: "pool/medium",
+        cwd: "C:/tree",
+        startedAt: 1,
+      });
+
+      const row = createJobJournal(path).orphans().find(
+        (candidate) => candidate.jobId === "job-broker-reference",
+      );
+      expect(row?.laneId).toBe("lane-b");
+      expect(row?.brokerExecution).toEqual({
+        kind: "daemon-v1",
+        executionId: "exec-00112233445566778899aabbccddeeff",
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
   it("leaves a killed job terminal and never reaps a process it does not own", () => {
     const { path, cleanup } = tempJournalPath();
     try {
@@ -298,6 +335,26 @@ describe("MCP server restart", () => {
       expect(malformedTree).toHaveLength(1);
       expect(malformedTree[0]?.jobId).toBe("job-valid");
       expect(malformedTree[0]?.startingTree).toBeUndefined();
+
+      // Malformed OPTIONAL broker metadata also drops only that field. The underlying job row
+      // survives so the pre-D1 killed-job path remains available as the weaker fallback.
+      writeFileSync(
+        path,
+        JSON.stringify({
+          version: 1,
+          jobs: [{
+            jobId: "job-valid-broker",
+            laneId: "lane-a",
+            cwd: "C:/tree",
+            startedAt: 1,
+            brokerExecution: { kind: "daemon-v1", executionId: "not-a-valid-execution-id" },
+          }],
+        }),
+      );
+      const malformedBroker = createJobJournal(path).orphans();
+      expect(malformedBroker).toHaveLength(1);
+      expect(malformedBroker[0]?.jobId).toBe("job-valid-broker");
+      expect(malformedBroker[0]?.brokerExecution).toBeUndefined();
 
       // And a version this build does not know.
       writeFileSync(path, JSON.stringify({ version: 99, jobs: [{ jobId: "x", laneId: "y", cwd: "z", startedAt: 1 }] }));
