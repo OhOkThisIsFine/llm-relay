@@ -718,6 +718,23 @@ describe("dispatch_lanes", () => {
     expect(text).toContain("next: free-pool");
   });
 
+  it("renders derived capability together with its evidence basis", async () => {
+    const h = new Harness({
+      buildView: async () =>
+        view({
+          ladder: [
+            lane({ id: "strong", position: 1, capability: "high", capabilityBasis: "snapshot" }),
+            lane({ id: "pool", position: 2, capability: "medium", capabilityBasis: "pool-band" }),
+            lane({ id: "unknown", position: 3, capabilityBasis: "unknown" }),
+          ],
+        }),
+    });
+    const { text } = await h.tool("dispatch_lanes", {});
+    expect(text).toContain("capability: high (snapshot)");
+    expect(text).toContain("capability: medium (pool-band)");
+    expect(text).toContain("capability: unknown (no evidence-qualified limit)");
+  });
+
   it("says what to do when no ladder is configured", async () => {
     const h = new Harness({
       buildView: async () => view({ ladder: [], next: null, reason: "no routing.ladder configured" }),
