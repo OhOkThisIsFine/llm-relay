@@ -411,6 +411,33 @@ describe("createAvailabilityProducer — cooldowns", () => {
     expect(reasons).toEqual(["auth_error", "provider_error"]);
   });
 
+  it("maps failure-escalation by the status that earned it: 402 rate_limit, 5xx provider_error", () => {
+    const breaker = new CircuitBreaker();
+    for (let i = 0; i < 3; i += 1) {
+      breaker.recordOutcome(target({ model: "m-five" }), {
+        ok: false,
+        status: 500,
+        elapsedMs: 5,
+        at: NOW - 10_000 + i,
+      });
+    }
+    for (let i = 0; i < 5; i += 1) {
+      breaker.recordOutcome(target({ model: "m-pay" }), {
+        ok: false,
+        status: 402,
+        elapsedMs: 5,
+        at: NOW - 20_000 + i,
+      });
+    }
+
+    expect(breaker.getState(target({ model: "m-five" }))!.cooldownSource).toBe("failure-escalation");
+    expect(breaker.getState(target({ model: "m-pay" }))!.cooldownSource).toBe("failure-escalation");
+
+    const rows = createAvailabilityProducer({ breaker, config: config(), now: () => NOW }).snapshot().cooldowns;
+    expect(rows.find((row) => row.deployment === "m-five")?.reason).toBe("provider_error");
+    expect(rows.find((row) => row.deployment === "m-pay")?.reason).toBe("rate_limit");
+  });
+
   it("renders target-fact cooling conditions as cooldown rows", () => {
     const breaker = new CircuitBreaker();
     recordFact("allowance-exhausted", { kind: "attempt", provider: "nim", credentialId: makeCredentialId("nim", "primary"), model: "m-a" }, { now: NOW - 30_000, retryAfterMs: 300_000 });
