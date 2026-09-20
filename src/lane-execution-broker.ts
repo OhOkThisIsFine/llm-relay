@@ -12,7 +12,10 @@ import { createHash } from "node:crypto";
 
 export const LANE_EXECUTION_SCHEMA = "mcp.lane-execution.v1" as const;
 export const MAX_BROKER_TERMINAL_EXECUTIONS = 100;
-export const MAX_BROKER_TASK_CHARS = 4096;
+// The HTTP server already caps the entire request body at 36 MiB by default. Keep only enough
+// headroom here to reject a pathological programmatic call without imposing the old 4 KiB packet
+// limit on MCP dispatch, which historically accepted much larger task text.
+export const MAX_BROKER_TASK_CHARS = 32 * 1024 * 1024;
 export const MAX_BROKER_PATH_CHARS = 4096;
 export const MAX_BROKER_ID_CHARS = 200;
 export const MAX_BROKER_TIMEOUT_MS = 24 * 60 * 60 * 1000;
@@ -99,6 +102,117 @@ export interface LaneExecutionSnapshot {
 export type LaneExecutionBrokerResult =
   | { ok: true; execution: LaneExecutionSnapshot }
   | { ok: false; status: 400 | 404 | 409 | 503; message: string };
+
+const SNAPSHOT_KEYS = new Set([
+  "schema",
+  "executionId",
+  "jobId",
+  "laneId",
+  "status",
+  "startedAt",
+  "endedAt",
+  "stdoutBytes",
+  "stderrBytes",
+  "lastOutputAt",
+  "cpuMs",
+  "code",
+  "stdout",
+  "stderr",
+  "timedOut",
+]);
+
+/**
+ * Parse the broker's public snapshot at an untrusted HTTP/file boundary.
+ *
+ * The optional process-result fields travel as one group: a running execution has none; a
+ * cancelled execution may have none until its killed child settles; every other terminal
+ * execution carries the full quartet. Unknown keys fail closed so a protocol revision cannot be
+ * silently misread by an older MCP client.
+ */
+export function parseLaneExecutionSnapshot(value: unknown): LaneExecutionSnapshot | null {
+  if (!isRecord(value) || !exactKeys(value, SNAPSHOT_KEYS)) return null;
+  if (value["schema"] !== LANE_EXECUTION_SCHEMA) return null;
+  if (!boundedId(value["executionId"]) || !boundedId(value["jobId"]) || !boundedId(value["laneId"])) return null;
+
+  const status = value["status"];
+  if (
+    status !== "running" &&
+    status !== "completed" &&
+    status !== "failed" &&
+    status !== "timed_out" &&
+    status !== "cancelled"
+  ) {
+    return null;
+  }
+  const startedAt = value["startedAt"];
+  if (typeof startedAt !== "number" || !Number.isFinite(startedAt)) return null;
+  const endedAt = value["endedAt"];
+  if (endedAt !== null && (typeof endedAt !== "number" || !Number.isFinite(endedAt))) return null;
+  if (status === "running" ? endedAt !== null : endedAt === null) return null;
+
+  const stdoutBytes = value["stdoutBytes"];
+  const stderrBytes = value["stderrBytes"];
+  if (
+    typeof stdoutBytes !== "number" ||
+    !Number.isSafeInteger(stdoutBytes) ||
+    stdoutBytes < 0 ||
+    typeof stderrBytes !== "number" ||
+    !Number.isSafeInteger(stderrBytes) ||
+    stderrBytes < 0
+  ) {
+    return null;
+  }
+  const lastOutputAt = value["lastOutputAt"];
+  if (
+    lastOutputAt !== null &&
+    (typeof lastOutputAt !== "number" || !Number.isFinite(lastOutputAt))
+  ) {
+    return null;
+  }
+  const cpuMs = value["cpuMs"];
+  if (cpuMs !== undefined && (typeof cpuMs !== "number" || !Number.isFinite(cpuMs) || cpuMs < 0)) {
+    return null;
+  }
+
+  const hasCode = Object.hasOwn(value, "code");
+  const hasStdout = Object.hasOwn(value, "stdout");
+  const hasStderr = Object.hasOwn(value, "stderr");
+  const hasTimedOut = Object.hasOwn(value, "timedOut");
+  const resultCount = Number(hasCode) + Number(hasStdout) + Number(hasStderr) + Number(hasTimedOut);
+  if (resultCount !== 0 && resultCount !== 4) return null;
+  if (status === "running" && resultCount !== 0) return null;
+  if (status !== "running" && status !== "cancelled" && resultCount !== 4) return null;
+
+  const out: LaneExecutionSnapshot = {
+    schema: LANE_EXECUTION_SCHEMA,
+    executionId: value["executionId"],
+    jobId: value["jobId"],
+    laneId: value["laneId"],
+    status,
+    startedAt,
+    endedAt,
+    stdoutBytes,
+    stderrBytes,
+    lastOutputAt,
+    ...(cpuMs === undefined ? {} : { cpuMs }),
+  };
+  if (resultCount === 4) {
+    const code = value["code"];
+    if (code !== null && (typeof code !== "number" || !Number.isFinite(code))) return null;
+    if (
+      typeof value["stdout"] !== "string" ||
+      typeof value["stderr"] !== "string" ||
+      typeof value["timedOut"] !== "boolean"
+    ) {
+      return null;
+    }
+    out.code = code;
+    out.stdout = value["stdout"];
+    out.stderr = value["stderr"];
+    out.timedOut = value["timedOut"];
+  }
+  return out;
+}
 
 export type LaneExecutionLauncher = (
   request: LaneExecutionStartRequest,
@@ -191,6 +305,14 @@ function parseStart(value: Record<string, unknown>): LaneExecutionStartRequest |
   const readOnly = value["readOnly"];
   if (readOnly !== undefined && typeof readOnly !== "boolean") return null;
   if (!optionalBoundedString(value["callerRoot"], MAX_BROKER_PATH_CHARS)) return null;
+  // The daemon cannot reconstruct the caller's protected tree from its own cwd. A brokered
+  // read-only start without this fact would silently weaken the mechanism the local MCP path uses.
+  if (
+    readOnly === true &&
+    (typeof value["callerRoot"] !== "string" || value["callerRoot"].length === 0)
+  ) {
+    return null;
+  }
   if (
     value["host"] !== undefined &&
     value["host"] !== "routed" &&
