@@ -32,8 +32,12 @@ function spawnWorker(args: string[]): Worker {
   return { child, stderr };
 }
 
-function workerFailed(worker: Worker): boolean {
+function workerExited(worker: Worker): boolean {
   return worker.child.exitCode !== null || worker.child.signalCode !== null;
+}
+
+function workerFailed(worker: Worker): boolean {
+  return (worker.child.exitCode !== null && worker.child.exitCode !== 0) || worker.child.signalCode !== null;
 }
 
 async function waitForFiles(paths: string[], workers: Worker[], timeoutMs = 20_000): Promise<void> {
@@ -48,7 +52,7 @@ async function waitForFiles(paths: string[], workers: Worker[], timeoutMs = 20_0
 }
 
 async function waitForExit(worker: Worker): Promise<void> {
-  if (workerFailed(worker)) return;
+  if (workerExited(worker)) return;
   await new Promise<void>((resolve, reject) => {
     worker.child.once("error", reject);
     worker.child.once("exit", () => resolve());
@@ -57,7 +61,7 @@ async function waitForExit(worker: Worker): Promise<void> {
 
 function stopWorkers(workers: Worker[]): void {
   for (const worker of workers) {
-    if (!workerFailed(worker)) worker.child.kill();
+    if (!workerExited(worker)) worker.child.kill();
   }
 }
 
