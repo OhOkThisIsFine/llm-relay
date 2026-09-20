@@ -229,6 +229,12 @@ describe("mcp server handshake", () => {
     expect(text).toContain("codex desktop");
     expect(text).toContain("before reaching the relay");
     expect(text).toContain("--next-command");
+    // 6. A running job's liveness comes from the relay's verdict, never from diagnostics.
+    expect(text).toContain("walk-verdict");
+    expect(text).toContain("keep-running");
+    expect(text).toContain("no-idle-stop");
+    expect(text).toContain("unavailable");
+    expect(text).toContain("do not infer liveness");
   });
 
   it("carries the unprompted trigger on the dispatch tool description too", async () => {
@@ -242,6 +248,19 @@ describe("mcp server handshake", () => {
     expect(description).toContain("without being asked");
     expect(description).toContain("codex desktop");
     expect(description).toContain("collaboration child");
+  });
+
+  it("makes walk-verdict authoritative on the dispatch_status tool description", async () => {
+    const h = new Harness();
+    const res = await h.request("tools/list");
+    const tools = (res["result"] as { tools: { name: string; description: string }[] }).tools;
+    const status = tools.find((t) => t.name === "dispatch_status");
+    const description = status?.description.toLowerCase() ?? "";
+    expect(description).toContain("walk-verdict");
+    expect(description).toContain("keep-running");
+    expect(description).toContain("no-idle-stop");
+    expect(description).toContain("unavailable");
+    expect(description).toContain("diagnostics only");
   });
 
   it("reports the version as unknown rather than a fake 0.0.0 when none is injected", async () => {
