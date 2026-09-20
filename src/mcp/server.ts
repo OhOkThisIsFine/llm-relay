@@ -236,7 +236,7 @@ export const MCP_INSTRUCTIONS =
   "`walk-verdict`: `keep-running` means continue polling, `no-idle-stop` means the walk will " +
   "not stop this attempt for idleness, and `unavailable` means another MCP process owns the live " +
   "job so you should keep polling rather than infer. Do not infer liveness from elapsed time, output silence, " +
-  "historical duration, or last-activity diagnostics. Follow the advice at the end of a " +
+  "historical duration, or activity diagnostics. Follow the advice at the end of a " +
   "reply: when it says a lane was stopped while it was still working, dispatch again with that " +
   "lane named so it can finish; when it says every lane ran and failed, do the work here — " +
   "re-dispatching the same task picks the same lanes. To run one specific model instead of the " +
