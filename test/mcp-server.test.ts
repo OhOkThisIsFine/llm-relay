@@ -260,6 +260,7 @@ describe("mcp server handshake", () => {
     expect(description).toContain("keep-running");
     expect(description).toContain("no-idle-stop");
     expect(description).toContain("unavailable");
+    expect(description).toContain("advancing");
     expect(description).toContain("diagnostics only");
   });
 
