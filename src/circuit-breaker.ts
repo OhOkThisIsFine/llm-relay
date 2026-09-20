@@ -185,6 +185,7 @@ export const COOLDOWN_SOURCES = [
   "loopback",
   "quota",
   "elapsed",
+  "failure-escalation",
 ] as const;
 
 export type CooldownSource = (typeof COOLDOWN_SOURCES)[number];
@@ -288,6 +289,14 @@ const CANCELLATION_EVIDENCE_MS = DEFAULT_COOLDOWN_MS;
 const RATE_LIMIT_ESCALATION_MS = [
   120_000, 600_000, 3_600_000, 86_400_000,
 ] as const;
+/**
+ * Repeated generic failures (including 5xx) and 402s escalate only AFTER the existing two-failure
+ * trip threshold. Index = consecutiveFailures - (MAX_FAILURES_BEFORE_TRIP + 1):
+ * failures 1–2 keep today's behaviour; 3, 4, 5, 6+ add 10m, 1h, 6h, 24h floors.
+ */
+const FAILURE_ESCALATION_MS = [
+  600_000, 3_600_000, 21_600_000, 86_400_000,
+] as const;
 const LOOPBACK_RATE_LIMIT_COOLDOWN_MS = 5_000;
 const QUOTA_EXHAUSTED_COOLDOWN_MS = 3_600_000;
 const MAX_FAILURES_BEFORE_TRIP = 2;
@@ -331,6 +340,7 @@ const PROBE_SUCCESS_ENDS_COOLDOWN = {
   "loopback": true,
   "quota": false,
   "elapsed": false,
+  "failure-escalation": true,
 } as const satisfies Record<CooldownSource, boolean>;
 
 /**
@@ -346,6 +356,7 @@ const REPROBE_TARGETS_COOLDOWN = {
   "loopback": false,
   "quota": false,
   "elapsed": false,
+  "failure-escalation": true,
 } as const satisfies Record<CooldownSource, boolean>;
 /** Ordering-only middle band retained for telemetry consumers during migration. */
 export const UNMEASURED_STABILITY = 50;
@@ -391,6 +402,21 @@ export function failureCooldown(elapsedMs: number): { ms: number; source: Cooldo
   return wasted > DEFAULT_COOLDOWN_MS
     ? { ms: wasted, source: "elapsed" }
     : { ms: DEFAULT_COOLDOWN_MS, source: "default" };
+}
+
+/** Escalation floor for this consecutive-failure count; null before failure 3. */
+function failureEscalationMs(consecutiveFailures: number): number | null {
+  const index = consecutiveFailures - (MAX_FAILURES_BEFORE_TRIP + 1);
+  if (index < 0) return null;
+  return FAILURE_ESCALATION_MS[Math.min(index, FAILURE_ESCALATION_MS.length - 1)]!;
+}
+
+/** Does a successful probe directly disprove this relay-invented cooldown? */
+function probeDisprovesCooldown(source: CooldownSource, status: number | undefined): boolean {
+  if (source === "failure-escalation") {
+    return status === 402 || (status !== undefined && status >= 500 && status <= 599);
+  }
+  return status === 429;
 }
 
 function isLoopbackTarget(target: ProviderTargetIdentity): boolean {
@@ -580,8 +606,9 @@ export class CircuitBreaker implements AttemptLifecyclePort {
   endRateLimitCooldown(cell: BreakerCellSelector, at = Date.now()): boolean {
     const state = this.states.get(this.getKey(cell));
     if (state === undefined || state.cooldownUntil <= at) return false;
-    if (state.lastStatus !== 429 || state.cooldownSource === null) return false;
+    if (state.cooldownSource === null) return false;
     if (!PROBE_SUCCESS_ENDS_COOLDOWN[state.cooldownSource]) return false;
+    if (!probeDisprovesCooldown(state.cooldownSource, state.lastStatus)) return false;
     state.cooldownUntil = 0;
     state.cooldownSource = null;
     this.notifyStateChanged();
@@ -602,8 +629,9 @@ export class CircuitBreaker implements AttemptLifecyclePort {
   rateLimitCoolingCells(now = Date.now()): RateLimitCoolingCell[] {
     const out: RateLimitCoolingCell[] = [];
     for (const state of this.states.values()) {
-      if (state.cooldownUntil <= now || state.lastStatus !== 429 || state.cooldownSource === null) continue;
+      if (state.cooldownUntil <= now || state.cooldownSource === null) continue;
       if (!REPROBE_TARGETS_COOLDOWN[state.cooldownSource]) continue;
+      if (!probeDisprovesCooldown(state.cooldownSource, state.lastStatus)) continue;
       out.push({
         provider: state.target.provider,
         model: state.target.model,
@@ -871,15 +899,31 @@ export class CircuitBreaker implements AttemptLifecyclePort {
           state.unexplained429s === 1 ? "default" : "escalation";
       }
     } else if (outcome.status === 402) {
-      state.cooldownUntil = now + (asked ?? QUOTA_EXHAUSTED_COOLDOWN_MS);
-      state.cooldownSource = asked === null ? "default" : "retry-after";
+      if (asked !== null) {
+        state.cooldownUntil = now + asked;
+        state.cooldownSource = "retry-after";
+      } else {
+        const escalated = failureEscalationMs(state.consecutiveFailures);
+        const ms = Math.max(QUOTA_EXHAUSTED_COOLDOWN_MS, escalated ?? 0);
+        state.cooldownUntil = now + ms;
+        state.cooldownSource =
+          escalated !== null && escalated > QUOTA_EXHAUSTED_COOLDOWN_MS
+            ? "failure-escalation"
+            : "default";
+      }
     } else if (asked !== null) {
       state.cooldownUntil = now + asked;
       state.cooldownSource = "retry-after";
     } else if (state.consecutiveFailures >= MAX_FAILURES_BEFORE_TRIP) {
       const cooling = failureCooldown(outcome.elapsedMs);
-      state.cooldownUntil = now + cooling.ms;
-      state.cooldownSource = cooling.source;
+      const escalated = failureEscalationMs(state.consecutiveFailures);
+      if (escalated !== null && escalated > cooling.ms) {
+        state.cooldownUntil = now + escalated;
+        state.cooldownSource = "failure-escalation";
+      } else {
+        state.cooldownUntil = now + cooling.ms;
+        state.cooldownSource = cooling.source;
+      }
     }
     // One unconditional notify for the whole ladder above — every outcome now dirties the file,
     // and the WriteBehindTimer bounds writes to one per 250 ms of quiet and one per 2 s under
