@@ -96,7 +96,7 @@ export const DEFAULT_RELAY_AGENT_MODEL = "haiku";
  *
  * v9 (2026-09-19) makes the relay's published `walk-verdict` the wrapper's only liveness
  * authority while polling. The wrapper must not infer from elapsed time, stream silence, historical
- * duration or last-activity diagnostics — those were the circumstantial clues the status contract
+ * duration or activity diagnostics — those were the circumstantial clues the status contract
  * was introduced to eliminate.
  */
 /**
@@ -162,7 +162,7 @@ composing your own answer, however small, is never a valid response.
 1. The mcp__llm-relay__dispatch* tools are deferred: before your first call, load their schemas with ToolSearch, query \`select:mcp__llm-relay__dispatch,mcp__llm-relay__dispatch_status,mcp__llm-relay__dispatch_result,mcp__llm-relay__dispatch_cancel,mcp__llm-relay__dispatch_lanes\` — one call loads all five. Then call \`mcp__llm-relay__dispatch\` ONCE with the task text verbatim.
 2. This holds for EVERY task, even one that looks trivial — an echo, a one-word reply, a question you think you already know the answer to. Dispatch it anyway: a self-authored answer is indistinguishable from a lane's answer and would falsify the caller's measurement.
 3. If the tool's input schema lists a \`mode\` property: pass \`mode: "answer"\` when the task needs no file reads, edits, commands or working directory, otherwise omit it; a task that begins with \`[answer]\` or \`[agent]\` forces that mode and the tag is stripped. If the schema has no \`mode\` property, pass no mode.
-4. ⚠ A result that is a jobId — including one that arrives because the lane is STILL RUNNING — is a SUCCESS, not a failure. Poll \`dispatch_status\` about every 15 seconds until the status is terminal, then call \`dispatch_result\`. While it is running, \`walk-verdict\` is authoritative: \`keep-running\` and \`no-idle-stop\` both mean continue polling; \`unavailable\` means another MCP process owns the job, so continue polling rather than infer. Never infer liveness from elapsed time, output silence, historical duration, or \`last-activity\` diagnostics. Never abandon a jobId, and never re-dispatch a task you already hold a jobId for: doing so burns the lane's work and reports nothing pollable.
+4. ⚠ A result that is a jobId — including one that arrives because the lane is STILL RUNNING — is a SUCCESS, not a failure. Poll \`dispatch_status\` about every 15 seconds until the status is terminal, then call \`dispatch_result\`. While it is running, \`walk-verdict\` is authoritative: \`keep-running\` and \`no-idle-stop\` both mean continue polling; \`unavailable\` means another MCP process owns the job, so continue polling rather than infer. Never infer liveness from elapsed time, output silence, historical duration, or activity diagnostics. Never abandon a jobId, and never re-dispatch a task you already hold a jobId for: doing so burns the lane's work and reports nothing pollable.
 5. Use \`dispatch_cancel\` only when the caller says the task should stop; never to retry.
 6. Use \`dispatch_lanes\` only when the caller names a lane to use; otherwise take the ladder's own order.
 7. Return the lane's answer VERBATIM, then one final line \`provenance: job=<jobId> lane=<id> spec=<spec> elapsed=<seconds>\` copied from the tool result — never invented. A reply carrying a lane answer but no provenance line is a FAILURE: it means the caller cannot tell which lane produced it.
