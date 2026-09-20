@@ -917,6 +917,19 @@ function normalizeOptions(opts: DispatchOptions): DispatchOptions {
   if (manifest && typeof manifest === "object" && manifest.version === 1 && typeof manifest.lanes === "object" && manifest.lanes !== null) {
     out.manifest = manifest;
   }
+  // Test/embedder-only capability snapshot seam. null is meaningful ("do not consult the live
+  // snapshot"), while an object must at least carry the two collections getStrength reads. This
+  // key can arrive from an untyped JSON object, so never trust an arbitrary object as TierData.
+  if (opts.tierData === null) {
+    out.tierData = null;
+  } else if (
+    opts.tierData &&
+    typeof opts.tierData === "object" &&
+    Array.isArray(opts.tierData.models) &&
+    Array.isArray(opts.tierData.byNorm)
+  ) {
+    out.tierData = opts.tierData;
+  }
   // Closed vocabularies, validated HERE because this object can arrive off a raw query string: an
   // unrecognised value reads as ABSENT — the behaviour before these existed — never as a guess.
   if (opts.requester === "mcp") out.requester = "mcp";
