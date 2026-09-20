@@ -69,10 +69,10 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   approved for design (D2), growing cooldowns for repeated 5xx and 402 are approved (packet S5),
   and operator-declared prices are declined (D4).
 - **Immediate next.** After the owner restarts Claude Desktop: run a Code tab
-  dispatch of a pool task that takes more than 60 s, and confirm it answers in one call and that
-  `last activity:` names relay traffic. Open backlog: route B, the Codex Desktop check, the
-  dashboard pin control, the tree delta for a `killed` job, the unused budget code, and the idle
-  signal for lanes that do not use the relay.
+  dispatch of a pool task that takes more than 60 s, and confirm it answers in one call and that a
+  running status reports `walk-verdict: keep-running` with relay activity as its basis rather than
+  requiring elapsed-time/output inference. Open backlog: route B, the Codex Desktop check, the
+  dashboard pin control, the tree delta for a `killed` job, and the unused budget code.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
