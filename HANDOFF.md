@@ -27,9 +27,9 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   - **Released as v0.84.1** (commit `f9fff49`, publish run 35270604176, owner decision). The
     release carries NO source change — the built output differs from v0.84.0 only in the version
     string — and exists so the npm page points at `CONTRIBUTING.md` and `docs/architecture.md`.
-    The global binary is reinstalled at 0.84.1. ⚠ The running daemon and every `llm-relay mcp`
-    process still hold v0.84.0 code, which is behaviourally identical, so `withVersionNotice`
-    appends a version notice to MCP replies until those processes restart.
+    The global binary was reinstalled at 0.84.1. At that release closeout, the running daemon
+    and MCP processes still held behaviourally identical v0.84.0 code; do not treat that historical
+    process-version note as current state.
 - **Later the same day (v0.83.2, v0.84.0).**
   - The desktop Code tab did not get the long wait: Desktop gave the session its own server copy,
     named `llm-relay`, which hid the Code tab's own server, and Desktop calls as `claude-ai` with a
