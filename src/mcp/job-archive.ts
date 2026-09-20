@@ -144,7 +144,7 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
    * because it later records some unrelated job. Lock acquisition defines same-id last-write-wins.
    */
   const write = (row: ArchivedJob): void => {
-    let committed: JobArchiveFile | null = null;
+    const transaction: { committed: JobArchiveFile | null } = { committed: null };
     try {
       const ok = transactionalUpdateJsonSync<JobArchiveFile>(
         path,
@@ -158,15 +158,16 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
           const ownSeq = jobSeqOf(row.id);
           if (ownSeq !== null && ownSeq > seq) seq = ownSeq;
 
-          committed = {
+          transaction.committed = {
             version: JOB_ARCHIVE_VERSION,
             lastSeq: seq,
             jobs: boundedRows(merged),
           };
-          return committed;
+          return transaction.committed;
         },
         { validator: isJobArchiveFile, strict: true },
       );
+      const committed = transaction.committed;
       if (!ok || committed === null) return;
 
       lastSeq = committed.lastSeq;
