@@ -2,7 +2,7 @@
 
 Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
 
-## 0. State as of 2026-09-17 (v0.84.0)
+## 0. State through 2026-09-20
 
 - **The documentation is now usable by a third party (2026-09-17, lap `ca8814f5`, commit
   `cfb5420`, no source change).** Owner instruction: third-party contributors and testers are
@@ -37,11 +37,12 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
     `llm-relay-desktop` (setup was re-run on this machine). Evidence:
     `docs/history/mcp-host-timeouts-2026-09-17.md`.
   - v0.84.0 (owner decision): the walk stops a lane only when it is IDLE for
-    `routing.dispatchWalk.idleMs` (300 s): no tagged relay traffic, no output, no file change. New
-    `src/lane-activity.ts` and `GET /dispatch/activity`. Verified live on the restarted daemon: a
-    headless `claude -p` with `ANTHROPIC_CUSTOM_HEADERS` sent its tag, and the route reported it.
-  - **Not verified yet:** a walk through a restarted MCP process. The Desktop and Code tab MCP
-    processes still run v0.83.2 until Claude Desktop restarts.
+    `routing.dispatchWalk.idleMs` (300 s): no tagged relay traffic, no output, no owned-process CPU
+    increase, and no file change. `src/lane-activity.ts` and `GET /dispatch/activity` supply the
+    relay-traffic signal; each attempt now has its own activity baseline and published
+    `walk-verdict`.
+  - **Owner verification still pending:** a Code-tab walk through a freshly restarted MCP process
+    should be checked end to end; do not infer current host-process versions from this document.
 
 - **What the dispatch-fidelity lap shipped (2026-09-17, lap `f8d56109`).** Goal: dispatch from
   Claude Desktop, Codex Desktop and other hosts works as closely as possible to each host's
@@ -57,24 +58,25 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
     with an optional `scope` that marks paths OUT OF SCOPE. A restart-killed job carries its
     bounded starting status in the running-job journal and labels the recovered delta as measured
     at restart adoption time, not at death. Report only (`4e1899e`).
-  - The walk skips a rung whose new `capability` is below the dispatch tier (`42b2745`). Its
-    budget extension was replaced by the idle-only stop in v0.84.0.
+  - The walk skips a rung whose derived `capability` is below the dispatch tier. Since 2026-09-20
+    the ceiling comes from synced capability data (or a dynamic pool's effort band), never from a
+    hand-set rung value; unknown evidence imposes no limit.
   - The Codex `relay` agent template writes provenance only from a real dispatch result
     (`05db5b8`), and a test replays a lane that outlives `waitMs` (`d984b87`).
-- **The work queue is planned (2026-09-17, planning lap, no source change).**
-  [docs/history/stabilization-plan-2026-09-17.md](docs/history/stabilization-plan-2026-09-17.md) splits every open
-  backlog entry, the stated residues and the findings of a live survey into packets for cheap
-  models, in waves. Start with packet W0-1: the package ceiling has room for two more entries.
-- **Lane capability now comes from synced capability data, never a hand-set rung value.**
-  Direct/CLI models use evidence-qualified `getStrength` bands; dynamic pool rungs use their
-  declared effort band; unknown or under-evidenced models impose no limit. A legacy `capability`
-  key loads with a no-effect warning. `POST /reload` remains approved for design (D2), growing
-  cooldowns for repeated 5xx and 402 remain packet S5, and operator-declared prices are declined (D4).
-- **Immediate next.** After the owner restarts Claude Desktop: run a Code tab
-  dispatch of a pool task that takes more than 60 s, and confirm it answers in one call and that a
-  running status reports `walk-verdict: keep-running` with relay activity as its basis rather than
-  requiring elapsed-time/output inference. Open backlog: route B, the Codex Desktop check, the
-  dashboard pin control and the unused budget code.
+- **The stabilization plan remains the implementation queue.**
+  [docs/history/stabilization-plan-2026-09-17.md](docs/history/stabilization-plan-2026-09-17.md)
+  records the remaining packets and design work; use `docs/backlog.md` for the current unmet
+  properties rather than following the plan's original wave order literally.
+- **2026-09-19–20 closeout of the dispatch-fidelity leftovers.** Multi-process journal/archive
+  writes are transactional; the public liveness verdict no longer exposes an internal idle-stop
+  transition; restart-killed jobs recover a bounded tree delta measured at adoption time; the
+  Windows S4 measurement proved a lane dies with its MCP parent; and lane capability is now derived
+  from synced model evidence. The legacy `capability` key loads with a no-effect warning.
+- **Immediate next.** Packet S5 is the next concrete code item: repeated 5xx/402 failures get growing
+  cooldowns while remaining in the walk, with probe success able to end the escalated cooldown.
+  Separately open: repository CI enforcement, Route B's vendor-qualification blocker, the
+  owner-driven Codex Desktop relay check, and design items D1/D2/D5. The Code-tab long-walk
+  verification remains an owner action.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
