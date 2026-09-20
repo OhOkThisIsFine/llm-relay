@@ -24,7 +24,7 @@
  * cut. Corrupt / absent / wrong-version ⇒ nothing restored, and the file is left alone (the
  * `lane-manifest.ts` rule); each row is validated field by field and one bad row is dropped alone.
  */
-import { atomicWriteJsonSync, safeReadJsonSync } from "../storage/json-store.js";
+import { safeReadJsonSync, transactionalUpdateJsonSync } from "../storage/json-store.js";
 import { relayStatePath } from "../state-paths.js";
 import type { LaneJob, LaneAttempt, LaneProcessReport, JobStatus } from "./lane-runner.js";
 
@@ -105,13 +105,8 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
   let lastSeq = 0;
   let loaded = false;
 
-  /** The valid rows and the highest sequence on disk now; null for an absent or unusable file. */
-  const readDisk = (): { rows: ArchivedJob[]; lastSeq: number } | null => {
-    const parsed = safeReadJsonSync<JobArchiveFile>(path, {
-      validator: (v): v is JobArchiveFile =>
-        isRecord(v) && v["version"] === JOB_ARCHIVE_VERSION && Array.isArray(v["jobs"]),
-    });
-    if (!parsed) return null;
+  /** Normalize one top-level-valid archive, dropping only malformed rows. */
+  const normalizeFile = (parsed: JobArchiveFile): { rows: ArchivedJob[]; lastSeq: number } => {
     let seq = typeof parsed.lastSeq === "number" && Number.isSafeInteger(parsed.lastSeq) && parsed.lastSeq > 0
       ? parsed.lastSeq
       : 0;
@@ -125,6 +120,13 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
     return { rows: valid, lastSeq: seq };
   };
 
+  /** The valid rows and the highest sequence on disk now; null for an absent or unusable file. */
+  const readDisk = (): { rows: ArchivedJob[]; lastSeq: number } | null => {
+    const parsed = safeReadJsonSync<JobArchiveFile>(path, { validator: isJobArchiveFile });
+    return parsed ? normalizeFile(parsed) : null;
+  };
+
+
   const readOnce = (): void => {
     if (loaded) return;
     loaded = true;
@@ -135,33 +137,58 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
   };
 
   /**
-   * ⚠ Merge before every write. Another host's `llm-relay mcp` process writes this same file, and
-   * the previous version wrote only the rows this process had loaded at start, so each process
-   * erased every job the other one finished. A row this process holds wins over the disk copy of
-   * the same id. Not locked: two writes in one instant can still lose one row.
+   * Persist ONE terminal mutation against the latest committed archive.
+   *
+   * The read/merge/bound/rewrite is one cross-process JSON transaction. Only the row being recorded
+   * here overlays disk, so an older archive instance cannot overwrite a fresher same-id row merely
+   * because it later records some unrelated job. Lock acquisition defines same-id last-write-wins.
    */
-  const write = (): void => {
+  const write = (row: ArchivedJob): void => {
+    const transaction: { committed: JobArchiveFile | null } = { committed: null };
     try {
-      const disk = readDisk();
-      if (disk) {
-        for (const row of disk.rows) if (!rows.has(row.id)) rows.set(row.id, row);
-        if (disk.lastSeq > lastSeq) lastSeq = disk.lastSeq;
-      }
-      atomicWriteJsonSync(path, { version: JOB_ARCHIVE_VERSION, lastSeq, jobs: boundedRows(rows) });
+      const ok = transactionalUpdateJsonSync<JobArchiveFile>(
+        path,
+        (diskFile) => {
+          const disk = diskFile ? normalizeFile(diskFile) : { rows: [], lastSeq: 0 };
+          const merged = new Map<string, ArchivedJob>();
+          for (const existing of disk.rows) merged.set(existing.id, existing);
+          merged.set(row.id, row);
+
+          let seq = Math.max(lastSeq, disk.lastSeq);
+          const ownSeq = jobSeqOf(row.id);
+          if (ownSeq !== null && ownSeq > seq) seq = ownSeq;
+
+          transaction.committed = {
+            version: JOB_ARCHIVE_VERSION,
+            lastSeq: seq,
+            jobs: boundedRows(merged),
+          };
+          return transaction.committed;
+        },
+        { validator: isJobArchiveFile, strict: true },
+      );
+      const committed = transaction.committed;
+      if (!ok || committed === null) return;
+
+      lastSeq = committed.lastSeq;
+      rows.clear();
+      for (const saved of committed.jobs) rows.set(saved.id, saved);
     } catch {
-      // Best-effort: a full disk must not become a dispatch failure. The report still exists in
-      // memory for as long as this process lives, exactly as before the archive existed.
+      // Best-effort: a full disk or unusable lock must not become a dispatch failure. The report
+      // still exists in memory for as long as this process lives, exactly as before the archive.
     }
   };
+
 
   return {
     record(job) {
       readOnce();
       if (job.status === "running" || job.endedAt === undefined) return;
-      rows.set(job.id, boundOutput(job as ArchivedJob));
+      const archived = boundOutput(job as ArchivedJob);
+      rows.set(job.id, archived);
       // ⚠ Eager, see the module header: the case this exists for is a process killed with no
       // handler, where a delayed write is a lost report.
-      write();
+      write(archived);
     },
     restore() {
       readOnce();
@@ -200,6 +227,10 @@ function boundOutput(job: ArchivedJob): ArchivedJob {
   // A plain copy of the enumerable fields: the store's own object must not be shared with the
   // archive, or a later in-memory mutation would silently change what "was persisted".
   return { ...job, stdout: cut(job.stdout), stderr: cut(job.stderr), attempts: job.attempts.map((a) => ({ ...a })) };
+}
+
+function isJobArchiveFile(value: unknown): value is JobArchiveFile {
+  return isRecord(value) && value["version"] === JOB_ARCHIVE_VERSION && Array.isArray(value["jobs"]);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

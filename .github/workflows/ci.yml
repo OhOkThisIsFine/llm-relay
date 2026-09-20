@@ -80,6 +80,7 @@ jobs:
           test/windows-npm-shim.test.ts
           test/lane-runner.test.ts
           test/mcp-lane-launch.test.ts
+          test/mcp-persistence-concurrency.test.ts
           test/lane-process-lifecycle.test.ts
           test/process-cpu.test.ts
 
