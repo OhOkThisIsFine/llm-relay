@@ -1149,6 +1149,8 @@ export class McpDispatchServer {
   private readonly activityTags = new Map<string, string>();
   /** Last cumulative process-tree CPU reading for the current attempt of each job. */
   private readonly processCpu = new Map<string, number>();
+  /** Startup adoption work; only reads of restored terminal jobs wait for it. */
+  private readonly startup: Promise<void>;
 
   constructor(private readonly deps: McpServerDeps) {
     this.jobs = new LaneJobStore(deps.journal ?? nullJobJournal, deps.archive ?? nullJobArchive);
@@ -1157,6 +1159,7 @@ export class McpDispatchServer {
     this.now = deps.now ?? Date.now;
     this.cwd = deps.cwd ?? (() => process.cwd());
     this.maxDepth = deps.maxDepth ?? DEFAULT_MAX_DEPTH;
+    this.startup = this.restoreKilledTreeDeltas();
   }
 
   /**
@@ -1316,8 +1319,13 @@ export class McpDispatchServer {
       case "dispatch":
         return this.toolDispatch(args, ctx);
       case "dispatch_status":
+        // A restarted process may still be enriching killed jobs with their adoption-time tree
+        // delta. Status/result are the only surfaces that need that fidelity; never make MCP
+        // initialization, tool discovery, cancellation or a fresh dispatch wait on git.
+        await this.startup;
         return this.toolStatus(args);
       case "dispatch_result":
+        await this.startup;
         return this.toolResult(args);
       case "dispatch_cancel":
         return this.toolCancel(args);
@@ -1783,7 +1791,29 @@ export class McpDispatchServer {
     const before = await this.readTree(opts.cwd);
     if (before !== null) {
       this.trees.set(jobId, { cwd: opts.cwd, before, scope: opts.scope, activityLastSeen: before });
+      this.jobs.noteStartingTree(jobId, before, opts.scope);
     }
+  }
+
+  /**
+   * Complete a killed job's tree report by comparing its journaled start with the tree as it exists
+   * when this restarted server adopts the job. This can include edits made after the old process
+   * died, so the result is explicitly labelled as an adoption-time measurement.
+   */
+  private async restoreKilledTreeDeltas(): Promise<void> {
+    const adopted = this.jobs.takeAdoptedStartingTrees();
+    await Promise.all(
+      adopted.map(async ({ jobId, cwd, startingTree }) => {
+        const after = await this.readTree(cwd);
+        if (after === null) return;
+        const before: TreeSnapshot = { prefix: startingTree.prefix, entries: new Map(startingTree.entries) };
+        const delta = renderTreeDelta(cwd, before, after, startingTree.scope);
+        this.jobs.noteTreeDelta(
+          jobId,
+          `${delta}\n  note: measured at restart adoption time, not at the time the job was killed`,
+        );
+      }),
+    );
   }
 
   /**
