@@ -55,6 +55,15 @@ describe("relay agent provenance", () => {
     expect(text).toMatch(/jobId/);
   });
 
+  it("treats walk-verdict as authoritative and refuses circumstantial liveness inference", () => {
+    const text = RELAY_AGENT_TEMPLATE;
+    expect(text).toContain("walk-verdict");
+    expect(text).toContain("keep-running");
+    expect(text).toContain("no-idle-stop");
+    expect(text).toContain("unavailable");
+    expect(text).toMatch(/never infer liveness from elapsed time, output silence, historical duration/i);
+  });
+
   it("strips the caller's mode tag through one shared helper, not a prompt-only instruction", () => {
     expect(stripRelayDispatchPrefix("[answer] what is 2+2")).toEqual({ mode: "answer", task: "what is 2+2" });
     expect(stripRelayDispatchPrefix("[agent] fix the bug")).toEqual({ mode: "agent", task: "fix the bug" });
