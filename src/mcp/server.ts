@@ -233,8 +233,9 @@ export const MCP_INSTRUCTIONS =
   "--next-command -t <task>` and follow its returned command or target; do not guess from the host.\n\n" +
   "Let dispatch choose the lane. If a lane stops showing activity, dispatch moves to the next one " +
   "itself and prefers the lane that answered on your next call. For a running job, follow " +
-  "`walk-verdict`: `keep-running` means continue polling, and `no-idle-stop` means the walk will " +
-  "not stop this attempt for idleness. Do not infer liveness from elapsed time, output silence, " +
+  "`walk-verdict`: `keep-running` means continue polling, `no-idle-stop` means the walk will " +
+  "not stop this attempt for idleness, and `unavailable` means another MCP process owns the live " +
+  "job so you should keep polling rather than infer. Do not infer liveness from elapsed time, output silence, " +
   "historical duration, or last-activity diagnostics. Follow the advice at the end of a " +
   "reply: when it says a lane was stopped while it was still working, dispatch again with that " +
   "lane named so it can finish; when it says every lane ran and failed, do the work here — " +
@@ -374,7 +375,8 @@ const TOOLS: ToolDefinition[] = [
     description:
       "Report a dispatched job. While it runs, `walk-verdict` is the authoritative liveness " +
       "decision: keep-running means continue polling; no-idle-stop means this attempt is exempt " +
-      "from idle stopping. Elapsed time, output silence, historical duration and last-activity are " +
+      "from idle stopping; unavailable means another MCP process owns the live job, so keep polling. " +
+      "Elapsed time, output silence, historical duration and last-activity are " +
       "diagnostics only. Once it has ended: its full answer, exactly as dispatch_result returns it. Wait at least a few " +
       "seconds between polls. Without jobId: list the recent jobs of every llm-relay MCP server " +
       "on this machine, so a lost jobId can be found again.",
@@ -653,8 +655,8 @@ function describeJob(job: LaneJob, now: number): string {
   if (job.readOnly) head.push(`read-only: ${job.readOnly.binding}`);
   if (job.launch?.length) head.push(`launch: ${job.launch.join("; ")}`);
   head.push(...describeLiveness(job, now));
-  // While it runs: the lane's usual time to answer, from its own completed runs, so a caller can tell
-  // a slow lane from a stuck one instead of giving up (`LaneJob.expected`).
+  // While it runs: the lane's usual time to answer, from its own completed runs. Diagnostic only:
+  // the caller follows walk-verdict rather than inferring "stuck" from historical duration.
   const usually = runningTimeToAnswer(job);
   if (usually !== null) head.push(usually);
   // And what the running attempt has produced, so a caller can see a SILENT lane for what it is
