@@ -439,7 +439,12 @@ the owner these questions.
 - **DECISION (owner, 2026-09-17): (b) APPROVED, including "a successful health probe ends the
   cooldown early".** The packet is S5.
 
-#### S5 [mid] Repeated 5xx and 402 failures get growing cooldowns
+#### S5 DONE (2026-09-20) [mid] Repeated 5xx and 402 failures get growing cooldowns
+- **Shipped.** Failures 1–2 keep the previous behavior; failures 3/4/5/6+ add 10m/1h/6h/24h
+  recovery floors. Generic failures keep a longer measured cooldown; 402 keeps its one-hour floor
+  until the ladder exceeds it. The new `failure-escalation` source persists, is re-probed through
+  the bounded recovery loop, and a successful probe may end it early for 402/5xx. Both public
+  request fronts prove the cooled member is demoted rather than removed.
 - **Verified facts (`src/circuit-breaker.ts` `applyHealthOutcome`).** A 402 without `Retry-After`
   cools a flat `QUOTA_EXHAUSTED_COOLDOWN_MS` (1 h), source `default`. Another failure without
   `Retry-After` cools `failureCooldown(elapsedMs)` once `consecutiveFailures` reaches
