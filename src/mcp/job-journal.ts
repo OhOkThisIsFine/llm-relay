@@ -275,8 +275,11 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
       readOnce();
       const row = rows.get(jobId);
       if (row === undefined) return;
-      // The method is an internal typed seam, but keep the persisted shape canonical anyway.
-      row.brokerExecution = { kind: "daemon-v1", executionId: execution.executionId };
+      // The method is an internal typed seam, but a string type alone cannot prove the wire id.
+      // Refuse to write metadata a later process would discard as malformed.
+      const canonical = readBrokerExecution(execution);
+      if (canonical === undefined) return;
+      row.brokerExecution = canonical;
       persist();
     },
     clear(jobId) {
