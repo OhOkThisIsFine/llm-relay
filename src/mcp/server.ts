@@ -623,17 +623,18 @@ function describeLiveness(job: LaneJob, now: number): string[] {
     `walk-verdict: ${liveness.verdict}`,
     `activity-checked: ${checkedAgo}s ago`,
   ];
-  if (liveness.source !== undefined) lines.push(`activity-basis: ${liveness.source}`);
+  lines.push(`activity-basis: ${liveness.source}`);
   if (liveness.lastActivityAt !== null) {
     // Keep diagnostics in the SAME snapshot as the verdict. If a status poll arrives between walk
     // probes, only activity-checked ages; the activity age/headroom below stay exactly what the
     // walk knew when it made that verdict instead of drifting toward an apparent contradiction.
     const activityAgeAtCheck = Math.max(0, liveness.checkedAt - liveness.lastActivityAt);
     lines.push(`last-activity-at-check: ${Math.round(activityAgeAtCheck / 1000)}s ago`);
-    if (liveness.verdict === "keep-running" && liveness.idleMs !== null && liveness.activity !== "advancing") {
-      const remainingAtCheck = Math.max(0, liveness.idleMs - activityAgeAtCheck);
-      lines.push(`idle-stop-in-at-check: ${Math.ceil(remainingAtCheck / 1000)}s`);
-    }
+  }
+  if (liveness.verdict === "keep-running" && liveness.idleMs !== null && liveness.activity !== "advancing") {
+    const baselineAgeAtCheck = Math.max(0, liveness.checkedAt - liveness.idleBaselineAt);
+    const remainingAtCheck = Math.max(0, liveness.idleMs - baselineAgeAtCheck);
+    lines.push(`idle-stop-in-at-check: ${Math.ceil(remainingAtCheck / 1000)}s`);
   }
   return lines;
 }
@@ -2032,7 +2033,9 @@ export class McpDispatchServer {
         activity: "unmonitored",
         verdict: "no-idle-stop",
         checkedAt: attemptStart,
+        idleBaselineAt: attemptStart,
         lastActivityAt: null,
+        source: "attempt-start",
         idleMs: null,
       });
       return guarded;
@@ -2041,7 +2044,8 @@ export class McpDispatchServer {
       activity: "starting",
       verdict: "keep-running",
       checkedAt: attemptStart,
-      lastActivityAt: attemptStart,
+      idleBaselineAt: attemptStart,
+      lastActivityAt: null,
       source: "attempt-start",
       idleMs,
     });
@@ -2058,6 +2062,7 @@ export class McpDispatchServer {
     });
     // The lane counts as active at its start, so a lane is never stopped before `idleMs` has passed.
     let lastActive = attemptStart;
+    let lastRealActivity: number | null = null;
     let lastSource = "attempt-start";
     for (;;) {
       const raced = await Promise.race([settled, pollTimer(Math.min(IDLE_POLL_MS, idleMs))]);
@@ -2075,6 +2080,7 @@ export class McpDispatchServer {
       const fresh = seen !== null && seen.at > lastActive;
       if (fresh && seen !== null) {
         lastActive = seen.at;
+        lastRealActivity = seen.at;
         lastSource = seen.source;
       }
       const checkedAt = this.now();
@@ -2088,7 +2094,8 @@ export class McpDispatchServer {
           activity: "advancing",
           verdict: "keep-running",
           checkedAt,
-          lastActivityAt: lastActive,
+          idleBaselineAt: lastActive,
+          lastActivityAt: lastRealActivity,
           source: lastSource,
           idleMs,
         });
@@ -2098,7 +2105,8 @@ export class McpDispatchServer {
         activity: fresh ? "active" : "quiet",
         verdict: "keep-running",
         checkedAt,
-        lastActivityAt: lastActive,
+        idleBaselineAt: lastActive,
+        lastActivityAt: lastRealActivity,
         source: lastSource,
         idleMs,
       });
