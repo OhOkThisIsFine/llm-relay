@@ -240,11 +240,21 @@ describe("the walk stops a lane only when it is idle", () => {
     await vi.advanceTimersByTimeAsync(IDLE_POLL_MS);
     const status = h.call("dispatch_status", { jobId });
     await status.done;
-    expect(status.text()).toContain("activity: active");
-    expect(status.text()).toContain("walk-verdict: keep-running");
-    expect(status.text()).toContain("activity-basis: relay-in-flight");
-    expect(status.text()).toContain("idle-stop-in-at-check:");
-    expect(status.text()).toContain("last-activity-at-check:");
+    const firstText = status.text();
+    expect(firstText).toContain("activity: active");
+    expect(firstText).toContain("walk-verdict: keep-running");
+    expect(firstText).toContain("activity-basis: relay-in-flight");
+    const headroom = firstText.split("\n").find((line) => line.startsWith("idle-stop-in-at-check:"));
+    const lastActivity = firstText.split("\n").find((line) => line.startsWith("last-activity-at-check:"));
+    expect(headroom).toBeDefined();
+    expect(lastActivity).toBeDefined();
+
+    // A status poll does not advance either diagnostic: they describe the same probe snapshot.
+    await vi.advanceTimersByTimeAsync(8_000);
+    const later = h.call("dispatch_status", { jobId });
+    await later.done;
+    expect(later.text()).toContain(headroom as string);
+    expect(later.text()).toContain(lastActivity as string);
   });
 
   it("publishes advancing/keep-running during an idle lane handoff, never stop-idle", async () => {
@@ -277,7 +287,7 @@ describe("the walk stops a lane only when it is idle", () => {
     expect(text).not.toContain("idle-stop-in-at-check:");
   });
 
-  it("keeps last-activity and idle headroom frozen to the verdict's probe snapshot", async () => {
+  it("freezes idle headroom and does not fabricate last activity from attempt start", async () => {
     const h = harness({
       lanes: [cliLane("slow"), cliLane("next")],
       scripts: { slow: { answersAfterMs: 10 * IDLE_MS }, next: { answersAfterMs: 100 } },
@@ -294,17 +304,18 @@ describe("the walk stops a lane only when it is idle", () => {
     const firstText = firstStatus.text();
     expect(firstText).toContain("activity: quiet");
     expect(firstText).toContain("activity-basis: attempt-start");
-    expect(firstText).toContain("last-activity-at-check: 15s ago");
-    expect(firstText).toContain("idle-stop-in-at-check: 15s");
+    expect(firstText).not.toContain("last-activity-at-check:");
+    const headroom = firstText.split("\n").find((line) => line.startsWith("idle-stop-in-at-check:"));
+    expect(headroom).toBeDefined();
 
-    // No new walk probe occurs in this interval. Only activity-checked may age; the two values
-    // derived from the verdict snapshot must stay fixed rather than drifting toward 0.
+    // No new walk probe occurs in this interval. Only activity-checked may age; the headroom from
+    // the verdict snapshot stays fixed, and attempt start never turns into fake observed activity.
     await vi.advanceTimersByTimeAsync(8_000);
     const laterStatus = h.call("dispatch_status", { jobId });
     await laterStatus.done;
     const laterText = laterStatus.text();
-    expect(laterText).toContain("last-activity-at-check: 15s ago");
-    expect(laterText).toContain("idle-stop-in-at-check: 15s");
+    expect(laterText).toContain(headroom as string);
+    expect(laterText).not.toContain("last-activity-at-check:");
     expect(laterText).not.toContain("last-activity: ");
     expect(laterText).not.toContain("idle-stop-in: ");
   });
