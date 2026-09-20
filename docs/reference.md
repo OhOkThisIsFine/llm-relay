@@ -1751,7 +1751,7 @@ sessions can therefore each run up to `maxConcurrent` jobs against the same rung
 for up to `2 × maxConcurrent` together; this is the stated limit of what one process can observe,
 not a claim about the rung's real-world concurrency everywhere it might be dispatched from.
 
-#### Derived rung capability
+#### Rung capability (`capability`) and the budget extension
 
 A lane's dispatch ceiling is derived from synced capability evidence; it is not an operator-set
 trust value. For a direct relay model or a CLI rung with `--model`, the relay uses the highest
