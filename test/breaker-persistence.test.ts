@@ -170,6 +170,29 @@ describe("the whole breaker cell survives a restart", () => {
     expect(carried.cooldownUntil).toBe(now + 120_007);
   });
 
+  it("restores a repeated-failure escalation row with its counter and status intact", () => {
+    const now = 1_000_000_000_000;
+    const target = identity("nim", "flaky-500");
+
+    const before = new CircuitBreaker();
+    for (let i = 0; i < 5; i += 1) {
+      before.recordOutcome(target, { ok: false, status: 500, elapsedMs: 5, at: now + i });
+    }
+    const learned = before.getState(target)!;
+    expect(learned.cooldownSource).toBe("failure-escalation");
+    expect(learned.consecutiveFailures).toBe(5);
+    expect(learned.lastStatus).toBe(500);
+    saveBreakerState(before.exportState(), { path: statePath });
+
+    const after = new CircuitBreaker();
+    expect(installBreakerPersistence(after, { path: statePath }).restored).toBe(1);
+    const carried = after.getState(target)!;
+    expect(carried.cooldownSource).toBe("failure-escalation");
+    expect(carried.cooldownUntil).toBe(learned.cooldownUntil);
+    expect(carried.consecutiveFailures).toBe(5);
+    expect(carried.lastStatus).toBe(500);
+  });
+
   /**
    * ⚠ The point of carrying the COUNTER, not just the expiry: once the cooldown lifts, the next
    * unexplained 429 must resume at the top of the ladder rather than restart at two minutes.
