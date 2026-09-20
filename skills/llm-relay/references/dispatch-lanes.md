@@ -112,7 +112,20 @@ dispatch(task: "...", mode: "answer")         -> no harness — a direct call, f
 If the lane outlives the wait (`routing.mcp.maxWaitMs`, default 25 s — under Codex's 31 s script
 limit; a larger `waitMs` is clamped to it and the reply says so) you get a `jobId` instead. Then:
 `dispatch_status(jobId)` -> `dispatch_result(jobId)`, and `dispatch_cancel(jobId)` to stop it.
-`dispatch_status` says how long the running lane usually takes, so keep polling a slow lane.
+
+For a running job, **`walk-verdict` is the authoritative liveness decision**:
+- `keep-running` — continue polling; the walk has not decided this attempt is idle.
+- `no-idle-stop` — continue polling; this attempt is deliberately exempt from idle stopping
+  (for example the last useful lane).
+- `unavailable` — another live MCP process owns the job, so this process cannot observe the
+  verdict. Continue polling; do not infer from elapsed time or silence.
+
+The neighboring `activity`, `activity-basis`, `last-activity`, `idle-stop-in`, elapsed time,
+output progress, and historical time-to-answer fields are diagnostics. **Do not combine them to
+reconstruct liveness.** Status polling is observational: it does not itself sample relay traffic,
+owned-process CPU, or the working tree, so polling cannot consume evidence the walk needs for its
+own keep/stop decision.
+
 `dispatch_lanes()` shows the ladder if you want to choose deliberately.
 
 Follow the last paragraph of a reply with no answer: it names a lane the walk stopped while it was
