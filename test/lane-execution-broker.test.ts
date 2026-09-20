@@ -50,6 +50,15 @@ describe("parseLaneExecutionBrokerRequest", () => {
     });
   });
 
+  it("preserves the pre-broker MCP task range and requires the caller root for read-only starts", () => {
+    expect(parseLaneExecutionBrokerRequest(start({ task: "x".repeat(5_000) }))).not.toBeNull();
+    expect(parseLaneExecutionBrokerRequest(start({ readOnly: true }))).toBeNull();
+    expect(parseLaneExecutionBrokerRequest(start({
+      readOnly: true,
+      callerRoot: "C:/Code/caller",
+    }))).not.toBeNull();
+  });
+
   it("rejects unknown keys, malformed ids, empty tasks and unsafe timeout values", () => {
     expect(parseLaneExecutionBrokerRequest({ ...start(), command: "powershell" })).toBeNull();
     expect(parseLaneExecutionBrokerRequest({ ...start(), executionId: "bad id" })).toBeNull();
