@@ -250,7 +250,7 @@ describe("the walk stops a lane only when it is idle", () => {
   it("publishes advancing/keep-running during an idle lane handoff, never stop-idle", async () => {
     let h!: ReturnType<typeof harness>;
     let jobId: string | undefined;
-    let statusAtFirstKill: ReturnType<ReturnType<typeof harness>["call"]> | undefined;
+    let statusAtFirstKill: { done: Promise<void>; text: () => string } | undefined;
     h = harness({
       lanes: [cliLane("slow"), cliLane("next")],
       scripts: { slow: { answersAfterMs: 10 * IDLE_MS }, next: { answersAfterMs: 100 } },
