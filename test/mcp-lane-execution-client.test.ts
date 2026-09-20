@@ -36,7 +36,7 @@ function runningExecution(overrides: Record<string, unknown> = {}) {
 
 describe("createLaneExecutionClient", () => {
   it("sends the exact broker request with control authorization and accepts a strict snapshot", async () => {
-    const seen: Array<{ url: string; init?: RequestInit }> = [];
+    const seen: Array<{ url: string; init: RequestInit | undefined }> = [];
     const fetchFn = (async (url: string | URL | Request, init?: RequestInit) => {
       seen.push({ url: String(url), init });
       return new Response(JSON.stringify({ execution: runningExecution() }), {
