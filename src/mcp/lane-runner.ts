@@ -283,9 +283,10 @@ export interface LaneJob {
   forcedLane?: boolean;
   /**
    * How long the lane now running usually takes to ANSWER in this dispatch's mode, from that
-   * lane's own completed runs — rendered on every poll so a caller can tell a slow lane from a
-   * stuck one. 23 of the 182 unanswered dispatches in the 2026-09-10 transcript sweep ended with
-   * the caller simply no longer polling. Absent when the lane has no completed run on record.
+   * lane's own completed runs. Diagnostic only: it gives duration context, but the caller follows
+   * `liveness.verdict` rather than deciding "stuck" from history. 23 of the 182 unanswered
+   * dispatches in the 2026-09-10 transcript sweep ended with the caller simply no longer polling.
+   * Absent when the lane has no completed run on record.
    */
   expected?: { medianMs: number | null; p80Ms: number | null; samples: number };
   startedAt: number;
@@ -351,8 +352,8 @@ export interface LaneJob {
  * `relay` rung takes in agent mode, i.e. the free pool itself — buffers its whole answer until
  * exit (module header), so "zero bytes after N seconds" is the ordinary shape of a healthy run on
  * the most-used lane. A threshold that killed on it would manufacture the false failure the backlog
- * item names as worse than a slow honest status. The figure lets the CALLER decide, which is the
- * property's second branch.
+ * item names as worse than a slow honest status. This figure is diagnostic only; the caller follows
+ * the walk's published liveness verdict instead of interpreting silence.
  */
 export interface LaneActivity {
   /** When the running attempt was spawned. */
