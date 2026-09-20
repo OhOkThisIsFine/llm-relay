@@ -202,6 +202,24 @@ describe("the walk stops a lane only when it is idle", () => {
     expect(new Set(h.asked)).toEqual(new Set([tag]));
   });
 
+  it("publishes no-idle-stop for an attempt the walk deliberately will not abandon", async () => {
+    const h = harness({
+      lanes: [cliLane("last")],
+      scripts: { last: { answersAfterMs: 3 * IDLE_MS } },
+    });
+    const first = h.call("dispatch", { task: "t", waitMs: 1_000 });
+    await vi.advanceTimersByTimeAsync(1_500);
+    await first.done;
+    const jobId = /jobId "(job-\d+)"/.exec(first.text())?.[1] ?? /job: (job-\d+)/.exec(first.text())?.[1];
+    expect(jobId).toBeDefined();
+
+    const status = h.call("dispatch_status", { jobId });
+    await status.done;
+    expect(status.text()).toContain("activity: unmonitored");
+    expect(status.text()).toContain("walk-verdict: no-idle-stop");
+    expect(status.text()).not.toContain("idle-stop-in:");
+  });
+
   it("publishes relay in-flight activity as an authoritative keep-running verdict", async () => {
     const h = harness({
       lanes: [cliLane("slow"), cliLane("next")],
