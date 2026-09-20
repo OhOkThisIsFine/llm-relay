@@ -100,6 +100,117 @@ export type LaneExecutionBrokerResult =
   | { ok: true; execution: LaneExecutionSnapshot }
   | { ok: false; status: 400 | 404 | 409 | 503; message: string };
 
+const SNAPSHOT_KEYS = new Set([
+  "schema",
+  "executionId",
+  "jobId",
+  "laneId",
+  "status",
+  "startedAt",
+  "endedAt",
+  "stdoutBytes",
+  "stderrBytes",
+  "lastOutputAt",
+  "cpuMs",
+  "code",
+  "stdout",
+  "stderr",
+  "timedOut",
+]);
+
+/**
+ * Parse the broker's public snapshot at an untrusted HTTP/file boundary.
+ *
+ * The optional process-result fields travel as one group: a running execution has none; a
+ * cancelled execution may have none until its killed child settles; every other terminal
+ * execution carries the full quartet. Unknown keys fail closed so a protocol revision cannot be
+ * silently misread by an older MCP client.
+ */
+export function parseLaneExecutionSnapshot(value: unknown): LaneExecutionSnapshot | null {
+  if (!isRecord(value) || !exactKeys(value, SNAPSHOT_KEYS)) return null;
+  if (value["schema"] !== LANE_EXECUTION_SCHEMA) return null;
+  if (!boundedId(value["executionId"]) || !boundedId(value["jobId"]) || !boundedId(value["laneId"])) return null;
+
+  const status = value["status"];
+  if (
+    status !== "running" &&
+    status !== "completed" &&
+    status !== "failed" &&
+    status !== "timed_out" &&
+    status !== "cancelled"
+  ) {
+    return null;
+  }
+  const startedAt = value["startedAt"];
+  if (typeof startedAt !== "number" || !Number.isFinite(startedAt)) return null;
+  const endedAt = value["endedAt"];
+  if (endedAt !== null && (typeof endedAt !== "number" || !Number.isFinite(endedAt))) return null;
+  if (status === "running" ? endedAt !== null : endedAt === null) return null;
+
+  const stdoutBytes = value["stdoutBytes"];
+  const stderrBytes = value["stderrBytes"];
+  if (
+    typeof stdoutBytes !== "number" ||
+    !Number.isSafeInteger(stdoutBytes) ||
+    stdoutBytes < 0 ||
+    typeof stderrBytes !== "number" ||
+    !Number.isSafeInteger(stderrBytes) ||
+    stderrBytes < 0
+  ) {
+    return null;
+  }
+  const lastOutputAt = value["lastOutputAt"];
+  if (
+    lastOutputAt !== null &&
+    (typeof lastOutputAt !== "number" || !Number.isFinite(lastOutputAt))
+  ) {
+    return null;
+  }
+  const cpuMs = value["cpuMs"];
+  if (cpuMs !== undefined && (typeof cpuMs !== "number" || !Number.isFinite(cpuMs) || cpuMs < 0)) {
+    return null;
+  }
+
+  const hasCode = Object.hasOwn(value, "code");
+  const hasStdout = Object.hasOwn(value, "stdout");
+  const hasStderr = Object.hasOwn(value, "stderr");
+  const hasTimedOut = Object.hasOwn(value, "timedOut");
+  const resultCount = Number(hasCode) + Number(hasStdout) + Number(hasStderr) + Number(hasTimedOut);
+  if (resultCount !== 0 && resultCount !== 4) return null;
+  if (status === "running" && resultCount !== 0) return null;
+  if (status !== "running" && status !== "cancelled" && resultCount !== 4) return null;
+
+  const out: LaneExecutionSnapshot = {
+    schema: LANE_EXECUTION_SCHEMA,
+    executionId: value["executionId"],
+    jobId: value["jobId"],
+    laneId: value["laneId"],
+    status,
+    startedAt,
+    endedAt,
+    stdoutBytes,
+    stderrBytes,
+    lastOutputAt,
+    ...(cpuMs === undefined ? {} : { cpuMs }),
+  };
+  if (resultCount === 4) {
+    const code = value["code"];
+    if (code !== null && (typeof code !== "number" || !Number.isFinite(code))) return null;
+    if (
+      typeof value["stdout"] !== "string" ||
+      typeof value["stderr"] !== "string" ||
+      typeof value["timedOut"] !== "boolean"
+    ) {
+      return null;
+    }
+    out.code = code;
+    out.stdout = value["stdout"];
+    out.stderr = value["stderr"];
+    out.timedOut = value["timedOut"];
+  }
+  return out;
+}
+
 export type LaneExecutionLauncher = (
   request: LaneExecutionStartRequest,
 ) => LaneExecutionLaunchHandle | { refusal: string };
