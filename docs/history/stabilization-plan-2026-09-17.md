@@ -197,7 +197,7 @@ renders the delta for the killed job.
   failed attempt holds the new kind, and the second candidate serves.
 - **Proof.** The assertions fail with the push removed.
 
-### R1 [cheap] Remove stale documentation claims
+### R1 DONE (2026-09-20) [cheap] Remove stale documentation claims
 - `CLAUDE.md` `hedge-race.ts` row says the post-commit stall or crawl policy "needs an owner
   decision (`docs/backlog.md`)". The crawl watchdog shipped 2026-09-09 (`withCrawlWatchdog`) and
   `docs/backlog.md` holds no such entry. Rewrite the sentence: the post-commit policy exists (stall

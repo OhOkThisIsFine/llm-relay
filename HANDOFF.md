@@ -76,10 +76,11 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   the old behavior; failure 3 onward gains a 10m → 1h → 6h → 24h recovery floor, without ever
   removing the member from failover. The background recovery loop re-probes relay-invented
   `failure-escalation` cooldowns, and a 200 probe can end one early for 402/5xx.
-- **Immediate next.** R1: remove the two remaining stale documentation claims named in the
-  stabilization plan. Then M1 can proceed only after one real archived AGY job confirms the exact
-  response-envelope shape. Separately open: repository CI enforcement, Route B's vendor blocker,
-  owner-driven Codex/Code-tab checks, and design items D1/D2/D5.
+- **Immediate next.** M1 starts with an evidence check, not code: read one real archived
+  `agy-gemini` job and confirm the exact success-envelope key set before writing the narrow
+  `lane-envelope.ts` parser. If that archive is unavailable in the current environment, move to
+  D1's detached-lane design rather than guessing the AGY schema. Separately open: repository CI
+  enforcement, Route B's vendor blocker, owner-driven Codex/Code-tab checks, and D1/D2/D5.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
@@ -221,8 +222,11 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   ladder, pins the lane that answered, demotes the one that did not, and budgets each lane from
   its own p80. Three defects fixed in review: a demotion did not retract the pin; the budget
   measured itself; a clamped budget was labelled `history`. ⚠ Review coverage was PARTIAL — 24 of
-  33 second-pass findings are UNVERIFIED, two filed in the backlog. ⚠ The demotion is EVIDENCE,
-  not a calibrated statistic; never point the HTTP path's numbers at a lane. Full record:
+  33 second-pass findings are UNVERIFIED, two filed in the backlog. That count is historical, not
+  a current verification ledger: the review document does not identify those findings individually,
+  and v0.84 removed the time-budget stop that many concerned. Do not claim the remainder was later
+  verified. ⚠ The demotion is EVIDENCE, not a calibrated statistic; never point the HTTP path's
+  numbers at a lane. Full record:
   [docs/history/lane-walk-safety-review-2026-09-08.md](docs/history/lane-walk-safety-review-2026-09-08.md).
 
 ### 0.5 Offload, measured
