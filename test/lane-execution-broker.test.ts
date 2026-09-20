@@ -159,6 +159,26 @@ describe("LaneExecutionBroker", () => {
       .toMatchObject({ ok: true, execution: { status: "cancelled", stdout: "partial" } });
   });
 
+  it("never prunes a cancelled execution while its child handle is still unsettled", async () => {
+    const run = deferred<LaneExecutionRunResult>();
+    const broker = new LaneExecutionBroker(
+      () => ({ result: run.promise, cancel: () => {} }),
+      () => 100,
+      0,
+    );
+    await broker.handle(start());
+    await broker.handle({ action: "cancel", executionId: start().executionId });
+
+    // maxTerminal=0 would normally remove every terminal row, but this one still owns the child.
+    expect(await broker.handle({ action: "status", executionId: start().executionId }))
+      .toMatchObject({ ok: true, execution: { status: "cancelled" } });
+
+    run.resolve({ code: 1, stdout: "", stderr: "stopped", timedOut: false });
+    await Promise.resolve();
+    expect(await broker.handle({ action: "status", executionId: start().executionId }))
+      .toMatchObject({ ok: false, status: 404 });
+  });
+
   it("maps process outcomes without inventing semantic lane judgments", async () => {
     for (const [result, status] of [
       [{ code: 0, stdout: "#", stderr: "", timedOut: false }, "completed"],
