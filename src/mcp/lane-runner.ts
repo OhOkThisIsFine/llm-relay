@@ -213,6 +213,30 @@ export function classifyLaneAttempt(
   return run.code === 0 && opts.semanticFailure === undefined ? "completed" : "failed";
 }
 
+export type LaneActivityState = "starting" | "active" | "quiet" | "idle" | "unmonitored";
+export type LaneWalkVerdict = "keep-running" | "stop-idle" | "no-idle-stop";
+
+/**
+ * The walk's OWN liveness decision for the attempt running now.
+ *
+ * This is a published snapshot, not a second activity probe. `mcp/server.ts` computes it while
+ * making the same keep/stop decision the walk already has to make, then `dispatch_status` merely
+ * renders it. A status read must never call the relay-traffic, process-CPU or working-tree readers:
+ * those readers carry baselines/state and consuming them from a poll could change routing.
+ */
+export interface LaneLiveness {
+  activity: LaneActivityState;
+  verdict: LaneWalkVerdict;
+  /** When the walk last evaluated/published this snapshot. */
+  checkedAt: number;
+  /** Newest activity timestamp the walk has accepted for this attempt, when one exists. */
+  lastActivityAt: number | null;
+  /** Which first-party signal supplied `lastActivityAt`, when known. */
+  source?: string;
+  /** Idle cutoff applied to this attempt; null means the walk will not idle-stop it. */
+  idleMs: number | null;
+}
+
 export interface LaneJob {
   id: string;
   status: JobStatus;
@@ -314,11 +338,10 @@ export interface LaneJob {
    */
   treeDelta?: string;
   /**
-   * The newest activity the walk saw for the lane now running (relay traffic, output, owned
-   * process CPU, or a file change), with its source. Replaced per lane; the walk stops a lane when this is older than
-   * `routing.dispatchWalk.idleMs`.
+   * The walk's authoritative liveness snapshot for the lane now running. Replaced per lane and
+   * removed when the job becomes terminal; terminal attempt records already say how the lane ended.
    */
-  lastActive?: { at: number; source: string };
+  liveness?: LaneLiveness;
 }
 
 /**
@@ -1313,8 +1336,9 @@ export class LaneJobStore {
     // The job is no longer running, so it is no longer something a restart could kill.
     this.journal.clear(id);
     if (!job) return;
-    // The attempt is over, so "silent for N s" no longer describes anything.
+    // The attempt is over, so neither stream progress nor a running-attempt verdict describes it.
     delete job.activity;
+    delete job.liveness;
     const pids = readOwnedPids(handle);
     if (kill === undefined) {
       // Nothing of ours ran for this job. Reported rather than omitted, so "no owned process" and
@@ -1379,12 +1403,22 @@ export class LaneJobStore {
     // must clear the previous lane's figure rather than inherit it.
     if (expected === undefined) delete job.expected;
     else job.expected = expected;
-    // Same rule for the previous lane's output progress and read-only binding: both describe an
-    // attempt that is over. `beginAttemptActivity`/`noteReadOnly` set the new lane's own.
+    // Same rule for attempt-scoped output/provenance/liveness: none may leak into the next rung.
     delete job.activity;
     delete job.readOnly;
     delete job.launch;
-    delete job.lastActive;
+    delete job.liveness;
+    // A different MCP process can answer status for this running job from the shared journal.
+    // Keep the lane identity current there too; liveness itself stays process-local so the journal
+    // is not rewritten every 15 seconds.
+    this.journal.note({
+      jobId: job.id,
+      laneId: job.laneId,
+      ...(job.spec === undefined ? {} : { spec: job.spec }),
+      cwd: job.cwd,
+      startedAt: job.startedAt,
+      ...(job.label === undefined ? {} : { label: job.label }),
+    });
   }
 
   /**
@@ -1426,11 +1460,11 @@ export class LaneJobStore {
     if (job.status !== "running") this.archive.record(job);
   }
 
-  /** Record the newest activity the walk saw for the running lane. */
-  noteLastActivity(id: string, at: number, source: string): void {
+  /** Publish the walk's liveness decision for the attempt now running. Pure status data only. */
+  noteLiveness(id: string, liveness: LaneLiveness): void {
     const job = this.jobs.get(id);
     if (!job || job.status !== "running") return;
-    job.lastActive = { at, source };
+    job.liveness = { ...liveness };
   }
 
   noteLaunch(id: string, notes: readonly string[]): void {
