@@ -252,6 +252,9 @@ function buildCooldowns(
         // "quota" joins rate_limit: Gap 12's demotion IS a spent-quota cooldown, which is what
         // this panel exists to show — labelling it provider_error would hide the one fact the
         // operator needs (the quota resets on its own; nothing is sick).
+        //
+        // `failure-escalation` deliberately does NOT join by source. Its lastStatus decides:
+        // repeated 402 is rate_limit; repeated 5xx is provider_error.
         const rateLimited =
           state.cooldownSource === "retry-after" ||
           state.cooldownSource === "escalation" ||

@@ -160,6 +160,45 @@ function messages(p: number, model = "pool/coding"): Promise<Response> {
   });
 }
 
+describe("repeated-failure escalation stays a demotion, never an eviction", () => {
+  it.each([
+    ["OpenAI Chat", chat],
+    ["Anthropic Messages", messages],
+  ] as const)("%s tries the healthy sibling first, then can still fall back to the escalated member", async (_name, request) => {
+    globalCircuitBreaker.reset();
+    resetFacts();
+    resetInterpretations();
+
+    const escalatedWinner = await scripted(() => ({ body: OK_BODY }));
+    const healthyButFailing = await scripted(() => ({
+      status: 500,
+      body: JSON.stringify({ error: { message: "temporary failure" } }),
+    }));
+    const now = Date.now();
+    for (let i = 0; i < 3; i += 1) {
+      globalCircuitBreaker.recordOutcome(
+        breakerIdentity("p1", "m1"),
+        { ok: false, status: 500, elapsedMs: 5, at: now - 10 + i },
+      );
+    }
+    expect(globalCircuitBreaker.getState(breakerIdentity("p1", "m1"))!.cooldownSource)
+      .toBe("failure-escalation");
+
+    const p = port(await startProxy(poolCfg([
+      `http://127.0.0.1:${port(escalatedWinner.server)}`,
+      `http://127.0.0.1:${port(healthyButFailing.server)}`,
+    ])));
+
+    const response = await request(p);
+    expect(response.status).toBe(200);
+    // p1 is configured first but cooling, so p2 must have been promoted ahead of it. p2 then
+    // fails, proving p1 remained in the walk rather than being filtered out.
+    expect(healthyButFailing.calls()).toBe(1);
+    expect(escalatedWinner.calls()).toBe(1);
+    expect(response.headers.get(SERVED_BY_HEADER)).toBe("p1/m1");
+  });
+});
+
 describe("OpenAI front — failover across pool candidates", () => {
   it("records exactly one failed and one measured winner across both public fronts", async () => {
     const anthBuffered = JSON.stringify({ id: "m", type: "message", role: "assistant", model: "m2", content: [{ type: "text", text: "ok" }], stop_reason: "end_turn", usage: { input_tokens: 2, output_tokens: 6 } });

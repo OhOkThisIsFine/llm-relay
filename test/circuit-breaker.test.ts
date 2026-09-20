@@ -128,6 +128,76 @@ describe("CircuitBreaker", () => {
     expect(cb.isHealthy(targetA, now + 1000)).toBe(false);
   });
 
+  it("escalates repeated generic failures from the third failure and caps at 24 hours", () => {
+    const cb = new CircuitBreaker();
+    const at = 1_000_000;
+    const expected: Array<{ ms: number | null; source: string | null }> = [
+      { ms: null, source: null },          // failure 1: below trip threshold
+      { ms: 60_000, source: "default" },  // failure 2: pre-existing trip behavior
+      { ms: 600_000, source: "failure-escalation" },
+      { ms: 3_600_000, source: "failure-escalation" },
+      { ms: 21_600_000, source: "failure-escalation" },
+      { ms: 86_400_000, source: "failure-escalation" },
+      { ms: 86_400_000, source: "failure-escalation" },
+    ];
+
+    expected.forEach((want, index) => {
+      const now = at + index;
+      cb.recordOutcome(targetA, { ok: false, status: 500, elapsedMs: 5, at: now });
+      const state = cb.getState(targetA)!;
+      expect(state.consecutiveFailures).toBe(index + 1);
+      expect(state.cooldownSource).toBe(want.source);
+      expect(state.cooldownUntil).toBe(want.ms === null ? 0 : now + want.ms);
+    });
+  });
+
+  it("keeps a longer measured failure cooldown instead of shortening it to the escalation floor", () => {
+    const cb = new CircuitBreaker();
+    const at = 1_000_000;
+    cb.recordOutcome(targetA, { ok: false, status: 500, elapsedMs: 5, at });
+    cb.recordOutcome(targetA, { ok: false, status: 500, elapsedMs: 5, at: at + 1 });
+    cb.recordOutcome(targetA, { ok: false, status: 500, elapsedMs: 12 * 60_000, at: at + 2 });
+    const state = cb.getState(targetA)!;
+    expect(state.cooldownSource).toBe("elapsed");
+    expect(state.cooldownUntil).toBe(at + 2 + 12 * 60_000);
+  });
+
+  it("keeps 402 at its existing one-hour floor until the failure ladder becomes longer", () => {
+    const cb = new CircuitBreaker();
+    const at = 2_000_000;
+    const expected = [
+      [3_600_000, "default"],
+      [3_600_000, "default"],
+      [3_600_000, "default"],
+      [3_600_000, "default"],
+      [21_600_000, "failure-escalation"],
+      [86_400_000, "failure-escalation"],
+    ] as const;
+    expected.forEach(([ms, source], index) => {
+      const now = at + index;
+      cb.recordOutcome(targetA, { ok: false, status: 402, elapsedMs: 5, at: now });
+      const state = cb.getState(targetA)!;
+      expect(state.cooldownUntil).toBe(now + ms);
+      expect(state.cooldownSource).toBe(source);
+    });
+  });
+
+  it("a real success resets the repeated-failure escalation ladder", () => {
+    const cb = new CircuitBreaker();
+    const at = 3_000_000;
+    for (let i = 0; i < 4; i += 1) {
+      cb.recordOutcome(targetA, { ok: false, status: 500, elapsedMs: 5, at: at + i });
+    }
+    expect(cb.getState(targetA)!.cooldownSource).toBe("failure-escalation");
+
+    cb.recordOutcome(targetA, { ok: true, status: 200, elapsedMs: 5, at: at + 10 });
+    cb.recordOutcome(targetA, { ok: false, status: 500, elapsedMs: 5, at: at + 11 });
+    const state = cb.getState(targetA)!;
+    expect(state.consecutiveFailures).toBe(1);
+    expect(state.cooldownUntil).toBe(0);
+    expect(state.cooldownSource).toBeNull();
+  });
+
   it("a success resets the consecutive-failure count", () => {
     const cb = new CircuitBreaker();
     const now = 100000;

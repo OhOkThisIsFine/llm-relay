@@ -206,7 +206,7 @@ block. State lives under `~/.llm-relay/`: `config.json`, `.env`, `keystore.json`
 the `usage/` accounting subtree.
 
 `breaker-state.json` is the circuit breaker's own memory: every credential×model cell it has
-learned about — the cooldown and its source, the unexplained-429 ladder, the failure counters, the
+learned about — the cooldown and its source, the unexplained-429 and repeated-failure ladder state, the failure counters, the
 credential fault, the last ten served-request samples and the quota observations — restored when the
 relay starts, so a restart does not send it back into a wall it already knows. Every field is
 re-learnable, so the file is cache-kind and safe to delete. Written on a short debounce (at most
@@ -661,10 +661,11 @@ entry can legitimately be the one that answers. `llm-relay candidates` reports t
 ## Failover (both fronts, one policy)
 
 - **429 / 5xx / 400 / 402 / 404 / 410** → recorded as a breaker failure, next candidate tried. A
-  `Retry-After` sets that candidate's cooldown to what the provider asked, **bounded to 1 s–15 min**
-  — so an hour-scale reset is re-probed after 15 minutes rather than parking the member for the
-  whole hour. 402 (depleted credits) cools for 1 hour when it carries no `Retry-After`; a 402 that
-  does carry one uses the same bounded value, i.e. at most 15 minutes. A 410 whose body states end-of-life additionally
+  `Retry-After` sets that candidate's cooldown to what the provider asked, **bounded to 1 s–15 min**.
+  Without one, repeated generic failures/5xx gain a recovery floor from failure 3 onward:
+  **10 min → 1 h → 6 h → 24 h**; the existing measured/default cooldown still wins when longer.
+  402 keeps its existing 1-hour floor, then uses the same ladder once it becomes longer (6 h, then
+  24 h). A 410 whose body states end-of-life additionally
   records a `not-servable` fact, so a retired model stops burning a walk slot per request.
 - **401 / 403** → the exact credential slot is marked `AUTH` and the walk may try a sibling slot or
   the next deployment. `llm-relay candidates` exposes the fault instead of hiding it. It expires
@@ -781,12 +782,12 @@ gate below governs only the allowance path. The response announces a displaced f
 nobody stated has no effect, and there is no margin to tune: the relay steps aside exactly at the
 stated figure.
 
-A deployment cooled by 429s is **re-probed while it cools**: the background loop sends one probe
-per cooling cell per minute (at most three per tick) against the cooldowns the relay itself
-guessed (the 2 min → 10 min → 1 h → 24 h escalation rungs), and a probe that answers 200 ends the
-cooldown at once. A stated `Retry-After` is honoured, not re-probed early. The escalation index
-is kept — only a real served success resets it — so a member that keeps refusing real requests
-while passing probes still escalates its nominal step.
+A deployment on a relay-invented recovery cooldown is **re-probed while it cools**: the background
+loop sends one probe per cooling cell per minute (at most three per tick) against guessed 429
+escalation and repeated-failure `failure-escalation` rungs (402 or 5xx). A probe that answers 200
+ends that guessed cooldown at once. A stated `Retry-After` is honoured, not proactively re-probed.
+The failure/429 counters are kept — only a real served success resets them — so repeated real
+failures still escalate even when a one-token probe briefly succeeds.
 
 Ordering also **interleaves providers** within a rank band, so the first N attempts land in N
 distinct quota domains rather than N members sharing one credential. The top-ranked candidate is

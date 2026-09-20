@@ -85,7 +85,7 @@ export interface AttemptWindow {
 /** The narrowest handle that names one breaker cell: exactly what `getKey` reads. */
 export type BreakerCellSelector = Pick<ProviderTargetIdentity, "credentialId" | "model">;
 
-/** One cell cooling on a rung the relay may re-test by probing — see `rateLimitCoolingCells`. */
+/** One cell cooling on a relay-invented rung that the ping loop may re-test. */
 export interface RateLimitCoolingCell {
   readonly provider: string;
   readonly model: string | null;
@@ -185,6 +185,7 @@ export const COOLDOWN_SOURCES = [
   "loopback",
   "quota",
   "elapsed",
+  "failure-escalation",
 ] as const;
 
 export type CooldownSource = (typeof COOLDOWN_SOURCES)[number];
@@ -288,6 +289,14 @@ const CANCELLATION_EVIDENCE_MS = DEFAULT_COOLDOWN_MS;
 const RATE_LIMIT_ESCALATION_MS = [
   120_000, 600_000, 3_600_000, 86_400_000,
 ] as const;
+/**
+ * Repeated generic failures (including 5xx) and 402s escalate only AFTER the existing two-failure
+ * trip threshold. Index = consecutiveFailures - (MAX_FAILURES_BEFORE_TRIP + 1):
+ * failures 1–2 keep today's behaviour; 3, 4, 5, 6+ add 10m, 1h, 6h, 24h floors.
+ */
+const FAILURE_ESCALATION_MS = [
+  600_000, 3_600_000, 21_600_000, 86_400_000,
+] as const;
 const LOOPBACK_RATE_LIMIT_COOLDOWN_MS = 5_000;
 const QUOTA_EXHAUSTED_COOLDOWN_MS = 3_600_000;
 const MAX_FAILURES_BEFORE_TRIP = 2;
@@ -323,6 +332,8 @@ export const MAX_ATTEMPT_STARTS = 10_000;
  * - `quota` — a spent allowance with a stated `resetsAt`; re-registered by `cooledByQuota` on the
  *   next request anyway, and a one-token probe does not disprove a spent token allowance.
  * - `elapsed` — a slow failure's measured waste; a fast probe says nothing about a slow request.
+ * - `failure-escalation` — the relay's repeated-5xx/402 floor. A successful probe directly
+ *   disproves that guessed recovery window, but only when `lastStatus` is 402 or 5xx.
  */
 const PROBE_SUCCESS_ENDS_COOLDOWN = {
   "default": true,
@@ -331,13 +342,15 @@ const PROBE_SUCCESS_ENDS_COOLDOWN = {
   "loopback": true,
   "quota": false,
   "elapsed": false,
+  "failure-escalation": true,
 } as const satisfies Record<CooldownSource, boolean>;
 
 /**
  * Which cooldown SOURCES the ping loop SPENDS a probe on (`rateLimitCoolingCells`). Narrower than
  * the table above on purpose: ending a cooldown a probe happened to disprove costs nothing, but
  * choosing to send a request against a limit the provider just stated does — so only the rungs
- * the relay itself invented are re-tested. Same total-table discipline.
+ * the relay itself invented are re-tested: guessed 429s and repeated-failure escalation. Same
+ * total-table discipline.
  */
 const REPROBE_TARGETS_COOLDOWN = {
   "default": true,
@@ -346,6 +359,7 @@ const REPROBE_TARGETS_COOLDOWN = {
   "loopback": false,
   "quota": false,
   "elapsed": false,
+  "failure-escalation": true,
 } as const satisfies Record<CooldownSource, boolean>;
 /** Ordering-only middle band retained for telemetry consumers during migration. */
 export const UNMEASURED_STABILITY = 50;
@@ -391,6 +405,21 @@ export function failureCooldown(elapsedMs: number): { ms: number; source: Cooldo
   return wasted > DEFAULT_COOLDOWN_MS
     ? { ms: wasted, source: "elapsed" }
     : { ms: DEFAULT_COOLDOWN_MS, source: "default" };
+}
+
+/** Escalation floor for this consecutive-failure count; null before failure 3. */
+function failureEscalationMs(consecutiveFailures: number): number | null {
+  const index = consecutiveFailures - (MAX_FAILURES_BEFORE_TRIP + 1);
+  if (index < 0) return null;
+  return FAILURE_ESCALATION_MS[Math.min(index, FAILURE_ESCALATION_MS.length - 1)]!;
+}
+
+/** Does a successful probe directly disprove this relay-invented cooldown? */
+function probeDisprovesCooldown(source: CooldownSource, status: number | undefined): boolean {
+  if (source === "failure-escalation") {
+    return status === 402 || (status !== undefined && status >= 500 && status <= 599);
+  }
+  return status === 429;
 }
 
 function isLoopbackTarget(target: ProviderTargetIdentity): boolean {
@@ -561,14 +590,12 @@ export class CircuitBreaker implements AttemptLifecyclePort {
   }
 
   /**
-   * A PROBE answered 200 for this exact cell: end its 429-sourced cooldown now (2026-09-15, the
-   * backlog's "a probe that answers 200 ends a rate-limit cooldown early").
+   * A PROBE answered 200 for this exact cell: end a relay-invented recovery cooldown it disproves.
    *
-   * Two gates, both required, and the second exists because the first cannot decide alone:
-   * `PROBE_SUCCESS_ENDS_COOLDOWN` names which SOURCES a probe may end, but `default` and
-   * `retry-after` are shared with a 402 and with generic failures, so the cell's `lastStatus`
-   * must be the 429 that set it. A cooldown that came from a quota statement, a credential
-   * fault (its own axis, untouched here), an operator hard cap (never on the breaker) or a slow
+   * Two gates, both required: `PROBE_SUCCESS_ENDS_COOLDOWN` names which SOURCES a probe may end,
+   * then `probeDisprovesCooldown` checks the status that earned it. The legacy guessed 429 sources
+   * still require `lastStatus === 429`; `failure-escalation` accepts only 402 or 5xx. A stated
+   * quota, credential fault, operator hard cap, ordinary generic-failure floor, or slow measured
    * failure is left exactly as it was.
    *
    * ⚠ `unexplained429s` — the escalation ladder's index — is deliberately NOT reset. A probe is a
@@ -580,8 +607,9 @@ export class CircuitBreaker implements AttemptLifecyclePort {
   endRateLimitCooldown(cell: BreakerCellSelector, at = Date.now()): boolean {
     const state = this.states.get(this.getKey(cell));
     if (state === undefined || state.cooldownUntil <= at) return false;
-    if (state.lastStatus !== 429 || state.cooldownSource === null) return false;
+    if (state.cooldownSource === null) return false;
     if (!PROBE_SUCCESS_ENDS_COOLDOWN[state.cooldownSource]) return false;
+    if (!probeDisprovesCooldown(state.cooldownSource, state.lastStatus)) return false;
     state.cooldownUntil = 0;
     state.cooldownSource = null;
     this.notifyStateChanged();
@@ -589,21 +617,21 @@ export class CircuitBreaker implements AttemptLifecyclePort {
   }
 
   /**
-   * Every cell cooling on a 429 rung the relay GUESSED — the set the ping loop re-probes so a
-   * deployment that has recovered is not parked for the rest of its escalation step (the owner's
-   * "the relay should be polling to see if things start working again anyway").
+   * Every cell on a relay-invented recovery rung worth spending a probe on: guessed 429 escalation
+   * plus repeated-failure escalation for 402/5xx. A deployment that recovered should not stay
+   * parked for the rest of a window the relay itself invented.
    *
-   * Only `REPROBE_TARGETS_COOLDOWN` sources qualify, and only with `lastStatus` 429: a stated
-   * `Retry-After` is the provider's own figure and is honoured rather than second-guessed with a
-   * request the provider just declined to serve; a loopback rung is 5 s; quota/elapsed are not
-   * rate-limit cooldowns at all. Sorted by soonest lift so a bounded re-probe budget reaches the
-   * cells closest to recovery first.
+   * A stated `Retry-After` is still honoured rather than second-guessed; loopback is only 5 s;
+   * quota/elapsed are not proactive re-probe targets. `probeDisprovesCooldown` keeps the status
+   * constraint aligned with `endRateLimitCooldown`. Sorted by soonest lift so the bounded probe
+   * budget reaches the cells closest to recovery first.
    */
   rateLimitCoolingCells(now = Date.now()): RateLimitCoolingCell[] {
     const out: RateLimitCoolingCell[] = [];
     for (const state of this.states.values()) {
-      if (state.cooldownUntil <= now || state.lastStatus !== 429 || state.cooldownSource === null) continue;
+      if (state.cooldownUntil <= now || state.cooldownSource === null) continue;
       if (!REPROBE_TARGETS_COOLDOWN[state.cooldownSource]) continue;
+      if (!probeDisprovesCooldown(state.cooldownSource, state.lastStatus)) continue;
       out.push({
         provider: state.target.provider,
         model: state.target.model,
@@ -871,15 +899,31 @@ export class CircuitBreaker implements AttemptLifecyclePort {
           state.unexplained429s === 1 ? "default" : "escalation";
       }
     } else if (outcome.status === 402) {
-      state.cooldownUntil = now + (asked ?? QUOTA_EXHAUSTED_COOLDOWN_MS);
-      state.cooldownSource = asked === null ? "default" : "retry-after";
+      if (asked !== null) {
+        state.cooldownUntil = now + asked;
+        state.cooldownSource = "retry-after";
+      } else {
+        const escalated = failureEscalationMs(state.consecutiveFailures);
+        const ms = Math.max(QUOTA_EXHAUSTED_COOLDOWN_MS, escalated ?? 0);
+        state.cooldownUntil = now + ms;
+        state.cooldownSource =
+          escalated !== null && escalated > QUOTA_EXHAUSTED_COOLDOWN_MS
+            ? "failure-escalation"
+            : "default";
+      }
     } else if (asked !== null) {
       state.cooldownUntil = now + asked;
       state.cooldownSource = "retry-after";
     } else if (state.consecutiveFailures >= MAX_FAILURES_BEFORE_TRIP) {
       const cooling = failureCooldown(outcome.elapsedMs);
-      state.cooldownUntil = now + cooling.ms;
-      state.cooldownSource = cooling.source;
+      const escalated = failureEscalationMs(state.consecutiveFailures);
+      if (escalated !== null && escalated > cooling.ms) {
+        state.cooldownUntil = now + escalated;
+        state.cooldownSource = "failure-escalation";
+      } else {
+        state.cooldownUntil = now + cooling.ms;
+        state.cooldownSource = cooling.source;
+      }
     }
     // One unconditional notify for the whole ladder above — every outcome now dirties the file,
     // and the WriteBehindTimer bounds writes to one per 250 ms of quiet and one per 2 s under
