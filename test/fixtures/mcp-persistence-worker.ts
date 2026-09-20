@@ -92,6 +92,53 @@ if (mode === "transaction") {
   // Keep every journal owner alive until the parent has inspected the shared file. A later writer
   // is otherwise allowed to drop a row whose owner process has already exited.
   waitForFile(release);
+} else if (mode === "journal-clear") {
+  const journalPath = arg(1);
+  const id = arg(2);
+  const ready = arg(3);
+  const start = arg(4);
+  const done = arg(5);
+  const release = arg(6);
+  const journal = createJobJournal(journalPath);
+  journal.note({
+    jobId: id,
+    laneId: "lane-before-clear",
+    cwd: process.cwd(),
+    startedAt: Date.now(),
+    label: "c".repeat(128 * 1024),
+  });
+  writeFileSync(ready, "ready");
+  waitForFile(start);
+  journal.clear(id);
+  writeFileSync(done, "done");
+  waitForFile(release);
+} else if (mode === "journal-update") {
+  const journalPath = arg(1);
+  const id = arg(2);
+  const ready = arg(3);
+  const start = arg(4);
+  const done = arg(5);
+  const release = arg(6);
+  const journal = createJobJournal(journalPath);
+  const startedAt = Date.now();
+  journal.note({
+    jobId: id,
+    laneId: "lane-before-update",
+    cwd: process.cwd(),
+    startedAt,
+    label: "u".repeat(128 * 1024),
+  });
+  writeFileSync(ready, "ready");
+  waitForFile(start);
+  journal.note({
+    jobId: id,
+    laneId: "lane-after-update",
+    cwd: process.cwd(),
+    startedAt,
+    label: "u".repeat(128 * 1024),
+  });
+  writeFileSync(done, "done");
+  waitForFile(release);
 } else if (mode === "hold-lock") {
   const path = arg(1);
   const ready = arg(2);

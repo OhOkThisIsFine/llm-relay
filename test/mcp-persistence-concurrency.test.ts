@@ -173,6 +173,41 @@ describe("cross-process MCP persistence", () => {
     }
   });
 
+  it("preserves an unrelated live row when a real process clear races another process update", async () => {
+    const { dir, cleanup } = tempDir();
+    const workers: Worker[] = [];
+    try {
+      const journalPath = join(dir, "mcp-jobs.json");
+      const start = join(dir, "start");
+      const release = join(dir, "release");
+      const clearReady = join(dir, "clear-ready");
+      const updateReady = join(dir, "update-ready");
+      const clearDone = join(dir, "clear-done");
+      const updateDone = join(dir, "update-done");
+
+      workers.push(
+        spawnWorker(["journal-clear", journalPath, "job-clear", clearReady, start, clearDone, release]),
+        spawnWorker(["journal-update", journalPath, "job-keep", updateReady, start, updateDone, release]),
+      );
+
+      await waitForFiles([clearReady, updateReady], workers);
+      writeFileSync(start, "go");
+      await waitForFiles([clearDone, updateDone], workers);
+
+      const stored = JSON.parse(readFileSync(journalPath, "utf8")) as {
+        jobs: Array<{ jobId: string; laneId: string }>;
+      };
+      expect(stored.jobs.map((row) => row.jobId)).toEqual(["job-keep"]);
+      expect(stored.jobs[0]?.laneId).toBe("lane-after-update");
+
+      writeFileSync(release, "done");
+      await Promise.all(workers.map(waitForExit));
+    } finally {
+      stopWorkers(workers);
+      cleanup();
+    }
+  });
+
   it("never steals a live lock and recovers the same lock after its owner dies", async () => {
     const { dir, cleanup } = tempDir();
     const workers: Worker[] = [];
