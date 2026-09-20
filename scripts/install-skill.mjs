@@ -82,7 +82,7 @@ const CODEX_RELAY_AGENT_MARKER_PREFIX = "# llm-relay:codex-relay-agent";
 // `dispatch_result` — rule 8 of the Claude template. Measured 2026-09-08: this Codex child returned
 // an inline review, said dispatch was unavailable, and still printed a provenance line.
 // v4 (2026-09-19): while polling, walk-verdict is the only liveness authority. The wrapper must
-// not reconstruct the verdict from elapsed time, silence, historical duration or last-activity.
+// not reconstruct the verdict from elapsed time, silence, historical duration or activity diagnostics.
 const CODEX_RELAY_AGENT_MARKER = "# llm-relay:codex-relay-agent v4";
 const CODEX_RELAY_AGENT_TEMPLATE = `${CODEX_RELAY_AGENT_MARKER}
 name = "relay"
