@@ -23,6 +23,11 @@ import { relayStatePath } from "../state-paths.js";
 import { MAX_ACTIVITY_STAT_PATHS, type TreeSnapshot } from "./tree-delta.js";
 
 /** One running job, as the journal records it. */
+export interface JournalBrokerExecution {
+  kind: "daemon-v1";
+  executionId: string;
+}
+
 export interface JournalRow {
   jobId: string;
   laneId: string;
@@ -37,6 +42,11 @@ export interface JournalRow {
    * deliberately carry none.
    */
   startingTree?: JournalStartingTree;
+  /**
+   * D1 daemon-owned execution reference. Optional/additive so pre-broker rows remain valid.
+   * The task, environment, command line and pid are deliberately NOT persisted here.
+   */
+  brokerExecution?: JournalBrokerExecution;
   /**
    * The process and the journal instance that own the row. Absent on a row written before
    * 2026-09-17, which is read exactly as before: an orphan.
@@ -88,6 +98,8 @@ export interface JobJournal {
   note(row: JournalRow): void;
   /** Persist the starting git status for a running agent-mode job, when it fits the bound. */
   noteStartingTree?(jobId: string, tree: TreeSnapshot, scope: readonly string[] | undefined): void;
+  /** Persist the daemon-owned execution reference for a running job. D1 Phase 3 consumes it. */
+  noteBrokerExecution?(jobId: string, execution: JournalBrokerExecution): void;
   /** Remove a job that reached a terminal state, or one that never started. */
   clear(jobId: string): void;
   /** Rows present at STARTUP whose owner is gone — i.e. jobs a previous process died holding. */
@@ -105,6 +117,7 @@ export interface JobJournal {
 export const nullJobJournal: JobJournal = {
   note: () => {},
   noteStartingTree: () => {},
+  noteBrokerExecution: () => {},
   clear: () => {},
   orphans: () => [],
   foreign: () => undefined,
@@ -226,12 +239,14 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
     note(row) {
       readOnce();
       const existing = rows.get(row.jobId);
-      // note() also repoints a running walk to its next lane. The starting tree is job-wide, so
-      // a lane transition must not erase the snapshot persisted before the first lane started.
+      // note() also repoints a running walk to its next lane. The starting tree and daemon broker
+      // execution are job-wide, so a lane transition must not erase either persisted fact.
       const startingTree = row.startingTree ?? existing?.startingTree;
+      const brokerExecution = row.brokerExecution ?? existing?.brokerExecution;
       rows.set(row.jobId, {
         ...row,
         ...(startingTree === undefined ? {} : { startingTree }),
+        ...(brokerExecution === undefined ? {} : { brokerExecution }),
         owner: { pid, instance },
       });
       persist();
@@ -254,6 +269,14 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
         entries: [...tree.entries],
         ...(scope === undefined ? {} : { scope: [...scope] }),
       };
+      persist();
+    },
+    noteBrokerExecution(jobId, execution) {
+      readOnce();
+      const row = rows.get(jobId);
+      if (row === undefined) return;
+      // The method is an internal typed seam, but keep the persisted shape canonical anyway.
+      row.brokerExecution = { kind: "daemon-v1", executionId: execution.executionId };
       persist();
     },
     clear(jobId) {
@@ -312,7 +335,24 @@ function readJournalRow(value: unknown): JournalRow | null {
   };
   const startingTree = readStartingTree(value["startingTree"]);
   if (startingTree !== undefined) row.startingTree = startingTree;
+  const brokerExecution = readBrokerExecution(value["brokerExecution"]);
+  if (brokerExecution !== undefined) row.brokerExecution = brokerExecution;
   return row;
+}
+
+function readBrokerExecution(value: unknown): JournalBrokerExecution | undefined {
+  if (!isRecord(value)) return undefined;
+  if (
+    Object.keys(value).length !== 2 ||
+    value["kind"] !== "daemon-v1" ||
+    typeof value["executionId"] !== "string" ||
+    !/^exec-[0-9a-f]{32}$/.test(value["executionId"])
+  ) {
+    // Optional recovery metadata must not invalidate the whole job row. Falling back to no broker
+    // reference is the weaker claim and preserves the pre-D1 killed-job reporting path.
+    return undefined;
+  }
+  return { kind: "daemon-v1", executionId: value["executionId"] };
 }
 
 function readStartingTree(value: unknown): JournalStartingTree | undefined {
