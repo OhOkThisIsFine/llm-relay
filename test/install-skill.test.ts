@@ -334,6 +334,8 @@ describe("install-skill postinstall hook", () => {
       expect(content).toContain("no-idle-stop");
       expect(content).toContain("unavailable");
       expect(content).toMatch(/never infer liveness from elapsed time, output silence, historical duration/i);
+      expect(content).toContain("activity diagnostics");
+      expect(content).not.toContain("last-activity");
       // The whole point: no line pins a model or provider for this agent.
       const lines = content.split("\n").map((l) => l.trim());
       expect(lines.some((l) => l.startsWith("model ="))).toBe(false);
