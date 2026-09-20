@@ -86,13 +86,14 @@ Claude Code workflows and subagents can delegate tasks to llm-relay lanes via th
 - On the Agent tool: `subagent_type: relay`
 - The `[answer]`/`[agent]` tag: a task that begins with `[answer]` or `[agent]` forces answer mode (`mode: "answer"`) when the task needs no file reads, edits, commands or working directory, and the tag is stripped before dispatch.
 - Installation: `llm-relay setup claude-desktop` or `llm-relay setup claude-cli` installs the definition at `~/.claude/agents/relay.md`.
-- The relay agent never answers a task itself, even a trivial one — it always dispatches and ends its reply with a `provenance: lane=<id> spec=<spec> elapsed=<seconds>` line, so a reply with no provenance line means no lane ran.
-- The relay agent pins no model — it runs on whatever model the calling session is on. Pass
-  `model` on the `agent()` call (`agent(task, {agentType: "relay", model: "sonnet"})`) or the
-  Agent tool call (`subagent_type: relay`, `model: "sonnet"`) to choose a different one for a
-  single call. Measured 2026-09-04: on `haiku` the wrapper answered a trivial echo task itself
-  instead of dispatching (no provenance line), while a realistic task dispatched correctly; on
-  `sonnet` even the echo dispatched.
+- The relay agent never answers a task itself, even a trivial one — it always dispatches and ends its reply with a `provenance: job=<jobId> lane=<id> spec=<spec> elapsed=<seconds>` line copied from a real completed job.
+- While it polls a running job, `walk-verdict` is authoritative. `keep-running` and
+  `no-idle-stop` mean continue polling; `unavailable` means another MCP process owns the job, so
+  continue polling rather than infer. Do not infer liveness from elapsed time, output silence,
+  historical duration, or `last-activity` diagnostics.
+- The Claude relay wrapper defaults to the cheap `haiku` alias so polling does not spend the
+  calling session's expensive model. `llm-relay setup --relay-model <alias>` changes that
+  installed default, and a single Agent/`agent()` call may still override `model`.
 - A changed `relay.md` takes effect only in a new Claude Code session — the running session already loaded the agent definition and does not re-read edits to it.
 
 ## Use from Codex
@@ -146,7 +147,8 @@ llm-relay offload status                        # inspect direct-routing rules
 ```
 
 When MCP `dispatch` outlives its initial wait, use `dispatch_status`, then
-`dispatch_result`; use `dispatch_cancel` only when the task should stop. Use
+`dispatch_result`; use `dispatch_cancel` only when the task should stop. For a running job,
+follow `walk-verdict` rather than reconstructing liveness from diagnostics. Use
 `dispatch_lanes` to pick a rung deliberately. Do not relaunch a still-running job.
 > Full dispatch tool reference including `dispatch_cancel` and `dispatch_lanes` is in
 > [references/dispatch-lanes.md](references/dispatch-lanes.md).
