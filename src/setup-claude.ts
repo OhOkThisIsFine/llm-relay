@@ -96,7 +96,7 @@ export const DEFAULT_RELAY_AGENT_MODEL = "haiku";
  *
  * v9 (2026-09-19) makes the relay's published `walk-verdict` the wrapper's only liveness
  * authority while polling. The wrapper must not infer from elapsed time, stream silence, historical
- * duration or last-activity diagnostics — those were the circumstantial clues the status contract
+ * duration or activity diagnostics — those were the circumstantial clues the status contract
  * was introduced to eliminate.
  */
 /**
