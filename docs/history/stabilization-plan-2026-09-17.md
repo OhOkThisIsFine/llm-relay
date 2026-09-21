@@ -510,8 +510,8 @@ the owner these questions.
   operator-declared prices again unless the owner raises it.
 
 ### D5 Major development-dependency upgrades
-`typescript` 5.9 → 7.0 (also a RUNTIME dependency for `delegate-gate`),
-`tailwindcss` 3 → 4, and three more remain. None is a defect today.
+`typescript` 5.9 → 7.0 (also a RUNTIME dependency for `delegate-gate`) and three more remain.
+None is a defect today.
 Recommendation: one upgrade per lap, each with the full gate and the package baseline measured
 again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
 
@@ -565,8 +565,31 @@ again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
   `dashboardRawBytes=388654`, `jsBytes=367804`, `cssBytes=19599`. Package measurement is
   `packBytes=1208600`, `unpackedBytes=5966259`, `packageEntries=460`, all below the existing
   ceilings.
-- **Next D5 lap.** Upgrade Tailwind 3 → 4 in its own migration lap. Keep TypeScript 7 separate
-  because it is also a runtime dependency of `delegate-gate`.
+- **Next D5 lap (historical plan).** Upgrade Tailwind 3 → 4 in its own migration lap. Keep
+  TypeScript 7 separate because it is also a runtime dependency of `delegate-gate`.
+
+#### D5-d DONE (2026-09-20) Tailwind 3 → 4
+- **Shipped candidate.** `tailwindcss ^3.4.19` → `^4.3.3` plus the first-party
+  `@tailwindcss/vite ^4.3.3` integration. The old Tailwind PostCSS/autoprefixer path,
+  `dashboard/postcss.config.cjs`, and the now-empty legacy `tailwind.config.cjs` are removed.
+- **Scan-boundary migration.** `dashboard/src/styles.css` uses
+  `@import "tailwindcss" source(none)`, then explicitly registers only `../index.html` and
+  the stylesheet's own `src` directory. This preserves the old load-bearing property that server
+  source cannot cause utility CSS to ship.
+- **Breaking-change review.** Tailwind 4's bare border/ring/divide changes do not bind here: the
+  dashboard has no real class use of those utilities and specifies visual borders itself. Its
+  button cursor is already explicitly `pointer`. The only actual risk utility is
+  `space-y-6` on a flex column that also supplies an explicit 1.5rem gap; the v4 selector moves
+  which adjacent visible block carries the extra margin but leaves the pairwise spacing unchanged.
+  Tailwind 4's browser floor is now part of the dashboard toolchain: Safari 16.4+, Chrome 111+,
+  Firefox 128+; the repository had no older-browser support contract to preserve.
+- **Proof.** 4,490 core tests and all 46 dashboard behavior/accessibility tests pass under the
+  migration; the Windows process-boundary suite passes. Exact output is
+  `dashboardRawBytes=391229` with unchanged JS (367804) and CSS `22174`. Package measurement:
+  `packBytes=1208855`, `unpackedBytes=5968835`, `packageEntries=460`, all below the existing
+  ceilings.
+- **Next D5 lap.** TypeScript 5.9 → 7.0 in a dedicated runtime/tooling lap; do not combine it with
+  another major because `typescript` is shipped as a runtime dependency for `delegate-gate`.
 
 ### D6 A lane's capability must come from the synced capability data (owner correction, 2026-09-17)
 - **Owner statement.** "The capability value is supposed to be set by data scraped from
