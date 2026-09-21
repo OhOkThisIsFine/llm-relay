@@ -63,10 +63,11 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
     hand-set rung value; unknown evidence imposes no limit.
   - The Codex `relay` agent template writes provenance only from a real dispatch result
     (`05db5b8`), and a test replays a lane that outlives `waitMs` (`d984b87`).
-- **The stabilization plan remains the implementation queue.**
-  [docs/history/stabilization-plan-2026-09-17.md](docs/history/stabilization-plan-2026-09-17.md)
-  records the remaining packets and design work; use `docs/backlog.md` for the current unmet
-  properties rather than following the plan's original wave order literally.
+- **The stabilization plan is now historical packet detail, not an unblocked implementation
+  queue.** [docs/history/stabilization-plan-2026-09-17.md](docs/history/stabilization-plan-2026-09-17.md)
+  records the packets and evidence behind the remaining owner/external tasks. Use
+  `docs/backlog.md` for current unmet properties. As of this closeout, no source implementation
+  packet in that plan is unblocked.
 - **2026-09-19–20 closeout of the dispatch-fidelity leftovers.** Multi-process journal/archive
   writes are transactional; the public liveness verdict no longer exposes an internal idle-stop
   transition; restart-killed jobs recover a bounded tree delta measured at adoption time; the
@@ -154,8 +155,12 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 - **D5 is complete.** Shipped: Vitest 5, Vite 8 + plugin-react 6, jsdom 30, Tailwind 4,
   native TypeScript 7 compiler, jest-dom 7, and lucide-react 1. Node types intentionally stay on
   major 22 while Node 22 remains supported. No original D5 major remains.
-- **Immediate next.** M1 remains blocked on a first-party AGY success envelope. Separately open:
-  repository CI enforcement, Route B's vendor blocker, and the owner-driven Codex/Code-tab checks.
+- **No repo-local implementation packet is currently unblocked.** M1 must not be written from an
+  assumed AGY schema: it still needs one raw archived first-party AGY success envelope. Repository
+  CI enforcement requires an administrator to enable branch protection or a ruleset requiring the
+  existing `check` and `windows-process-boundary` jobs. Route B needs an answer from OpenCode
+  about its session-identity restriction. O2–O4 and the Codex Desktop relay-agent check require
+  owner/operator interaction with the live applications.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
