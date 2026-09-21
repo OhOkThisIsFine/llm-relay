@@ -249,10 +249,17 @@ export function parseLaneExecutionSnapshot(value: unknown): LaneExecutionSnapsho
     ) {
       return null;
     }
+    const timedOut = value["timedOut"];
+    // Status and process result are one claim. Reject contradictions at the wire boundary rather
+    // than asking every recovery consumer to decide which half to trust.
+    if (status === "completed" && (code !== 0 || timedOut !== false)) return null;
+    if (status === "failed" && (code === 0 || timedOut !== false)) return null;
+    if (status === "timed_out" && timedOut !== true) return null;
+
     out.code = code;
     out.stdout = value["stdout"];
     out.stderr = value["stderr"];
-    out.timedOut = value["timedOut"];
+    out.timedOut = timedOut;
   }
   return out;
 }
