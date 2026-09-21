@@ -8,7 +8,7 @@
     { "packagePath": "node_modules/scheduler", "name": "scheduler", "version": "0.27.0", "license": "MIT" }
   ],
   "generatedAssets": [
-    { "assetKind": "Tailwind-generated CSS (Preflight, components and utilities)", "source": "dashboard/src/styles.css", "attribution": { "packagePath": "node_modules/tailwindcss", "name": "tailwindcss", "version": "3.4.19", "license": "MIT" } }
+    { "assetKind": "Tailwind-generated CSS (Preflight, components and utilities)", "source": "dashboard/src/styles.css", "attribution": { "packagePath": "node_modules/tailwindcss", "name": "tailwindcss", "version": "4.3.3", "license": "MIT" } }
   ],
   "virtualRuntime": [
     { "moduleId": "rolldown/runtime.js", "kind": "Rolldown bundler runtime", "attribution": { "packagePath": "node_modules/rolldown", "name": "rolldown", "version": "1.2.9", "license": "MIT" } },

@@ -117,10 +117,18 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   All 4,490 core tests and 46 dashboard tests pass, including focus/accessibility coverage; Windows
   process-boundary and packed-dashboard smoke also pass. Dashboard output is byte-identical to
   D5-b; package measurement is 1,208,600 packed bytes, 5,966,259 unpacked bytes, and 460 entries.
-- **Immediate next in D5.** Upgrade Tailwind 3 → 4 as its own migration lap. Keep TypeScript 7
-  separate because it is also a runtime dependency of `delegate-gate`. M1 remains blocked on a
-  first-party AGY success envelope. Separately open: repository CI enforcement, Route B's vendor
-  blocker, and the owner-driven Codex/Code-tab checks.
+- **D5-d Tailwind 4 is migrated.** Tailwind moved from `^3.4.19` to `^4.3.3` using
+  the first-party `@tailwindcss/vite` plugin; the old PostCSS/autoprefixer integration and empty
+  JavaScript Tailwind config are gone. The v4 stylesheet disables automatic source detection and
+  explicitly scans only dashboard HTML/source, preserving the old server-source exclusion.
+  4,490 core tests and 46 dashboard tests pass, as does the Windows process-boundary suite.
+  Dashboard output is 391,229 raw bytes (367,804 JS / 22,174 CSS); package measurement is
+  1,208,855 packed bytes, 5,968,835 unpacked bytes, and 460 entries, all within ceilings. Tailwind
+  4 also establishes a dashboard browser floor of Safari 16.4+, Chrome 111+, and Firefox 128+.
+- **Immediate next in D5.** Upgrade TypeScript 5.9 → 7.0 in its own lap. Treat it as runtime as
+  well as tooling because `delegate-gate` ships it. M1 remains blocked on a first-party AGY
+  success envelope. Separately open: repository CI enforcement, Route B's vendor blocker, and the
+  owner-driven Codex/Code-tab checks.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
