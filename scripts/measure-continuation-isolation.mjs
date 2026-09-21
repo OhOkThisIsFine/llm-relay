@@ -36,7 +36,7 @@ const prefixes = {
   opencode: "OPENCODE_CONTINUATION_MEASUREMENT ",
 };
 
-if (!(harness in scripts)) {
+if (typeof harness !== "string" || !Object.hasOwn(scripts, harness)) {
   throw new Error("usage: node scripts/measure-continuation-isolation.mjs <agy|claude|codex|opencode>");
 }
 
@@ -45,7 +45,7 @@ const script = join(root, "scripts", scripts[harness]);
 const prefix = prefixes[harness];
 
 function runChild(label) {
-  return new Promise((resolveRun, rejectRun) => {
+  return new Promise((resolveRun) => {
     const child = spawn(process.execPath, [script], {
       cwd: root,
       env: {
@@ -57,21 +57,31 @@ function runChild(label) {
     });
     let stdout = "";
     let stderr = "";
+    let spawnError = null;
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => { stdout += String(chunk); });
     child.stderr.on("data", (chunk) => { stderr += String(chunk); });
-    child.once("error", rejectRun);
+    child.once("error", (error) => {
+      spawnError = error;
+    });
     child.once("close", (code, signal) => {
-      resolveRun({ label, code, signal, stdout, stderr });
+      resolveRun({
+        label,
+        code,
+        signal,
+        stdout,
+        stderr,
+        spawnError: spawnError instanceof Error ? spawnError.message : null,
+      });
     });
   });
 }
 
 function parseMeasurement(run) {
-  if (run.code !== 0) {
+  if (run.spawnError || run.code !== 0) {
     throw new Error(
-      `${run.label} probe failed: code=${run.code} signal=${run.signal}; stderr=${run.stderr}`,
+      `${run.label} probe failed: spawnError=${run.spawnError ?? "none"} code=${run.code} signal=${run.signal}; stderr=${run.stderr}`,
     );
   }
   const line = run.stdout
