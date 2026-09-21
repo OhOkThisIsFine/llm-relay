@@ -296,34 +296,18 @@ export interface Routing {
   pacing?: PacingConfig;
     /** Post-commit sustained-slow-stream watchdog. Default on; `false` disables it. */
   crawl?: CrawlWatchdogConfig;
-  /**
-   * Background lane re-probing (owner decision 2026-08-29,
-   * docs/history/quota-reprobe-design-2026-08-29.md): keeping lane metadata fresh is the relay's own
-   * job, the way the ping loop already does for HTTP. **Default ON** — catalog probes are
-   * metadata commands that spend no quota, and quota probes fire only for buckets carrying an
-   * ACTIVE recorded death (an alive lane is re-tested by real use for free). Boolean shorthand
-   * toggles `enabled` with the default intervals. Absent on a hand-built `Config` means the
-   * defaults too — the cadence resolves absence itself.
+    /**
+   * Background lane re-probing. Default on: catalog probes refresh metadata without model quota;
+   * quota probes run only for buckets with an active recorded quota death.
    */
+
   laneProbe?: LaneProbeSettings;
-  /**
-   * The automatic dispatch lane WALK (owner request 2026-09-06,
-   * docs/history/dispatch-lane-walk-design-2026-09-06.md). **Default ON.**
-   *
-   * Before it, `dispatch` ran ONE lane and reported a failure when that lane was slow; the calling
-   * agent then picked the next lane by hand, which is the friction the owner reported. With it,
-   * the relay walks the ladder past a lane only after it has remained idle for `idleMs` with no
-   * relay traffic, output, owned-process CPU increase or working-tree change; it pins the lane
-   * that answers and demotes the lane it left.
-   *
-   * ⚠ Read ONLY by `llm-relay mcp`, exactly like `mcp` below — the MCP walk owns delegation
-   * policy even when D1 asks the daemon's token-gated broker to own the physical process tree.
-   * No PUBLIC MODEL HTTP turn spawns a lane. The daemon also reads the PIN and DEMOTION those
-   * walks record, because ordering a ladder is not choosing to delegate.
-   *
-   * `false` is the shorthand for `{ enabled: false }` and restores the pre-walk behaviour exactly:
-   * one lane per call, no memory.
+    /**
+   * Automatic MCP dispatch walk. Default on. It advances only after `idleMs` without relay traffic,
+   * output, owned-process CPU growth or working-tree change, and records routing memory. Public HTTP
+   * request handling never spawns a lane.
    */
+
   dispatchWalk?: DispatchWalkSettings;
   /**
    * Settings for `llm-relay mcp`, the stdio MCP server that exposes the dispatch verb to any MCP
@@ -415,20 +399,11 @@ export interface LatencyDemotionConfig {
 export interface HedgeConfig {
   /** Default true. false disables hedging entirely. */
   enabled?: boolean;
-  /**
-   * The floor's flat component, in ms. Owner direction 2026-09-04: the floor is no longer flat on
-   * its own — see `msPerInputToken` — but this still bounds the SMALL-prompt case, where the
-   * size-scaled component is negligible. Without it a deployment with a tiny p90 is hedged on
-   * ordinary noise, and a fast pool duplicates almost every request.
-   */
+    /** Flat minimum hedge delay for small prompts; combined with the size-scaled component. */
+
   minFloorMs?: number;
-  /**
-   * LEGACY alias of `minFloorMs`, kept for backward compatibility — an operator config written
-   * before 2026-09-04 (`{"floorMs": 8000}`) keeps loading and keeps meaning exactly what it always
-   * meant: the floor never drops below 8000 ms. Honoured only when `minFloorMs` itself is absent;
-   * `resolveHedgeSettings` in `hedge-trigger.ts` is the ONE place that resolves the alias, so a new
-   * caller of that function can never re-decide the precedence.
-   */
+    /** Legacy alias for `minFloorMs`, used only when `minFloorMs` is absent. */
+
   floorMs?: number;
   /**
    * The floor's size-scaled component, in ms per estimated INPUT token
@@ -537,18 +512,11 @@ export interface LadderRung {
    * substituted here — env values are operator-authored routing, not task content.
    */
   env?: Record<string, string | null>;
-  /**
-   * cli rungs: the most jobs this MCP server process will run against THIS rung at once. A
-   * dispatch walk whose turn reaches a rung already at this many spawned processes SKIPS it for
-   * that walk rather than starting a competing one — see `mcp/lane-runner.ts` `LaneJobStore.inFlight`
-   * and `mcp/server.ts`'s walk. Absent means unbounded, which is the byte-for-byte pre-existing
-   * behaviour: nothing here changes for an operator who never sets it.
-   *
-   * ⚠ The ADMISSION count remains per MCP SERVER PROCESS by design, even though D1 moves physical
-   * process ownership to the daemon. The originating MCP job store counts its own/recovered jobs;
-   * another simultaneously-live MCP process is not folded into that count. Two host sessions can
-   * therefore still exceed this figure together: this is a per-host cap, not a machine-wide semaphore.
+    /**
+   * Per-MCP-process concurrent-job cap for this CLI rung. A full rung is skipped before spawn;
+   * absent means unbounded. Daemon process ownership does not make this a machine-wide semaphore.
    */
+
   maxConcurrent?: number;
   /**
    * Legacy compatibility key. Parsed values warn and have NO routing effect; dispatch derives lane
@@ -579,42 +547,20 @@ export interface ResolvedTarget {
   timeoutMs: number;
   /** Carried from the provider: inter-byte stall watchdog for streamed responses. */
   stallTimeoutMs?: number;
-  /**
-   * RESOLVED time-to-first-byte deadline for a non-streamed attempt (`resolveFirstByteTimeoutMs`)
-   * — an explicit `ProviderConfig.firstByteTimeoutMs`, or `stallTimeoutMs` as the default, or
-   * absent when neither is set. Resolved here so the attempt runner is handed a number and never
-   * re-derives a default from two provider fields. Absent (a hand-built target) means no
-   * first-byte deadline, the pre-2026-09-09 behaviour byte for byte.
-   */
+    /** Resolved non-streamed time-to-first-byte deadline; absent means no first-byte deadline. */
+
   firstByteTimeoutMs?: number;
-  /**
-   * RESOLVED outbound tool-call-id shape (`resolveToolCallIdMode`) — an explicit
-   * `compat.toolCallIds` or the labelled base-host default. Resolved here so the request mapper
-   * is handed a mode and never a provider identity to re-derive one from. Absent (a hand-built
-   * target) reads as `"preserve"`, which is the pre-2026-08-23 behaviour byte for byte.
-   */
+    /** Resolved outbound tool-call-id mode; absent targets default to `preserve`. */
+
   toolCallIds?: ToolCallIdMode;
-  /**
-   * RESOLVED thought-signature mode (`resolveThoughtSignatureMode`) — an explicit
-   * `compat.thoughtSignature` or the labelled base-host default. Resolved here for the same reason
-   * as `toolCallIds`: the request mapper is handed a mode, never a provider identity to sniff one
-   * from. Absent (a hand-built target) reads as `"none"` — the pre-2026-08-23 bytes exactly.
-   */
+    /** Resolved thought-signature mode; absent targets default to `none`. */
+
   thoughtSignature?: ThoughtSignatureMode;
-  /**
-   * RESOLVED wire mode (`ProviderConfig.wire`, absent ⇒ `"chat"`) — carried onto the target at
-   * resolution time, exactly like `toolCallIds`/`thoughtSignature`, so `src/backend.ts` is handed
-   * a mode and never re-derives one from provider identity. Absent (a hand-built target) reads as
-   * `"chat"`, the pre-2026-09-09 behaviour byte for byte.
-   */
+    /** Resolved upstream OpenAI wire mode; absent targets default to `chat`. */
+
   wire?: ProviderWireMode;
-  /**
-   * RESOLVED reasoning-mapping mode (`resolveReasoningMode`) — an explicit `compat.reasoning` or
-   * the labelled base-host default (`api.deepseek.com` ⇒ `"deepseek"`). Resolved here for the same
-   * reason as `toolCallIds`/`thoughtSignature`: the request mapper is handed a mode, never a
-   * provider identity to sniff one from. Absent (a hand-built target) reads as `"none"` — the
-   * pre-2026-09-10 bytes exactly.
-   */
+    /** Resolved reasoning-mapping mode; absent targets default to `none`. */
+
   reasoning?: ReasoningMode;
   /**
    * The routed POOL's effort band, when the request was resolved through a single dynamic pool
@@ -778,27 +724,15 @@ export interface McpSettings {
 }
 
 /**
- * Default `routing.mcp.blockingWaitMs` — 25 minutes.
- *
- * Measured and documented 2026-09-17 (`docs/history/mcp-host-timeouts-2026-09-17.md`): Claude Code's
- * wall-clock tool limit (`MCP_TOOL_TIMEOUT`) defaults to about 28 hours, and a 240 s call succeeded
- * headless with and without progress. Its stdio idle timeout is 30 minutes, and the documentation
- * says a progress notification resets it. The default stays under 30 minutes so the call survives
- * even if that reset does not happen. A lane still running at the cap degrades to polling.
+ * Default long blocking wait for hosts proven to tolerate it and supplying progress: 25 minutes,
+ * below the 30-minute stdio idle ceiling. Other hosts use their shorter wait policy.
  */
+
 export const DEFAULT_MCP_BLOCKING_WAIT_MS = 1_500_000;
 
 /**
- * Default `routing.mcp.maxWaitMs` — the longest one `dispatch` tool call blocks before handing
- * back a job id to poll.
- *
- * It must end before the SHORTEST host limit, because above a host's limit the host fails the call
- * AND loses the job handle. Two limits are measured on this machine: Claude Code fails an MCP call
- * somewhere between 45 s and 100 s, and Codex's code-mode `exec` tool yields its script at 31.0 s
- * with empty output ("Script running with cell ID N / Wall time 31.0 seconds"). The 2026-09-10
- * transcript sweep counted 29 of 266 first Codex dispatch calls that lost their job id that way
- * while this default was 40 s (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §8). 25 s sits under
- * both. The tool description names the config key rather than this figure, so an operator override
- * never leaves the text stale.
+ * Default ordinary MCP blocking wait: 25 seconds, below the shortest measured host tool-call
+ * ceiling so a slow lane returns a pollable job id before the host abandons the call.
  */
+
 export const DEFAULT_MCP_MAX_WAIT_MS = 25_000;
