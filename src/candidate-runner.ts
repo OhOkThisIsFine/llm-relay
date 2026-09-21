@@ -190,10 +190,8 @@ export interface StickyRequestContext {
 }
 
 /**
- * The walk's health bands, best first: `probation` → `live` → `slow` → `paced` →
- * `credential-fault` → `cooling`. `paced` (2026-09-15, `pacing.ts`) sits behind `slow` because a
- * slow member most likely answers while one at its stated ceiling most likely 429s — and ahead of
- * the failure bands because it is healthy, merely full for the moment.
+ * Candidate usability bands, best first. Probation gathers data; slow/paced are healthy one-way
+ * demotions; credential-fault/cooling are failure bands.
  */
 export type TargetUsability = "live" | "slow" | "paced" | "credential-fault" | "cooling" | "probation";
 type CredentialAttemptLabel = number | "transport" | "timeout" | "protocol" | "local" | "client" | "cancelled";
@@ -945,10 +943,8 @@ export function beginAttemptRun(
     egressCallbackCalled: false,
     fetchFn: fetch,
   };
-  // "First byte" for a non-streamed attempt is the moment fetch() resolves — response HEADERS
-  // have arrived (design: docs/backlog.md item 1). Never armed on a streamed attempt: that path
-  // already has `withStallWatchdog`'s inter-byte watchdog once its own head is being served, and
-  // its pre-head wait is governed by `timer` plus the commit probe exactly as before this existed.
+  // For non-streamed attempts, fetch() resolution is the first-byte/header boundary. Streamed
+  // attempts use the existing overall timeout plus commit/stall watchdogs instead.
   const firstByteTimeoutMs = wantsStream ? undefined : target.firstByteTimeoutMs;
   if (firstByteTimeoutMs !== undefined) {
     run.firstByteTimer = setTimeout(() => {
@@ -1022,20 +1018,9 @@ interface CommitProbeOptions {
 }
 
 /**
- * Run the stream-commit probe INSIDE the attempt's own promise, so the hedge race settles at
- * COMMIT — the first meaningful content — rather than at header arrival (2026-09-04, owner
- * direction: the hedge exists for wedged requests, and a provider that answers 200 + headers at
- * once and then produces nothing is the common wedge; a race decided at RESPONSE RESOLUTION had
- * already called that primary the winner, and `hedge-race.ts` recorded the gap in as many words).
- * A non-streamed or non-2xx response passes through untouched — the walk's own status
- * classification decides those. The verdict rides beside the response for the route to consume
- * through `takeCommitProbe`; the route keeps its inline probe only as the fallback for a response
- * that did not come through this wrapper.
- *
- * ⚠ The probe reads the body up to the first meaningful event and the `ready` verdict replays
- * every byte it consumed, so a committed winner is served byte-exact as before. A LOSER's probe is
- * left to settle on its own after `retireHedgeLoser` aborts its run — the race ignores a late
- * settlement — and that abort is what cancels its body.
+ * Attach stream-commit probing to a candidate promise so hedge races settle on first meaningful
+ * content rather than headers. Consumed bytes are replayed for the winner; loser probes settle after
+ * their attempt is retired/aborted. Non-streamed and non-2xx responses pass through unchanged.
  */
 export async function withCommitProbe(promise: Promise<Response>, options: CommitProbeOptions): Promise<Response> {
   const response = await promise;
@@ -1295,15 +1280,8 @@ export function applyStickyOrdering(
   quotaDemotion?: QuotaDemotionFn | null,
   costClassOf?: CostClassFn | null,
   latencyDemotion?: LatencyDemotionFn | null,
-  // ⚠ Threaded so a pinned candidate the probation band would place is judged by the SAME
-  // closed union as every other caller of `targetUsability` — a call site that omits it would
-  // silently read such a candidate as "live" and pin it, defeating "a pin may promote only a
-  // live member" (see the gotcha in CLAUDE.md). `latencyDemotion` above is left exactly as this
-  // call site already had it (undefined at the one production call site in `server.ts`); fixing
-  // that pre-existing gap is out of this packet's scope.
+  // Sticky pins may promote only candidates still classified live by these ordering terms.
   probation?: ProbationFn | null,
-  // Threaded for the same reason as `probation`: a pinned candidate at its stated ceiling must
-  // read as `paced`, not `live`, or the pin would promote exactly the member pacing stepped aside.
   pacing?: PacingFn | null,
 ): { targets: ResolvedAttempt[]; status: string } {
   const groups = groupCredentialAttempts(ordered);
@@ -1360,36 +1338,9 @@ export function recordStickySuccess(
 }
 
 /**
- * Demote unusable candidates — and do NOTHING else to the order.
- *
- * ⚠ Deliberately NOT `getHealthyTargets()`: that filters AND re-sorts by measured stability, which
- * is a second ranking pass competing with the deployment-fitness ranking `resolveTargets` already
- * applied. Two ranking passes means neither decides the order, and live health then PROMOTES on
- * evidence that is often a single request's latency. Health is used here only to demote, never to
- * promote: a target the breaker is cooling steps aside, everything else keeps its fitness order.
- * (The re-sort was invisible for as long as an untracked target scored a flat 100 and
- * `Array.prototype.sort` is stable — INV-TS-7.)
- *
- * ⚠⚠ **AMENDED BY OWNER DECISION 2026-08-30, and this is NOT drift — do not "restore" it.**
- * Latency now DOES demote, via `latency-demotion.ts` folded into `targetUsability` beside the quota
- * term. The paragraph above stays because every word of it is still the constraint: what was
- * rejected is a second ranking PASS that re-sorts and can PROMOTE on one request's latency, and
- * that remains rejected. A one-way demotion term is a different thing — it never re-sorts, never
- * promotes, and cannot fire on a single sample (p95 over a minimum count of MEASURABLE samples,
- * unmeasured having no effect at all).
- *
- * What forced the amendment: measured 2026-08-30, banding on breaker state ALONE walked a
- * breaker-CLOSED member with a p95 of 70364 ms ahead of every cooling one, and single requests cost
- * 120-123 s across 2-6 attempts.
- *
- * ⚠⚠ **AMENDED AGAIN BY OWNER DIRECTION 2026-09-09, same standing — do not "restore" it.** A
- * free deployment with fewer than `minSamples` served-request samples now LEADS, in a
- * `probation` band AHEAD of `live` (config order within the band), so one untested member at a
- * time gathers data and leaves the band by itself as its request samples accumulate. Like the
- * 2026-08-30 term this is a one-way placement, not a second ranking pass: fitness still decides
- * the order everywhere else, nothing is dropped, and an unmeasured free primary is already
- * hedged (`hedge-trigger.ts`: unmeasured IS hedged), so a probation member that hangs costs one
- * hedge, not a timeout — no second mechanism is added here.
+ * Stable one-way usability ordering: probation, live, slow, paced, credential-fault, cooling.
+ * Fitness order is preserved within each band; health/latency/pacing may demote but never promote or
+ * drop a candidate.
  */
 export function orderByUsability(
   attempts: ResolvedAttempt[],
