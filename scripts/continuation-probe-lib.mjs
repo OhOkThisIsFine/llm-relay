@@ -235,14 +235,14 @@ export async function terminateProbeTree(state, options = {}) {
 export function redactProbeDiagnostics(value) {
   return String(value)
     .replace(
-      /("(?:session_id|thread_id|sessionID|conversation_id)"\\s*:\\s*")[^"]+(")/g,
+      /("(?:session_id|thread_id|sessionID|conversation_id)"\s*:\s*")[^"]+(")/g,
       "$1<redacted>$2",
     )
     .replace(
-      /\\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b/gi,
+      /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi,
       "<redacted-id>",
     )
-    .replace(/\\bses_[A-Za-z0-9_-]+\\b/g, "ses_<redacted>");
+    .replace(/\bses_[A-Za-z0-9_-]+\b/g, "ses_<redacted>");
 }
 
 export function diagnosticFailure(prefix, error, states = []) {
