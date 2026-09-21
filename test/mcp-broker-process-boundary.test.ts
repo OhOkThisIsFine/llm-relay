@@ -245,10 +245,13 @@ describe("D1 daemon-owned process boundary", () => {
         waitMs: 500,
       });
       const jobId = jobIdFrom(dispatch.text);
-      expect(dispatch.text).toContain("execution-owner: relay-daemon");
 
       pid = await waitFor(() => lanePid(h.pidPath), 10_000, "daemon-owned lane pid");
       expect(alive(pid)).toBe(true);
+      // The initial dispatch may time out of its short blocking wait while broker preflight/start
+      // is still being established. Once the process exists, ownership must be explicit.
+      const owned = await rpc(first, 7, "dispatch_status", { jobId });
+      expect(owned.text).toContain("execution-owner: relay-daemon");
 
       // Load-bearing boundary: kill ONLY the MCP parent, never /T.
       taskkill(first.child.pid, false);
