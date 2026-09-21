@@ -8,7 +8,7 @@ The repository is on the published v0.86.0 baseline and is waiting on live conti
 
 - Published package version: **0.86.0**.
 - `main` contains the architecture published in **v0.86.0**.
-- Current `main` CI (run 779) is green:
+- Current `main` (`fad96b7`, PR #70) CI run **782** is green:
   - 4,510 core tests passed, 4 skipped;
   - 46 dashboard tests passed;
   - 57 targeted Windows process-boundary/concurrency tests passed;
@@ -24,6 +24,9 @@ The repository is on the published v0.86.0 baseline and is waiting on live conti
 - D5 dependency modernization is complete: Vitest 5, Vite 8, jsdom 30, Tailwind 4, native
   TypeScript 7 compilation, jest-dom 7 and lucide-react 1. Node declarations intentionally remain
   on the Node 22 line while Node 22 is supported.
+- Repository-wide documentation/comment reconciliation is complete. PR #70 refreshed the live docs,
+  removed stale restart/reload/continuation claims, and trimmed implementation comments to durable
+  invariants. Its `src/**/*.ts` diff was comment-only; no runtime behavior changed.
 
 ### Immediate next
 
