@@ -151,6 +151,37 @@ describe("LaneExecutionBroker", () => {
     expect(JSON.stringify(status)).not.toContain("pid");
   });
 
+  it("never samples slow process activity on start or cancel acknowledgements", async () => {
+    const run = deferred<LaneExecutionRunResult>();
+    let activityReads = 0;
+    const broker = new LaneExecutionBroker(() => ({
+      result: run.promise,
+      cancel: () => {},
+      activity: () => {
+        activityReads += 1;
+        return new Promise<LaneExecutionActivity>(() => {});
+      },
+    }));
+
+    const started = await Promise.race([
+      broker.handle(start()),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("start waited on process activity")), 100),
+      ),
+    ]);
+    expect(started).toMatchObject({ ok: true, execution: { status: "running" } });
+    expect(activityReads).toBe(0);
+
+    const cancelled = await Promise.race([
+      broker.handle({ action: "cancel", executionId: start().executionId }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("cancel waited on process activity")), 100),
+      ),
+    ]);
+    expect(cancelled).toMatchObject({ ok: true, execution: { status: "cancelled" } });
+    expect(activityReads).toBe(0);
+  });
+
   it("reports injected activity while running without exposing process ids or task text", async () => {
     const run = deferred<LaneExecutionRunResult>();
     const handle: LaneExecutionLaunchHandle = {
