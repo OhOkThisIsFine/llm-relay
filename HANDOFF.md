@@ -32,12 +32,12 @@ The repository is in a consolidation phase after a large post-v0.85.0 developmen
 
 ### Immediate next
 
-**v0.86.0 is published.** Phase 3 is complete. The first-party hard-cap continuation harness
-survey is also complete: AGY is the strongest first candidate, while Claude, Codex and OpenCode
-have exact resume primitives with additional caveats. The immediate gate is a real AGY
-kill/resume probe; run `npm run build:server` then `node scripts/measure-agy-continuation.mjs`.
-Do not add continuation substrate until at least one harness passes the live protocol.
-Evidence/vendor/operator blockers remain parallel work.
+**v0.86.0 is published.** Phase 3 is complete. The first-party hard-cap continuation survey
+and repeatable probe tooling are complete for AGY, Claude, Codex and OpenCode. No harness is yet
+verified resumable: the live probes require available harness/provider quota. Do not add Phase 5.2
+continuation substrate until at least one exact-ID interruption/resume probe succeeds. When capacity
+is available, build once with `npm run build:server` and run the corresponding
+`scripts/measure-*-continuation.mjs`. Evidence/vendor/operator blockers remain parallel work.
 
 Audit evidence:
 [`docs/history/release-readiness-audit-2026-09-21.md`](docs/history/release-readiness-audit-2026-09-21.md).
@@ -56,10 +56,10 @@ Persistence and repository enforcement are no longer blockers:
 
 Work in this order:
 
-1. run the documented AGY live kill/resume probe and prove exact conversation continuation;
-2. if AGY passes, mark it verified resumable and add the generic continuation substrate without changing behavior;
-3. implement AGY continuation end to end;
-4. probe and add Claude/Codex/OpenCode independently;
+1. when quota is available, run any documented exact-ID continuation probe (prefer AGY, then Claude; Codex specifically tests active-turn durability);
+2. mark only a passing harness verified resumable;
+3. then add the generic continuation substrate without changing behavior;
+4. implement one verified harness end to end, then expand harness support independently;
 5. clear evidence/vendor/operator-blocked items in parallel as their inputs become available.
 
 Detailed sequence and exit conditions:
