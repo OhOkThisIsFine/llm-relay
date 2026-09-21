@@ -2124,8 +2124,24 @@ export class McpDispatchServer {
     const seen: Array<{ at: number | null | undefined; source: string }> = [
       { at: this.jobs.get(jobId)?.activity?.lastOutputAt, source: "lane-output" },
     ];
+    const broker = this.liveBrokerSnapshots.get(jobId);
+    if (broker !== undefined) {
+      seen.push(
+        broker.relayInFlight !== undefined && broker.relayInFlight > 0
+          ? { at: now, source: "relay-in-flight" }
+          : { at: broker.relayLastActivityAt, source: "relay-traffic" },
+      );
+      if (broker.cpuMs !== undefined) {
+        const previous = this.brokerCpu.get(jobId);
+        this.brokerCpu.set(jobId, broker.cpuMs);
+        if (previous !== undefined && broker.cpuMs - previous >= PROCESS_CPU_ACTIVITY_MS) {
+          seen.push({ at: now, source: "process-cpu" });
+        }
+      }
+    }
+
     const tag = this.activityTags.get(jobId);
-    if (tag !== undefined && this.deps.readLaneActivity !== undefined) {
+    if (broker === undefined && tag !== undefined && this.deps.readLaneActivity !== undefined) {
       const traffic = await this.deps.readLaneActivity(tag).catch(() => null);
       seen.push(
         traffic !== null && traffic.inFlight > 0
@@ -2140,7 +2156,7 @@ export class McpDispatchServer {
     // tree this dispatcher already owns for reaping, and only after cheaper signals went stale.
     // The first reading is a baseline and proves nothing; a later >=1 s cumulative CPU increase
     // is current activity. A failed read is no signal, never an idle verdict.
-    const pids = this.jobs.runningPids(jobId);
+    const pids = broker === undefined ? this.jobs.runningPids(jobId) : [];
     if (pids.length > 0 && this.deps.readProcessCpu !== undefined) {
       const cpuMs = await this.deps.readProcessCpu(pids).catch(() => null);
       if (typeof cpuMs === "number" && Number.isFinite(cpuMs) && cpuMs >= 0) {
