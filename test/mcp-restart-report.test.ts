@@ -65,35 +65,6 @@ function brokerClient(
   };
 }
 
-async function toolText(
-  server: McpDispatchServer,
-  id: number,
-  name: "dispatch_status" | "dispatch_result" | "dispatch_cancel",
-  jobId: string,
-): Promise<{ text: string; isError?: boolean }> {
-  const out: Array<{ id?: number; result?: { content?: Array<{ text?: string }>; isError?: boolean } }> = [];
-  const originalWrite = (server as unknown as { deps: { write: (chunk: string) => void } }).deps.write;
-  (server as unknown as { deps: { write: (chunk: string) => void } }).deps.write = (chunk: string) => {
-    out.push(JSON.parse(chunk) as (typeof out)[number]);
-  };
-  try {
-    await server.ingest(
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id,
-        method: "tools/call",
-        params: { name, arguments: { jobId } },
-      }) + "\n",
-    );
-  } finally {
-    (server as unknown as { deps: { write: (chunk: string) => void } }).deps.write = originalWrite;
-  }
-  const response = out.find((message) => message.id === id)?.result;
-  return {
-    text: response?.content?.[0]?.text ?? "",
-    ...(response?.isError === undefined ? {} : { isError: response.isError }),
-  };
-}
 
 async function killedResult(path: string, jobId: string, treeSnapshot?: TreeSnapshotReader): Promise<string> {
   const out: Array<{ id?: number; result?: { content: Array<{ text: string }> } }> = [];
@@ -116,6 +87,39 @@ async function killedResult(path: string, jobId: string, treeSnapshot?: TreeSnap
   );
   return out.find((message) => message.id === 1)?.result?.content[0]?.text ?? "";
 }
+
+describe("D1 broker journal ownership", () => {
+  it("atomically gives a dead-owner broker row to only one replacement MCP process", () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const dead = createJobJournal(path, { pid: 1001, isAlive: () => false });
+      dead.note({
+        jobId: "job-broker-claim",
+        laneId: "lane-a",
+        cwd: "C:/tree",
+        startedAt: 1,
+      });
+      dead.noteBrokerExecution?.("job-broker-claim", {
+        kind: "daemon-v1",
+        executionId: BROKER_EXECUTION_ID,
+      });
+
+      const first = createJobJournal(path, {
+        pid: 2001,
+        isAlive: (pid) => pid === 2002,
+      });
+      const second = createJobJournal(path, {
+        pid: 2002,
+        isAlive: (pid) => pid === 2001,
+      });
+
+      expect(first.claimBrokerOrphan?.("job-broker-claim")?.owner?.pid).toBe(2001);
+      expect(second.claimBrokerOrphan?.("job-broker-claim")).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+});
 
 describe("D1 broker-backed MCP restart recovery", () => {
   function serverFor(
