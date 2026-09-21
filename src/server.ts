@@ -12,6 +12,10 @@ import {
   type ResolvedTarget,
 } from "./config.js";
 import { MetadataLogger } from "./log.js";
+import {
+  applyConfigReload,
+  type ConfigReloadAttemptResult,
+} from "./config-reload.js";
 import { resolveCredential } from "./authEnv.js";
 import { parseCredentialId } from "./credential-id.js";
 import type { ResolvedAttempt } from "./resolved-attempt.js";
@@ -137,6 +141,7 @@ const CONTROL_ROUTES = new Set([
   "/health/stats",
   "/health",
   "/candidates",
+  "/reload",
   "/stop",
 ]);
 
@@ -261,6 +266,13 @@ export interface ProxyDeps {
    * null explicitly disables it for fail-closed embeds/tests.
    */
   laneExecutionBroker?: LaneExecutionBrokerPort | null;
+  /**
+   * D2 validated config loader. Production injects the same source path + CLI overrides used at
+   * startup. Absent/null keeps /reload fail-closed for programmatic embeds.
+   */
+  reloadConfig?: (() => Config) | null;
+  /** Best-effort post-commit warm/validation hook. It can never roll back an accepted config. */
+  onReloaded?: (cfg: Config) => void | Promise<void>;
   /** Optional shutdown callback — called by POST /stop after responding 202. A bare programmatic proxy with no onStop answers 503. */
   onStop?: () => void;
 }
@@ -796,6 +808,9 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
     configStalenessLogged = true;
     return true;
   };
+  const resetConfigStalenessLog = (): void => {
+    configStalenessLogged = false;
+  };
   const isDestructive = destructiveMatcher(cfg.repair.destructiveTools);
   const catalog = deps.catalog ?? new ModelCatalog();
   const laneExecutionBroker =
@@ -860,7 +875,10 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   });
   const latencyDemotion = createLatencyDemotionFn({
     readPings: (provider, model) => pingLoop.getModelPings(provider, model),
-    settings: cfg.routing?.latency,
+    // D2: read through the live Config identity so a committed reload changes new requests.
+    get settings() {
+      return cfg.routing.latency;
+    },
   });
   const costClassOf = (attempt: ResolvedAttempt): CostClass | undefined => {
     const t = attempt.target;
@@ -906,7 +924,10 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   // through `ProbationDeps.readRequestSamples` rather than this real seam.
   const probationDeps: ProbationDeps = {
     readRequestSamples: countRequestSamples,
-    settings: cfg.routing.probation,
+    // D2: the evaluator reads this property on every call; do not snapshot reloadable policy.
+    get settings() {
+      return cfg.routing.probation;
+    },
     costClassOf,
   };
   const probation: ProbationFn = createProbationFn(probationDeps);
@@ -914,7 +935,14 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   // ceiling the deployment stated. Reads the breaker's per-cell attempt-start log — the ONE
   // dataset every egress on both fronts feeds through `beginHealthAttempt` — so every client on
   // the machine that routes through the relay is counted against the same window.
-  const pacing: PacingFn = createPacingFn({ cfg, breaker, settings: cfg.routing.pacing });
+  const pacing: PacingFn = createPacingFn({
+    cfg,
+    breaker,
+    // D2: pacing policy changes with the same in-place Config commit as its configured limits.
+    get settings() {
+      return cfg.routing.pacing;
+    },
+  });
   const hedgeSettings = resolveHedgeSettings(cfg.routing?.hedge);
   const hedgeDelay = (
     attempt: ResolvedAttempt,
@@ -955,6 +983,51 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       controlAuthorization = undefined;
     }
   }
+
+  const reloadTransaction =
+    deps.reloadConfig === undefined || deps.reloadConfig === null
+      ? undefined
+      : (): ConfigReloadAttemptResult => {
+          let candidate: Config;
+          try {
+            // loadConfig validates the whole file first. Materialize derived pools on the
+            // candidate object, never the live one, so preparation remains side-effect-free.
+            candidate = deps.reloadConfig!();
+            materializeDynamicPools(candidate, catalog, { force: true });
+          } catch {
+            return {
+              ok: false,
+              status: 400,
+              message: "config reload failed validation; live config is unchanged",
+            };
+          }
+
+          const applied = applyConfigReload(cfg, candidate);
+          if (!applied.ok) {
+            return {
+              ok: false,
+              status: 409,
+              message: "config changes include fields that require a relay restart; live config is unchanged",
+              requiresRestart: applied.requiresRestart,
+            };
+          }
+
+          resetConfigStalenessLog();
+          try {
+            const warmed = deps.onReloaded?.(cfg);
+            if (warmed && typeof warmed.catch === "function") {
+              void warmed.catch(() => undefined);
+            }
+          } catch {
+            // Warming is advisory after a valid atomic commit. Persisted catalog state remains
+            // available and ordinary background probes will retry.
+          }
+          return {
+            ok: true,
+            changed: applied.changed,
+            warnings: [...(cfg.warnings ?? [])],
+          };
+        };
 
   const providerBackedReshaper = (
     targets: readonly ResolvedTarget[],
@@ -1049,6 +1122,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       costClassOf,
       hardCap: hardCapEvaluator,
       claimConfigStalenessLogOnce,
+      ...(reloadTransaction ? { reloadConfig: reloadTransaction } : {}),
       ...(deps.onStop ? { onStop: deps.onStop } : {}),
     }).catch((e) => {
       failClosed(res, 502, `llm-relay internal error: ${(e as Error).message}`);

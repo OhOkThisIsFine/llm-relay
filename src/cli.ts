@@ -328,6 +328,7 @@ ${formatTextTable([
   ["llm-relay dispatch --next-command -t <task>", "Print only the runnable command for the next lane."],
   ["llm-relay delegate-gate <diff-file> --repo <root> [--fix]", "Quality-gate a delegated lane's diff before judgment/merge."],
   ["llm-relay mcp", "Preferred dispatch entry point for every MCP host; one call returns an answer."],
+  ["llm-relay reload", "Reload supported config fields in the running relay."],
   ["llm-relay stop", "Stop the running relay (requires control token)."],
   ["llm-relay help | --help | -h", "Show help."],
   ["llm-relay version | --version | -v", "Print version."],
@@ -426,6 +427,7 @@ ${formatTextTable([
   ["GET|POST /offload", "Read/set rules; accepts ?client=<name>."],
   ["GET|POST /dispatch", "Read/set next lane; POST {\"exhausted\":\"<lane>\"}."],
   ["POST /cooldowns/clear", "Clear scoped live cooling state."],
+  ["POST /reload", "Atomically reload supported config fields."],
   ["GET /telemetry", "Provider telemetry."],
   ["GET /ping", "Run health probe."],
   ["GET /health", "Provider health."],
@@ -802,14 +804,18 @@ export function ensureEnvFileLoaded(): void {
   loadEnvFile();
 }
 
-export function loadOrExit(): Config {
-  ensureEnvFileLoaded();
-  const configPath = resolveConfigPath();
-  const overrides: ConfigOverrides = {
+export function configOverridesFromCli(): ConfigOverrides {
+  return {
     routeDefault: argValue("--default", "-d"),
     mode: argValue("--mode", "-m"),
     listen: argValue("--listen", "-l"),
   };
+}
+
+export function loadOrExit(): Config {
+  ensureEnvFileLoaded();
+  const configPath = resolveConfigPath();
+  const overrides = configOverridesFromCli();
   try {
     const cfg = loadConfig(configPath, overrides);
     for (const w of cfg.warnings ?? []) {
@@ -964,6 +970,13 @@ export function onListenError(
 
 export function runProxy() {
   const cfg = loadOrExit();
+  // Preserve the exact CLI policy this daemon started with. Re-reading process.argv later is
+  // avoidable ambiguity, and dropping --listen/--mode/--default during reload would silently
+  // change the operator's effective config.
+  const startupOverrides = configOverridesFromCli();
+  const reloadConfig = cfg.sourcePath
+    ? () => loadConfig(cfg.sourcePath!, startupOverrides)
+    : undefined;
   const catalog = new ModelCatalog();
   let accountingStore: AccountingStore | undefined;
   let accountingStoreClosed = false;
@@ -1014,6 +1027,17 @@ export function runProxy() {
     relayVersion: currentVersion(),
     // The projector aggregates every labeled attribution by default; query filters narrow it.
     dashboardAttributionPolicy: "include_all_labeled",
+    ...(reloadConfig
+      ? {
+          reloadConfig,
+          onReloaded: (reloaded: Config) => {
+            for (const warning of reloaded.warnings ?? []) {
+              process.stderr.write(`llm-relay: ⚠ ${warning}\n`);
+            }
+            return warmAndValidate(reloaded, catalog);
+          },
+        }
+      : {}),
     onStop: () => shutdown("POST /stop"),
   });
   server.once("close", closeAccountingStore);
@@ -1410,7 +1434,7 @@ const COOLDOWN_CLEAR_OPTIONS: ReadonlyMap<string, CooldownClearOption> = new Map
 export const CLI_COMMAND_NAMES: ReadonlySet<string> = new Set([
   "onboard", "setup", "keys", "check-keys", "models", "ping", "dashboard", "telemetry",
   "offload", "lanes", "dispatch", "cooldowns", "eligibility", "candidates", "cost", "pools",
-  "routing", "route", "config", "delegate-gate", "mcp", "stop", "help", "version",
+  "routing", "route", "config", "delegate-gate", "mcp", "reload", "stop", "help", "version",
 ]);
 
 interface CommandArity {
@@ -1488,7 +1512,8 @@ const COMMAND_ARITY: Readonly<Record<string, CommandArity>> = {
   // Reads no positional at all: every knob is a config setting, because a stdio server is launched
   // by a host config line that nobody re-types.
   mcp: { min: 1, max: 1, hint: "llm-relay mcp" },
-  // `llm-relay stop` POSTs to the running relay; it takes no positionals.
+  // Control commands POST to the running relay and take no positionals.
+  reload: { min: 1, max: 1, hint: "llm-relay reload" },
   stop: { min: 1, max: 1, hint: "llm-relay stop" },
 };
 
@@ -1542,6 +1567,9 @@ export const CLI_OPTIONS: CliOptionSpec = {
   config: ["--config"],
   "delegate-gate": ["--repo", "--fix"],
   mcp: ["--config"],
+  // Startup overrides are accepted here so the control client can resolve the same effective
+  // config/listener shape as a daemon launched with them.
+  reload: ["--config", "--default", "--mode", "--listen"],
   stop: ["--config"],
 };
 
@@ -3258,6 +3286,81 @@ export async function runOffload(arg: string | undefined, nextArg?: string): Pro
   }
 }
 
+/** `llm-relay reload` — atomically reload supported config through POST /reload. */
+export async function runReload(): Promise<void> {
+  const cfg = loadOrExit();
+
+  let authorization;
+  try {
+    authorization = createControlAuthorization(resolveControlAuthorizationConfigDir(cfg.sourcePath));
+  } catch {
+    process.stderr.write("llm-relay reload: control authorization is unavailable; the relay must be running with this config\n");
+    process.exit(1);
+  }
+
+  let response: Response | null = null;
+  try {
+    response = await fetch(proxyUrl(cfg, "/reload"), {
+      method: "POST",
+      headers: authorization.attach({ "content-type": "application/json" }),
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch {
+    // The daemon is the authority for whether a candidate is reloadable. A transport failure is
+    // not converted into a local file edit or restart attempt.
+  }
+
+  if (response === null) {
+    process.stdout.write(`no relay is listening at ${proxyUrl(cfg, "")}\n`);
+    process.exit(1);
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    process.stderr.write("llm-relay reload: the running relay returned an invalid response\n");
+    process.exit(1);
+  }
+
+  const object = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+  if (!response.ok) {
+    const detail = controlErrorMessage(payload);
+    const restart = Array.isArray(object["requiresRestart"])
+      ? object["requiresRestart"].filter((value): value is string => typeof value === "string")
+      : [];
+    if (response.status === 409 && restart.length > 0) {
+      process.stderr.write(
+        `llm-relay reload: restart required for: ${restart.join(", ")}\n`,
+      );
+    } else {
+      process.stderr.write(
+        `llm-relay reload: the running relay rejected the reload${detail === null ? "" : `: ${detail}`}\n`,
+      );
+    }
+    process.exit(1);
+  }
+
+  if (object["reloaded"] !== true) {
+    process.stderr.write("llm-relay reload: unexpected response from the relay\n");
+    process.exit(1);
+  }
+  const changed = Array.isArray(object["changed"])
+    ? object["changed"].filter((value): value is string => typeof value === "string")
+    : [];
+  const warnings = Array.isArray(object["warnings"])
+    ? object["warnings"].filter((value): value is string => typeof value === "string")
+    : [];
+  process.stdout.write(
+    changed.length === 0
+      ? "llm-relay config is already current\n"
+      : `reloaded llm-relay config: ${changed.join(", ")}\n`,
+  );
+  for (const warning of warnings) process.stderr.write(`llm-relay: ⚠ ${warning}\n`);
+  process.exit(0);
+}
+
 /** `llm-relay stop` — stop the running relay via the admitted POST /stop. */
 export async function runStop(): Promise<void> {
   const cfg = loadOrExit();
@@ -4560,6 +4663,13 @@ function runKeysSubcommand(action: string | undefined, target: string | undefine
     });
     return;
   }
+  if (arg2 === "reload") {
+    runReload().catch((e) => {
+      process.stderr.write(`llm-relay reload: ${(e as Error).message}\n`);
+      process.exit(1);
+    });
+    return;
+  }
   if (arg2 === "stop") {
     runStop().catch((e) => {
       process.stderr.write(`llm-relay stop: ${(e as Error).message}\n`);
@@ -4754,7 +4864,9 @@ export function classifyCommand(argv: string[]): CommandEffect {
     // server means the host's pipe dies mid-session with no diagnosable error.
     case "mcp":
       return "read-only";
-    // POST /stop only reads control token and signals shutdown; no config files are touched.
+    // Control POSTs mutate the already-running daemon, not durable client-side state. Keeping
+    // them read-only also prevents a package self-update/re-exec before the control request.
+    case "reload":
     case "stop":
       return "read-only";
     // check-keys, models, telemetry, candidates, pools, ping, help, version — and anything not

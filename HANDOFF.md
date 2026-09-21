@@ -88,8 +88,18 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   running. The Windows process-boundary regression kills only the original MCP parent and verifies
   that the lane survives, can be collected by a replacement MCP, and can be cancelled there.
   See `docs/history/mcp-restart-safe-lane-execution-design-2026-09-20.md`.
-- **Immediate next after D1.** D2/D5 remain design work; M1 remains blocked on a first-party AGY
-  success envelope. Separately open: repository CI enforcement, Route B's vendor blocker, and the
+- **D2 config hot reload is implemented end to end.** `POST /reload` is on the existing
+  control-token boundary and applies only the field-by-field reload-safe subset after a complete
+  `loadConfig` validation. Restart-only differences reject the entire candidate with 409 and
+  field paths; no sibling change is partially applied. `llm-relay reload` is the operator command,
+  and successful reload updates the loaded mtime so telemetry returns to current. The production
+  loader preserves startup `--listen`, `--mode`, and `--default` overrides. A real-daemon
+  regression proves one PID serves routing value A, reloads to B, then refuses a restart-only
+  candidate C while retaining B. See
+  `docs/history/config-reload-design-2026-09-20.md`.
+- **Immediate next after D2.** D5 major development-dependency upgrades remains the repo-internal
+  design item (one upgrade per lap, Vitest first). M1 remains blocked on a first-party AGY success
+  envelope. Separately open: repository CI enforcement, Route B's vendor blocker, and the
   owner-driven Codex/Code-tab checks.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)

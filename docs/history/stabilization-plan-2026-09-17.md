@@ -416,21 +416,26 @@ the owner these questions.
   replacement MCP, then separately verifies replacement-process cancellation kills the daemon-owned
   lane tree.
 
-### D2 The daemon does not reload `config.json`
-- **True now.** An edit takes effect at the next restart. `/telemetry` and three CLI commands
-  report the staleness. Measured cost: a provider timeout edit and a rung edit each served the old
-  value without notice (2026-09-03, 2026-09-09).
-- **Options.** (a) Keep the report only. (b) `POST /reload` (control token) that re-runs
-  `loadConfig` and swaps the parts that are safe to swap: `routing`, provider timeouts, `limits`.
-  Objects built at startup (breaker, catalog, ping loop, stores) stay.
-- **Recommendation.** (b), designed by a strong model: the hard part is the list of what is safe to
-  swap. `setOffload` already mutates the live `Config`, which is the precedent.
-- **DECISION (owner, 2026-09-17): (b) APPROVED.** Next step: a strong model writes
-  `docs/config-reload-design-<date>.md` that names, for every field of `Config`, whether a reload
-  may swap it and which startup object reads it. The design then splits into cheap packets. Until
-  then no cheap model starts this item. Two binding points for the design: `/reload` joins
-  `CONTROL_ROUTES` (the same admission as `POST /stop`), and a config that fails `loadConfig` is
-  refused whole, with the live config untouched.
+### D2 DONE (2026-09-20) Transactional config hot reload
+- **Design.** The field-by-field ownership matrix and transaction are recorded in
+  [config-reload-design-2026-09-20.md](config-reload-design-2026-09-20.md).
+- **Shipped.** `POST /reload` joins `CONTROL_ROUTES` and re-runs the daemon's original
+  `loadConfig` source plus startup CLI overrides. A candidate is fully validated and dynamic pools
+  are materialized before the live config is touched. Reloadable changes commit synchronously by
+  mutating the existing `Config` identity; a valid candidate containing any restart-only
+  difference returns 409 with field paths and applies nothing. Invalid candidates are 400; an
+  embed with no loader is 503.
+- **Reloadable policy.** Request-time routing/pool policy; provider timeout, concurrency and limit
+  policy; nested limits on an unchanged credential slot; mode/reshaper policy; request body/walk
+  budgets; latency/probation/pacing settings; load warnings and mtime.
+- **Restart-only policy.** Listener host/port, logger policy, destructive-tool matching,
+  provider/credential identity and wire/auth shape, sticky/hedge policy, `dispatchWalk`, and
+  `routing.mcp`.
+- **Operator surface.** `llm-relay reload` uses the existing control capability, reports applied
+  paths, and names restart-only paths on 409. The stale-config notice points at this command.
+- **Proof.** Unit and HTTP integration tests pin atomicity/admission. A real-process regression
+  keeps one daemon PID alive while changing routing value A→B, then changes a restart-only provider
+  field alongside value C and proves the daemon rejects it while continuing to serve B.
 
 ### D3 A deployment that fails without end is tried on every walk
 - **True now.** `opencode/mimo-v2.5-free` has 1,221 failures in a row (HTTP 500);

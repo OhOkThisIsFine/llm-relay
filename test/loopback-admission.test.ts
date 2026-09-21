@@ -467,7 +467,7 @@ describe("loopback admission (ARC-c9155ca2)", () => {
       }
 
       const matches = stderrLines.filter((line) =>
-        line.includes("config changed on disk since the relay loaded it — restart required"),
+        line.includes('config changed on disk since the relay loaded it — run "llm-relay reload"'),
       );
       expect(matches).toHaveLength(1);
     } finally {

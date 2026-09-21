@@ -26,9 +26,9 @@
   protection or a repository ruleset.
 
 - **The stabilization plan holds work that has no entry here (2026-09-17).** M1,
-  operator tasks O2 to O5, and design items D2 and D5 of
-  `history/stabilization-plan-2026-09-17.md`. **Property:** each of those packets is shipped, or the owner
-  declined it and the plan says so.
+  operator tasks O2 to O5, and design item D5 of
+  `history/stabilization-plan-2026-09-17.md`. D2 hot reload shipped 2026-09-20.
+  **Property:** each remaining packet is shipped, or the owner declined it and the plan says so.
 
 - **Route B reaches the vendor; the SERVED half waits for the free allowance to refill**
   (route B shipped 2026-09-09: `wire: "responses"` on a `kind: "openai"` provider, `src/backend.ts`;
