@@ -11,7 +11,7 @@ manual generated-output attributions.
 
 | Package | License | Attribution |
 | --- | --- | --- |
-| `lucide-react@0.468.0` | ISC | Portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT). All other Lucide copyright is held by Lucide Contributors 2022. |
+| `lucide-react@1.47.0` | ISC | Portions of Lucide are held by Cole Bemis 2013-2022 as part of Feather (MIT). All other Lucide copyright is held by Lucide Contributors 2022. |
 | `react@19.2.8` | MIT | Copyright (c) Meta Platforms, Inc. and affiliates |
 | `react-dom@19.2.8` | MIT | Copyright (c) Meta Platforms, Inc. and affiliates |
 | `scheduler@0.27.0` | MIT | Copyright (c) Meta Platforms, Inc. and affiliates |

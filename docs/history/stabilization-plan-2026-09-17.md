@@ -509,10 +509,10 @@ the owner these questions.
 - **DECISION (owner, 2026-09-17): (a) — keep "Unpriced". No work.** Do not propose
   operator-declared prices again unless the owner raises it.
 
-### D5 Major development-dependency upgrades
-The original unnamed remainder has now been reconstructed from the pre-D5 manifest. After the
-Node-types alignment decision below, only `lucide-react` 0.x → 1.x remains as an independent
-major-upgrade lap. None is a defect today.
+### D5 DONE (2026-09-20) Major development-dependency upgrades
+The original dependency-major inventory has now been exhausted. Five named majors shipped, the
+unnamed remainder was reconstructed from the exact pre-D5 manifest, Node types were deliberately
+kept aligned to the Node 22 runtime floor, and the final lucide-react major shipped below.
 Recommendation: one upgrade per lap, each with the full gate and the package baseline measured
 again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
 
@@ -652,8 +652,25 @@ again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
 - **Revisit condition.** Upgrade the declaration major only in the same lap that raises and tests
   llm-relay's Node runtime floor to that major (or otherwise adds a lower-runtime compatibility
   guard).
-- **Next D5 lap.** Upgrade `lucide-react` 0.x → 1.x, the final independent major from the
-  original inventory.
+- **Next D5 lap (historical plan).** Upgrade `lucide-react` 0.x → 1.x, the final
+  independent major from the original inventory.
+
+#### D5-h DONE (2026-09-20) lucide-react 0.x → 1.x
+- **Shipped candidate.** `lucide-react ^0.468.0` → `^1.47.0`. License remains ISC and the
+  package now explicitly peers with stable React 19.
+- **Compatibility review.** The dashboard uses ordinary named icon exports. The production build
+  proves every imported icon still exists; no `DynamicIcon` or package-internal import path is
+  used.
+- **Bundle/accounting change.** The checked production inventory and third-party notice now
+  attribute `lucide-react@1.47.0`. Dashboard output grows by 3,671 bytes, entirely in JavaScript:
+  `dashboardRawBytes=394900`, `jsBytes=371476`; CSS/HTML/manifest are unchanged.
+- **Proof.** 4,490 core tests and all 46 dashboard behavior/accessibility tests pass; package
+  attribution passes; packed-dashboard smoke passes. Package measurement is
+  `packBytes=1209741`, `unpackedBytes=5973679`, `packageEntries=460`, all below ceilings.
+- **D5 exit.** The original major inventory is complete: Vitest 5, Vite 8 + plugin-react 6,
+  jsdom 30, Tailwind 4, native TypeScript 7 compiler, jest-dom 7, and lucide-react 1 shipped.
+  `@types/node` 26 was explicitly declined while Node 22 remains supported; the matching 22.x
+  declarations were refreshed instead. No unnamed D5 major remains.
 
 ### D6 A lane's capability must come from the synced capability data (owner correction, 2026-09-17)
 - **Owner statement.** "The capability value is supposed to be set by data scraped from
