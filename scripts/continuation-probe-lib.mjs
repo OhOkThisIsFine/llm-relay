@@ -7,7 +7,7 @@
  */
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
 import { executableOnPath } from "../dist/executable-lookup.js";
@@ -23,6 +23,14 @@ export function delay(ms) {
 }
 
 export function makeProbeWorkspace(prefix) {
+  const shared = process.env.LLM_RELAY_CONTINUATION_PROBE_WORKSPACE;
+  if (shared) {
+    if (!existsSync(shared)) {
+      throw new Error("LLM_RELAY_CONTINUATION_PROBE_WORKSPACE does not exist");
+    }
+    return { path: shared, cleanup: () => {} };
+  }
+
   const path = mkdtempSync(join(tmpdir(), prefix));
   return {
     path,
