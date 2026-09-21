@@ -2551,14 +2551,14 @@ export class McpDispatchServer {
    * Only a bad working directory is a `refusal`, because that is the caller's own error and every
    * remaining lane would hit it identically.
    */
-  private startLane(
+  private async startLane(
     jobId: string,
     lane: DispatchLane,
     task: string,
     opts: WalkOptions,
     /** The invocation to spawn instead of `lane.invoke` — a read-only binding of it. */
     invokeOverride?: LaneInvocation,
-  ): { result: Promise<LaneAttemptOutcome>; kill: () => void; pids?: () => number[] } | { refusal: string } {
+  ): Promise<StartedLaneHandle | { refusal: string }> {
     if (opts.mode === "answer" && lane.kind === "relay") {
       // ⚠ Skips the whole cwd/invoke/spawn path on purpose: a direct HTTP call to this relay's own
       // /v1/messages needs no working directory and no harness. `lane.invoke` may still be present
@@ -2614,6 +2614,14 @@ export class McpDispatchServer {
         result: Promise.resolve(failedOutcome(`Lane "${lane.id}" cannot be run from here: ${why}.`)),
         kill: () => {},
       };
+    }
+
+    const broker = await this.tryStartBrokerLane(jobId, lane, task, opts, declared);
+    if (broker !== null && !("fallback" in broker)) return broker;
+    if (broker !== null && "fallback" in broker) {
+      // Preflight failed BEFORE any start request, so local ownership is safe but intentionally
+      // visible: this attempt will die with the MCP host if it exits.
+      this.jobs.noteExecutionOwner(jobId, "local-fallback");
     }
 
     // The launcher's own corrections, recorded on the job so the reply names them.
