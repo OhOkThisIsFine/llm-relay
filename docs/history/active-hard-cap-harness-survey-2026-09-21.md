@@ -3,8 +3,8 @@
 **Purpose:** Phase 5.1 of the active hard-cap continuation plan.  
 **Scope:** establish which current lane harnesses expose an exact resumable identity early enough
 for a relay-owned process rollover.  
-**Status:** first-party capability survey complete; live kill/resume validation still required
-before any harness is marked implementation-ready.
+**Status:** survey and repeatable probe tooling complete; live exact-resume and same-cwd isolation
+validation still required before any harness is implementation-ready.
 
 The safety rule is unchanged: **never resume "latest".** Continuation is allowed only with an
 identifier attributable to the exact process incarnation that is being rolled over.
