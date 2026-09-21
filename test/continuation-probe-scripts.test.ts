@@ -8,7 +8,12 @@ const repoRoot = fileURLToPath(new URL("../", import.meta.url));
 const scriptsDir = join(repoRoot, "scripts");
 const helper = join(scriptsDir, "continuation-probe-lib.mjs");
 const continuationScripts = readdirSync(scriptsDir)
-  .filter((name) => name === "continuation-probe-lib.mjs" || /^measure-(agy|claude|codex|opencode)-continuation\.mjs$/u.test(name))
+  .filter(
+    (name) =>
+      name === "continuation-probe-lib.mjs" ||
+      name === "measure-continuation-isolation.mjs" ||
+      /^measure-(agy|claude|codex|opencode)-continuation\.mjs$/u.test(name),
+  )
   .sort();
 
 describe("continuation measurement scripts", () => {
@@ -18,6 +23,7 @@ describe("continuation measurement scripts", () => {
       "measure-agy-continuation.mjs",
       "measure-claude-continuation.mjs",
       "measure-codex-continuation.mjs",
+      "measure-continuation-isolation.mjs",
       "measure-opencode-continuation.mjs",
     ]);
   });
