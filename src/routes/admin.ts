@@ -85,16 +85,8 @@ function relayModels(
   );
 
   return [...ids].sort().map((id) => {
-    // Resolve per id: pool/<name> -> the minimum over its resolving members; a provider spec -> the
-    // deployment's own three-rung resolution. NOTHING resolves -> the two fields are OMITTED
-    // (contract review DR-004, 2026-09-04). Until then an unresolvable id advertised a flat 272000,
-    // roughly 1.7-2.1x this machine's measured pool minimums: an invented ceiling on the surface
-    // Codex budgets compaction against, contradicting the rule every other limit surface here
-    // keeps — an unknown ceiling stays unknown, never a large guess. The description states what
-    // was resolved and how, because the wire schema has no provenance field of its own.
-    // `auto` is a relay-reserved name, resolved through the ladder at request time; resolving it
-    // as a MODEL id would borrow whatever the snapshot holds under that last segment — it did:
-    // `openrouter/auto`'s 2,000,000 tokens, measured 2026-09-04 on this machine.
+    // Resolve each advertised id from actual context evidence. Unknown ceilings are omitted.
+    // `auto` is relay-reserved and must resolve through the current ladder, not as a model id.
     const isAuto = id === AUTO_MODEL;
     const spec = isAuto ? resolveAutoSpec(cfg).spec : id;
     const isPool = spec.startsWith("pool/");
@@ -249,29 +241,13 @@ const TELEMETRY_FAILURE_KIND = {
   completed: null,
   failed: "unknown",
   timed_out: "timeout",
-  // ⚠ `aborted`, NOT `timeout`. The lane did not exceed its own ceiling — the relay's dispatch
-  // walk stopped it after observing it idle, and started
-  // the next lane instead. `aborted` is the vocabulary's word for "the relay ended this attempt",
-  // and it is the honest one: reporting the walk's idle-stop as the lane's own hard timeout would
-  // label a routing decision as a lane failure.
+  // Walk abandonment is relay-initiated, not the lane's own timeout.
   abandoned: "aborted",
 } as const satisfies Record<DispatchLaneStatus, FailureKind | null>;
 
 /**
- * Whether one settled lane attempt PINS its lane or DEMOTES it — a total table, so a new
- * `DispatchLaneStatus` is a compile error here rather than a silent guess (the closed-union
- * gotcha in CLAUDE.md).
- *
- * ⚠ One rule, deliberately: **an attempt that produced an answer pins the lane; any attempt that
- * did not, demotes it.** The narrower alternative — demote only on `abandoned` and `timed_out`,
- * because a `failed` lane at least produced something — was considered and rejected. It reads well
- * until you meet the measured case: a lane that returns a lone `#` is `failed` (empty output), and
- * that is exactly a lane not answering. Splitting the rule would also put the reason for a failure
- * on the wire, widening a channel that carries counts and lengths only.
- *
- * The cost of the simple rule is stated rather than hidden: a lane that fails for reasons specific
- * to ONE task is ordered behind its peers for the demotion window. That cost is bounded three ways
- * — it only reorders, it lapses on its own, and the lane's next success retracts it.
+ * Routing-memory effect for a settled lane attempt. An answer pins; every non-answer demotes.
+ * The table is exhaustive over `DispatchLaneStatus`.
  */
 const LANE_AFFINITY_EFFECT = {
   completed: "pin",
@@ -281,30 +257,8 @@ const LANE_AFFINITY_EFFECT = {
 } as const satisfies Record<DispatchLaneStatus, "pin" | "demote">;
 
 /**
- * Update the daemon's routing memory from one lane report — "the MCP child reports, the daemon
- * records", the same split the telemetry lap already established.
- *
- * ⚠ The DAEMON owns this memory, and it is the only writer. The MCP child could keep its own copy,
- * but the child restarts often (a filed machine-wide defect records one restart destroying five
- * lanes at once) and it is not the process that builds the ladder view. One writer, one owner.
- *
- * ⚠ RECORDING EITHER MEMORY RETRACTS THE OTHER, in BOTH directions. A success retracts the
- * demotion before recording the pin, and a failure retracts the pin before recording the demotion.
- * That mirrors `target-facts.ts`, where a success clears a cooling condition rather than merely
- * being recorded beside it.
- *
- * ⚠⚠ The second direction was MISSING until 2026-09-08, and its absence defeated the demotion half
- * of the walk in exactly the case the feature exists for. `remember` writes one key per KIND
- * (`${kind}:${tier}:${laneId}`), so `demoteLane` could never touch the pin row on its own; only
- * this call site can. Without it a lane that answered, was pinned, and then hung on a later walk
- * carried BOTH memories — and `rankSelectable` ranks a lane holding both as PINNED, i.e. FIRST. So
- * the lane the walk had just abandoned was tried first again on the very next dispatch, and kept
- * that position for the rest of its pin window (15 minutes by default). Found by an adversarial
- * review, confirmed by reading, and pinned by `test/lane-affinity-retraction.test.ts`.
- *
- * ⚠ `rankSelectable`'s own doc rests on this being true — it ranks a both-memories lane as pinned
- * BECAUSE "the pin is the more recent evidence", which only holds while recording one retracts the
- * other. Its handling of that state stays as a defence for a row restored from an older file.
+ * Update daemon-owned lane routing memory from one settled attempt. Recording either outcome first
+ * clears the previous memory so the newest evidence wins. No memory is written when walking is off.
  */
 function recordLaneAffinity(cfg: Config, report: DispatchedTelemetryReport): void {
   const walk = cfg.routing.dispatchWalk;
@@ -322,12 +276,8 @@ function recordLaneAffinity(cfg: Config, report: DispatchedTelemetryReport): voi
   } else {
     demoteLane(cfg, tier, report.laneId, `${report.status.replace("_", " ")} after ${seconds}s`, walk.demoteMs);
   }
-  // Recent-versus-earlier outlier demotion (backlog item 9), evaluated AFTER the sample lands
-  // AND after the pin/demotion above — in that order deliberately. The sample must be in the
-  // window before the rule can read it, and the rule must run after the pin: a lane that
-  // answered and THEN slowed keeps no stale pin, because the outlier demotion goes through the
-  // same retract-then-record entry and the pin it just earned is retracted with it. `false`
-  // makes the rule inert; rows still carry their timestamps either way.
+  // Evaluate outlier demotion after recording this sample and its immediate pin/demotion so a
+  // newly detected slowdown can retract a pin from the same attempt.
   if (walk.outlier !== false) {
     const window = laneStatsFor(cfg, report.laneId, tier)?.wallClockMs ?? [];
     recordLaneOutlier(cfg, tier, report.laneId, window, walk.outlier, {
@@ -399,38 +349,9 @@ type OperatorPinOutcome =
   | { ok: false; message: string };
 
 /**
- * `POST /dispatch {"pin": "<lane>"}` / `{"unpin": "<lane>"}` — the operator's own hand on the
- * dispatch order, and the dashboard's FIRST write (backlog 2026-09-16). It REUSES the walk's
- * routing memory (`lane-affinity.ts`): a pin promotes the lane to the front of its tier's ladder
- * for `routing.dispatchWalk.pinMs` (or the body's `ttlMs`), exactly as a lane that just answered
- * is promoted, and the next `GET /dispatch` reads it with no restart — the same live-state
- * mutation `POST /dispatch {"exhausted"}` already performs on the same route, behind the same
- * admission (`CONTROL_ROUTES` in `server.ts`: exact `Host`, exact `Origin` when present,
- * `content-type: application/json`, the control token).
- *
- * ⚠ It is NOT a config rewrite. `routing.ladder` on disk is untouched, so the order the operator
- * chose lapses with the pin (six hours at most, `MAX_AFFINITY_MS`) and a restart restores it only
- * through the persisted `lane-affinity.json` while the pin is still live. That is the design: a
- * pin reorders lanes that are ALREADY selectable and never resurrects one (`DispatchLane.pinned`),
- * so this write can neither break "health demotes, never drops" nor promote a lane the config,
- * a cooldown, the manifest or the host says is unavailable. A persistent reorder is
- * `llm-relay config set routing.ladder …`, a validated config edit, and deliberately not this.
- *
- * ⚠ Everything below REFUSES rather than silently doing nothing, because the memory is silent by
- * design and an inert pin would read as a pin that took effect: the walk must be ON (with it off
- * `annotateAffinity` reads no memory at all — the documented byte-for-byte revert); the tier must
- * name a ladder this config declares, and must be absent on a legacy single-ladder config (where
- * `selectLadder` would ignore it); the lane must be a rung ON THAT LADDER — `lookupLadderRung`,
- * the same tier-scoped lookup `markExhausted` uses; the rung must be enabled (a pin cannot
- * resurrect a parked one); and an explicit `ttlMs` must be inside the window this relay will hold
- * a memory for — refused, never clamped, since a silently lowered figure would read as the
- * operator's own number taking effect.
- *
- * ⚠ A pin RETRACTS a live demotion first (`clearLaneAffinity` then `pinLane`) — the walk's own
- * retract-then-record rule in `recordLaneAffinity` — and the walk's next idle-stop or failed attempt on that
- * lane retracts the pin in turn: an operator pin is a memory like any other, and the newest
- * evidence wins. `unpin` retracts ONLY the pin (`forgetLaneMemory`), leaving a demotion the walk
- * measured; it is idempotent, reporting whether a live pin existed.
+ * Apply an operator pin/unpin to the walk's routing memory. Pins are temporary live-state
+ * preferences, never config rewrites, and can reorder only enabled/selectable ladder rungs.
+ * Invalid or inert requests are refused rather than silently ignored.
  */
 function operatorLanePin(cfg: Config, body: Record<string, unknown>): OperatorPinOutcome {
   const refuse = (message: string): OperatorPinOutcome => ({ ok: false, message: `POST /dispatch: ${message}` });
@@ -730,12 +651,8 @@ export async function handleAdminRoutes(
       return bad(400, `?task= exceeds ${MAX_TASK_LEN} characters`);
     }
     const taskParam = typeof rawTask === "string" && rawTask.length > 0 ? rawTask : undefined;
-    // ⚠ `host` is REPORTED by the caller, never derived here. Whether a session's traffic reaches
-    // this relay is a fact about the caller's process environment; this process was launched at
-    // logon and its own environment describes nothing about whoever is asking. A bypassing host
-    // is by definition one that sends no traffic here, so there is no request to infer it from —
-    // only the CLI, running as a child of that session, can see it. `buildDispatch` validates the
-    // value and falls back to "unknown" (pre-existing behaviour) for anything it cannot parse.
+    // Host routing state is caller-reported; the daemon's own environment cannot describe the
+    // session making this request.
     const hostParam = parseHostRoutingState(pickQuery(path, "host"));
     const entrypointParam = pickQuery(path, "entrypoint");
     const view = buildDaemonDispatchView(
@@ -748,9 +665,7 @@ export async function handleAdminRoutes(
         ...(bodyClient ? { client: bodyClient } : {}),
         ...(hostParam ? { host: hostParam } : {}),
         ...(entrypointParam ? { entrypoint: entrypointParam } : {}),
-        // Passed through raw and validated by `buildDispatch` (`normalizeOptions`): an unknown
-        // requester or mode reads as ABSENT — the behaviour before these existed — and an unknown
-        // model spec yields no lane and a reason, never a guess.
+        // `buildDispatch` validates requester/mode/model and fails safe on unknown values.
         ...(pickQuery(path, "requester") ? { requester: pickQuery(path, "requester") as NonNullable<DaemonDispatchOptions["requester"]> } : {}),
         ...(pickQuery(path, "mode") ? { mode: pickQuery(path, "mode") as NonNullable<DaemonDispatchOptions["mode"]> } : {}),
         ...(pickQuery(path, "model") ? { model: pickQuery(path, "model") as string } : {}),
@@ -778,10 +693,7 @@ export async function handleAdminRoutes(
   }
 
   if ((req.method === "GET" || req.method === "HEAD") && pathname === "/dispatch/telemetry") {
-    // POST-only, like `/cooldowns/clear`: an explicit 404 rather than the model-path
-    // fall-through, so a mistyped read can never walk candidates or egress upstream.
-    // HEAD is matched beside GET — an authenticated HEAD would otherwise skip this guard
-    // into model routing (finding N6); nothing is reachable off the exact POST either way.
+    // Explicitly reject reads so this control path can never fall through into model routing.
     return bad(404, `${req.method} /dispatch/telemetry is not a route — POST a telemetry report`);
   }
 
@@ -791,25 +703,16 @@ export async function handleAdminRoutes(
       // The reason never echoes the body: a report carries job ids and token counts.
       return bad(400, `POST /dispatch/telemetry body must be a telemetry report`);
     }
-    // P1: ladder membership, mirroring the `POST /dispatch` exhaustion branch — any holder
-    // of the control token could otherwise mint unlimited distinct lane ids (one bad row is
-    // dropped alone, but nothing would bound the NUMBER of lanes). `findLadderRung` is the
-    // shared lookup in `dispatch.ts`, not a second copy; the 400 echoes only the bounded,
-    // dashboard-safe lane id the parser already validated, like the exhaustion branch.
+    // Reports are accepted only for configured ladder lanes; the shared lookup also bounds the
+    // set of persisted lane-stat/affinity keys.
     const rung = findLadderRung(cfg, report.laneId);
     if (!rung) {
       return bad(400, `POST /dispatch/telemetry: no lane "${report.laneId}" in routing.ladder`);
     }
     recordLaneRun(cfg, report);
     recordLaneAffinity(cfg, report);
-    // Owner decision D1: `cli` lanes are metered here because nothing else sees them; a
-    // `relay` lane's harness traffic already flows through the daemon's own HTTP pipeline,
-    // so a second row would double count. Lane stats record BOTH kinds. "Metered by the
-    // relay" is decided by the DAEMON from the rung's declared env (finding C1): a `cli`
-    // rung whose env routes its harness back through this listener is already metered by
-    // the HTTP pipeline, and the report's own `kind` is never trusted — the rung's kind is
-    // the authority, so a stale MCP snapshot (renamed rung, daemon not yet restarted) can
-    // never mint a ledger row.
+    // Account only work not already metered by the HTTP pipeline. The daemon's configured rung is
+    // authoritative; never trust the report's lane kind for accounting.
     if (report.kind !== rung.kind) {
       return ok({ recorded: true, accounting: "skipped", reason: "kind-mismatch" }, true);
     }
