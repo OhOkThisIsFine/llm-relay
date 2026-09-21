@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -25,8 +25,8 @@ describe("replaceFileWithRetrySync", () => {
       const calls: Array<[string, string]> = [];
       const delays: number[] = [];
       let failuresLeft = 2;
-      const rename = (source: string, target: string): void => {
-        calls.push([source, target]);
+      const rename: typeof renameSync = (source, target): void => {
+        calls.push([String(source), String(target)]);
         if (failuresLeft > 0) {
           failuresLeft -= 1;
           throw Object.assign(new Error(`transient ${code}`), { code });
@@ -52,7 +52,7 @@ describe("replaceFileWithRetrySync", () => {
   it("gives up after the bounded Windows retry schedule", () => {
     let calls = 0;
     const delays: number[] = [];
-    const rename = (): never => {
+    const rename: typeof renameSync = (_source, _target): never => {
       calls += 1;
       throw Object.assign(new Error("still locked"), { code: "EPERM" });
     };
@@ -72,7 +72,7 @@ describe("replaceFileWithRetrySync", () => {
     for (const [platform, code] of [["linux", "EPERM"], ["win32", "ENOENT"]] as const) {
       let calls = 0;
       let sleeps = 0;
-      const rename = (): never => {
+      const rename: typeof renameSync = (_source, _target): never => {
         calls += 1;
         throw Object.assign(new Error(`${platform} ${code}`), { code });
       };
