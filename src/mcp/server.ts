@@ -1165,8 +1165,10 @@ export class McpDispatchServer {
   private readonly processCpu = new Map<string, number>();
   /** Last daemon-reported cumulative CPU reading for each recovered broker execution. */
   private readonly brokerCpu = new Map<string, number>();
-  /** Startup adoption work; only job-control reads wait for it. */
+  /** Full restart enrichment; status/result wait for final tree fidelity. */
   private readonly startup: Promise<void>;
+  /** Broker orphan claiming/reconciliation only; explicit cancel waits on this, never on git. */
+  private readonly brokerStartup: Promise<void>;
 
   constructor(private readonly deps: McpServerDeps) {
     this.jobs = new LaneJobStore(deps.journal ?? nullJobJournal, deps.archive ?? nullJobArchive);
@@ -1175,7 +1177,9 @@ export class McpDispatchServer {
     this.now = deps.now ?? Date.now;
     this.cwd = deps.cwd ?? (() => process.cwd());
     this.maxDepth = deps.maxDepth ?? DEFAULT_MAX_DEPTH;
-    this.startup = this.restoreRestartedJobs();
+    const killedTreeStartup = this.restoreKilledTreeDeltas();
+    this.brokerStartup = this.restoreBrokerOrphans();
+    this.startup = Promise.all([killedTreeStartup, this.brokerStartup]).then(() => undefined);
   }
 
   /**
@@ -1343,7 +1347,7 @@ export class McpDispatchServer {
         await this.startup;
         return this.toolResult(args);
       case "dispatch_cancel":
-        await this.startup;
+        await this.brokerStartup;
         return this.toolCancel(args);
       case "dispatch_lanes":
         return this.toolLanes(args);
@@ -1867,14 +1871,6 @@ export class McpDispatchServer {
       this.trees.set(jobId, { cwd: opts.cwd, before, scope: opts.scope, activityLastSeen: before });
       this.jobs.noteStartingTree(jobId, before, opts.scope);
     }
-  }
-
-  /** Reconcile every restart artifact without delaying MCP initialize/tool discovery. */
-  private async restoreRestartedJobs(): Promise<void> {
-    await Promise.all([
-      this.restoreKilledTreeDeltas(),
-      this.restoreBrokerOrphans(),
-    ]);
   }
 
   /**
