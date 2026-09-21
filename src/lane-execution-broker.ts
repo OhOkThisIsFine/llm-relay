@@ -270,6 +270,8 @@ export type LaneExecutionLauncher = (
 
 export interface LaneExecutionBrokerPort {
   handle(request: LaneExecutionBrokerRequest): Promise<LaneExecutionBrokerResult>;
+  /** Daemon shutdown owns and terminates every still-running broker process tree. */
+  shutdown?(): void;
 }
 
 interface StoredExecution {
@@ -493,6 +495,21 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
     private readonly now: () => number = Date.now,
     private readonly maxTerminal: number = MAX_BROKER_TERMINAL_EXECUTIONS,
   ) {}
+
+  /** Graceful daemon shutdown: cancel every process tree this broker still owns. */
+  shutdown(): void {
+    for (const stored of this.executions.values()) {
+      if (stored.status !== "running") continue;
+      stored.cancelRequested = true;
+      stored.status = "cancelled";
+      stored.endedAt = this.now();
+      try {
+        stored.handle?.cancel();
+      } catch {
+        // Shutdown continues; process-tree termination is best-effort at this seam.
+      }
+    }
+  }
 
   async handle(request: LaneExecutionBrokerRequest): Promise<LaneExecutionBrokerResult> {
     switch (request.action) {
