@@ -64,6 +64,23 @@ function snapshot(
   };
 }
 
+function runningSnapshot(
+  request: Extract<LaneExecutionBrokerRequest, { action: "start" }>,
+): LaneExecutionSnapshot {
+  return {
+    schema: LANE_EXECUTION_SCHEMA,
+    executionId: request.executionId,
+    jobId: request.jobId,
+    laneId: request.laneId,
+    status: "running",
+    startedAt: 100,
+    endedAt: null,
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    lastOutputAt: null,
+  };
+}
+
 class BrokerHarness {
   readonly out: string[] = [];
   readonly requests: LaneExecutionBrokerRequest[] = [];
@@ -240,17 +257,7 @@ describe("D1 fresh-dispatch ownership switchover", () => {
         return { ok: false, kind: "rejected", status: 404, message: "unknown lane execution id" };
       }
       if (request.action === "start") {
-        return {
-          ok: true,
-          execution: snapshot(request, {
-            status: "running",
-            endedAt: null,
-            code: undefined,
-            stdout: undefined,
-            stderr: undefined,
-            timedOut: undefined,
-          }),
-        };
+        return { ok: true, execution: runningSnapshot(request) };
       }
       return { ok: false, kind: "unavailable", status: null, message: "should not cancel on shutdown" };
     }, [lane()], {
