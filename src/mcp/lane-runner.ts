@@ -1699,28 +1699,10 @@ export interface CwdCheck {
 }
 
 /**
- * Validate a caller-supplied working directory.
- *
- * The design question the prior-art survey raised: an executing tool needs a directory, and a
- * caller-supplied filesystem path is a strictly larger version of the hazard `dispatch.ts` already
- * refuses (request content becoming process configuration).
- *
- * The answer taken here, and why: the directory must EXIST and be a directory, and when the
- * operator declares `allowedRoots` it must sit under one of them. With no `allowedRoots` declared
- * the check is existence only — the caller is already a trusted agent on the operator's own
- * machine, and refusing by default would make the tool useless for its stated purpose. The bound
- * is offered, not imposed; that is the operator's call to make in config, not this file's.
- *
- * ⚠ **The containment test resolves BOTH sides with `path.resolve` before comparing** (closed
- * 2026-09-03, docs/history/audit-findings-2026-09-03.md finding 1 / DR-002). Without it a literal `..`
- * segment in `cwd` — a raw string a caller sends verbatim, never normalized — satisfied a bare
- * `startsWith` prefix test while `existsSync`/`statSync` above had already resolved `..` at the
- * OS level against the REAL, escaped directory: `allowedRoots: ["C:/allowed"]` admitted
- * `C:/allowed/../other`. `path.resolve` collapses `..`/`.` the same way the OS already does for
- * the existence check, so the two agree; it is a no-op on an already-clean absolute path, so the
- * common case is unaffected. `normalizePath`'s trailing-separator LOOP is untouched — resolving
- * first does not remove the need for it (`path.resolve` does not fold case on win32).
+ * Validate a caller-supplied working directory. It must exist and be a directory; when
+ * `allowedRoots` is configured, resolved-path containment is enforced with separator boundaries.
  */
+
 export function checkCwd(cwd: string, allowedRoots: readonly string[] | undefined): CwdCheck {
   if (!existsSync(cwd)) return { ok: false, reason: `working directory does not exist: ${cwd}` };
   let isDir: boolean;
