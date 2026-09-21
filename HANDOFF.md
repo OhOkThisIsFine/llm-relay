@@ -125,10 +125,20 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   Dashboard output is 391,229 raw bytes (367,804 JS / 22,174 CSS); package measurement is
   1,208,855 packed bytes, 5,968,835 unpacked bytes, and 460 entries, all within ceilings. Tailwind
   4 also establishes a dashboard browser floor of Safari 16.4+, Chrome 111+, and Firefox 128+.
-- **Immediate next in D5.** Upgrade TypeScript 5.9 → 7.0 in its own lap. Treat it as runtime as
-  well as tooling because `delegate-gate` ships it. M1 remains blocked on a first-party AGY
-  success envelope. Separately open: repository CI enforcement, Route B's vendor blocker, and the
-  owner-driven Codex/Code-tab checks.
+- **D5-e TypeScript 7 compiler is green, with a deliberate API split.** Build and typecheck
+  scripts run native TypeScript 7.0.2 explicitly from `@typescript/native`. The root
+  `typescript` runtime package remains 5.9.3 because `delegate-gate` needs the classic
+  in-process Compiler API and TypeScript 7.0 does not ship its stable replacement; that root
+  version also satisfies current typescript-eslint and Madge peers. A clean-install probe confirmed
+  API=5.9.3 and compiler=7.0.2. Native TS7 build/declaration emit, 4,490 core tests, 46 dashboard
+  tests, delegate-gate regressions, Windows process coverage, and packed smoke all pass. Package
+  measurement is 1,208,872 packed bytes, 5,970,011 unpacked bytes, and 460 entries.
+- **Immediate next in D5.** Re-survey the three remaining major development dependencies from the
+  original stabilization inventory, then upgrade one per lap. The runtime Compiler API should not
+  be moved merely for version symmetry; revisit it when TypeScript's new API and this repo's peers
+  support that transition. M1 remains blocked on a first-party AGY success envelope. Separately
+  open: repository CI enforcement, Route B's vendor blocker, and the owner-driven Codex/Code-tab
+  checks.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
