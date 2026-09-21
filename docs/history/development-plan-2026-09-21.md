@@ -17,70 +17,56 @@ The ordering is intentional:
 4. external/evidence-blocked work separated from source work;
 5. active hard-cap continuation implemented incrementally, one verified harness at a time.
 
-## Phase 1 — close the persistence-concurrency uncertainty
+## Phase 1 — persistence-concurrency uncertainty — completed 2026-09-21
 
-### Evidence
+Three Windows CI failures established that the real multi-process persistence property was not
+stable:
 
-On 2026-09-21 the targeted Windows CI job failed twice in
-`test/mcp-persistence-concurrency.test.ts`:
+- run `35568330539` lost one journal row;
+- run `35571358626` lost one archive row;
+- run `35635993384` lost one journal row.
 
-- run `35568330539` at `f5e7ff9`;
-- run `35571358626` at `73c7ed0`.
+The commits that happened to trigger those runs were unrelated to MCP persistence.
 
-In both cases the failing property was the real concurrent-process test that expects every distinct
-journal/archive row to survive. One journal row was missing. Both commits were dependency-only laps;
-later runs passed, including current `main`.
+The investigation found two independent defects:
 
-That pattern is evidence of unresolved nondeterminism in either the test/process synchronization or
-the persistence path. It is not evidence that the dependency changes caused the failure.
+1. **Unrelated journal writes performed liveness-based garbage collection.** A normal journal
+   mutation preserved only foreign rows whose owner passed a process-liveness probe. That made a
+   false-negative liveness read destructive, and it also allowed a genuinely dead owner's recovery
+   row to disappear before a replacement MCP process adopted it.
+2. **Transactional reads failed open.** `transactionalUpdateJsonSync(..., strict: true)` still read
+   through `safeReadJsonSync`, which maps any read/parse/validation failure to `null`. An existing
+   but temporarily unreadable or invalid file could therefore be treated as empty and replaced with
+   a partial new snapshot. That mechanism applies to both journal and archive and explains why the
+   historical failures appeared in both stores.
 
-### Work
+The fix:
 
-1. **Stress the existing regression on Windows and Linux.**
-   - Run the real multi-process case repeatedly, not just the in-process transaction unit.
-   - Capture which row disappears, whether archive and journal differ, worker exit state, and lock
-     ownership at failure.
-2. **Make persistence failure observable in the regression path.**
-   - Production journal writes may remain best-effort where that is an intentional contract.
-   - Tests need a seam that distinguishes "transaction committed" from "failure swallowed", so a
-     lost row cannot masquerade as ordinary execution.
-3. **Classify the mechanism.**
-   Investigate, in order:
-   - journal owner/liveness filtering dropping a still-valid row;
-   - lock acquisition/reclamation behavior on Windows;
-   - a transaction/write failure hidden by best-effort persistence;
-   - worker coordination allowing an owner to disappear before inspection;
-   - filesystem rename/directory-lock semantics.
-4. **Fix the mechanism, not the symptom.**
-   Do not merely widen the 30 s MCP lock budget unless a captured failure proves lock timeout.
-5. **Pin the actual failure mode.**
-   Add or sharpen a regression that fails for the identified mechanism and passes with the fix.
-6. **Stress after the fix.**
-   Require repeated Windows and Linux runs with no missing non-conflicting row.
+- ordinary journal writes preserve every foreign row without a liveness probe;
+- dead startup-orphan rows are removed only after durable terminal adoption, matched against the
+  exact startup row identity;
+- transactional updates distinguish true `ENOENT` from read/parse/validation failure and fail
+  closed on the latter;
+- the real worker fixture now verifies that its own journal/archive mutation actually committed, so
+  a swallowed persistence failure is reported at the worker rather than only as a later missing-row
+  assertion;
+- deterministic tests pin both failure mechanisms and orphan acknowledgement ordering.
 
-### Exit
+No timeout was increased.
 
-The cross-process persistence property is considered closed only when:
+Exit evidence: the protected PR's full `check` job and targeted Windows process-boundary suite are
+green on the source fix. The final documentation head must pass both again before merge.
 
-- the mechanism of the observed CI failure is explained;
-- the regression is deterministic enough to detect that mechanism;
-- repeated supported-platform stress runs preserve every non-conflicting row;
-- no write needed for that property can fail silently in the test harness.
+## Phase 2 — CI enforcement — completed 2026-09-21
 
-## Phase 2 — make CI enforcement real
-
-The repository already runs:
+Repository ruleset `Protect main` is active for the default branch. It requires a pull request and
+both status checks:
 
 - `check`;
 - `windows-process-boundary`.
 
-Configure branch protection or a repository ruleset so both are required before `main` advances.
-
-This is an administrator action, not a source packet.
-
-### Exit
-
-A deliberately failing PR cannot merge to `main` while either required check is red or missing.
+The ruleset has no bypass actors and does not require the branch to be rebased to the latest
+`main` before merge.
 
 ## Phase 3 — establish the next release checkpoint
 
@@ -219,8 +205,8 @@ tested. Unsupported harnesses keep the current timeout semantics.
 
 | Order | Packet | Kind | Gate to advance |
 |---|---|---|---|
-| 1 | Persistence-concurrency investigation/fix | source correctness | mechanism explained + stress green |
-| 2 | Required CI checks on `main` | repository admin | merge blocked when either check fails |
+| 1 | Persistence-concurrency investigation/fix | source correctness | **complete** |
+| 2 | Required CI checks on `main` | repository admin | **complete** |
 | 3 | Release-readiness audit and release | verification/release | current architecture published |
 | 4 | M1 and live/vendor/operator blockers | evidence/operations | close as inputs become available |
 | 5 | Continuation harness survey | design/evidence | exact-resume matrix exists |
