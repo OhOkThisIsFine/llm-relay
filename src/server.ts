@@ -484,7 +484,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     reqBuf = await readBody(req, cfg.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
   } catch (e) {
     const msg = (e as Error).message;
-    // Classified by the code `readBody` set, never by its message (contract review DR-005).
+    // Classify by `readBody`'s code, never by matching error text.
     const status = bodyReadStatus(e);
     if (isCallerVisibleAccountingPath(req.method, pathname)) {
       recordEarlyTerminalAccounting(h.accountingRecorder, started, requestClient);
