@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import {
   atomicWriteJsonSync,
   safeReadJsonSync,
+  transactionalUpdateJsonSync,
 } from "../../src/storage/json-store.js";
 
 let dir: string;
@@ -78,3 +79,61 @@ describe("safeReadJsonSync", () => {
   });
 });
 
+
+
+describe("transactionalUpdateJsonSync", () => {
+  interface RowsFile {
+    version: 1;
+    rows: string[];
+  }
+
+  const validator = (value: unknown): value is RowsFile =>
+    typeof value === "object" &&
+    value !== null &&
+    (value as { version?: unknown }).version === 1 &&
+    Array.isArray((value as { rows?: unknown }).rows) &&
+    (value as { rows: unknown[] }).rows.every((row) => typeof row === "string");
+
+  it("creates an absent file from a null starting state", () => {
+    const target = join(dir, "transaction-new.json");
+    expect(
+      transactionalUpdateJsonSync<RowsFile>(
+        target,
+        (current) => ({ version: 1, rows: [...(current?.rows ?? []), "a"] }),
+        { validator, strict: true },
+      ),
+    ).toBe(true);
+    expect(JSON.parse(readFileSync(target, "utf8"))).toEqual({ version: 1, rows: ["a"] });
+  });
+
+  it("fails closed instead of treating corrupt existing JSON as empty", () => {
+    const target = join(dir, "transaction-corrupt.json");
+    writeFileSync(target, "{ definitely not valid json", "utf8");
+
+    expect(() =>
+      transactionalUpdateJsonSync<RowsFile>(
+        target,
+        (current) => ({ version: 1, rows: [...(current?.rows ?? []), "replacement"] }),
+        { validator, strict: true },
+      ),
+    ).toThrow();
+
+    expect(readFileSync(target, "utf8")).toBe("{ definitely not valid json");
+  });
+
+  it("fails closed instead of replacing an existing file that fails validation", () => {
+    const target = join(dir, "transaction-invalid-shape.json");
+    const original = JSON.stringify({ version: 1, rows: [42] });
+    writeFileSync(target, original, "utf8");
+
+    expect(
+      transactionalUpdateJsonSync<RowsFile>(
+        target,
+        () => ({ version: 1, rows: ["replacement"] }),
+        { validator },
+      ),
+    ).toBe(false);
+
+    expect(readFileSync(target, "utf8")).toBe(original);
+  });
+});
