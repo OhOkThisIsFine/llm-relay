@@ -11,6 +11,7 @@ Start with the row that matches what you want to do.
 | To know what this project is, and is not | [`project-goals.md`](project-goals.md) |
 | The convictions that settle a design question | [`project-philosophy.md`](project-philosophy.md) |
 | What is still open | [`backlog.md`](backlog.md) |
+| What development should happen next | [`history/development-plan-2026-09-21.md`](history/development-plan-2026-09-21.md) |
 
 ## Subject documents
 
@@ -37,7 +38,8 @@ Each of these covers one subject in depth. Read one when you work on that subjec
 
 ## Other directories
 
-- [`history/`](history/) — dated records: design notes, audits and lap closeouts. These are
-  **evidence, not documentation**. Read [`history/README.md`](history/README.md) first.
+- [`history/`](history/) — dated records: design notes, audits, plans and lap closeouts. These are
+  evidence/history rather than the live user reference. Read [`history/README.md`](history/README.md)
+  first.
 - [`../CLAUDE.md`](../CLAUDE.md) — the full source map, written for an AI coding assistant. It
   states the reason behind each rule. Read [`architecture.md`](architecture.md) first.

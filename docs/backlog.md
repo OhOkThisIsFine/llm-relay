@@ -1,71 +1,64 @@
 # Backlog — llm-relay
 
-> The work queue. Each entry states an unmet **Property** and is deleted once that property is
-> met. Shipped work lives in git history and in the dated documents under
-> [`history/`](history/);
-> [`../HANDOFF.md`](../HANDOFF.md) holds current state plus the immediate next; `CLAUDE.md` holds
-> invariants and rationale. Nothing here is a status log. A machine-wide item (a global hook, a
-> shared instruction file, the lap and closeout ceremony) belongs in `C:\Code\docs\backlog.md`,
-> not here. ⚠ A measured fact about USING the relay — dispatch mechanics, what a lane can carry,
-> reading a reply, lane concurrency, operating the daemon — belongs in
-> [`../skills/llm-relay/references/lane-field-notes.md`](../skills/llm-relay/references/lane-field-notes.md),
-> the bundle every host installs (owner, 2026-09-17). It is reference, not work, so it never
-> belongs in either backlog.
+> The work queue. Each entry states an unmet **Property** and is deleted once that property is met.
+> Shipped work belongs in git history and dated records under [`history/`](history/).
+> [`../HANDOFF.md`](../HANDOFF.md) holds current state and the immediate next step; the current
+> development sequence is in
+> [`history/development-plan-2026-09-21.md`](history/development-plan-2026-09-21.md).
+> This file is not a status log.
 
 ## Open
 
-> Implementation packets for every entry below, plus the stability items a live survey found on
-> 2026-09-17, are in [`history/stabilization-plan-2026-09-17.md`](history/stabilization-plan-2026-09-17.md). Delete
-> this pointer when that plan's exit condition is met.
+- **Cross-process MCP persistence is not yet demonstrated stable on Windows.**
+  The targeted Windows CI job failed twice on 2026-09-21 in
+  `test/mcp-persistence-concurrency.test.ts`, each time with one expected journal row missing from
+  the real concurrent-process test. The failures occurred on unrelated dependency commits
+  (`f5e7ff9` and `73c7ed0`); later runs, including current `main`, passed. Treat the property as
+  open until the failure mechanism is understood rather than dismissing it as dependency noise.
+  **Property:** concurrent journal/archive mutations from multiple MCP processes never lose a
+  non-conflicting row on supported platforms, and the regression can be stressed repeatedly on
+  Windows and Linux without silent persistence failure.
 
-- **The default branch still does not enforce the CI gate (rechecked 2026-09-20,
-  medium/repository hardening).** GitHub reports no repository rulesets. The repository already has
-  the two checks that should be required — the full `check` job and the targeted
-  `windows-process-boundary` job — but requiring them before a change reaches `main` is a
-  repository-administrator setting, not a source change.
-  **Property:** the default branch requires both CI checks before changes can land, through branch
-  protection or a repository ruleset.
+- **The default branch does not enforce the CI gate.**
+  The repository has the two checks that should be required — `check` and
+  `windows-process-boundary` — but `main` is not protected by a branch rule/ruleset requiring
+  them.
+  **Property:** both checks are required before a change can land on the default branch.
 
-- **The stabilization plan now holds only evidence-blocked or owner/operator work without a
-  separate backlog entry.** D5 and O5 are complete. M1 cannot begin until one real archived AGY
-  success envelope exists; O2 to O4 are live owner/operator tasks rather than repository
-  implementation packets. There is currently no unblocked source packet in that plan.
-  **Property:** M1 ships or is declined once its required evidence exists, and O2 to O4 are
-  completed or explicitly declined by the owner.
+- **Active hard-cap continuation is designed but not implemented.**
+  Today an active lane that reaches its absolute runtime ceiling is terminated even when first-party
+  liveness evidence says it is still working. The approved design is in
+  [`history/active-hard-cap-lane-continuation-plan-2026-09-20.md`](history/active-hard-cap-lane-continuation-plan-2026-09-20.md).
+  **Property:** where a harness exposes an exact resumable session identity, an active hard-cap event
+  rolls the same logical attempt into a new process incarnation without overlap, without consuming
+  another walk rung, and without counting the rollover as lane-failure evidence. Unsupported or
+  inactive lanes retain ordinary timeout behavior.
 
-- **Route B reaches the vendor; the SERVED half waits for the free allowance to refill**
-  (route B shipped 2026-09-09: `wire: "responses"` on a `kind: "openai"` provider, `src/backend.ts`;
-  tests in `test/backend-responses-upstream.test.ts`). Everything this entry asked for except a
-  200 is now measured. **Done and recorded 2026-09-10:** the daemon runs v0.78.0 (restarted from
-  `Startup\llm-relay.vbs`, PID 28920); `~/.llm-relay/config.json` declares
-  `providers.opencode.wire: "responses"`, pins `opencode/muse-spark-1.3-contributor-free` first in
-  `routing.pools.medium.preferred`, and carries `maxConcurrent: 1` on all four
-  `opencode-muse-spark` rungs (backup `config.json.bak-2026-09-09-pre-v0.78.0-route-b`); and a
-  STREAMED request carrying a tool, sent on BOTH fronts (`/v1/messages` and `/v1/responses`),
-  egressed to OpenCode Zen on the Responses wire and came back
-  `x-llm-relay-served-by: opencode/muse-spark-1.3-contributor-free`,
-  `x-llm-relay-error-origin: upstream`, each front's own native error envelope, and
-  `x-llm-relay-probation: opencode/muse-spark-1.3-contributor-free (0 of 5 request samples)`.
-  ⚠ The upstream answer was `HTTP 429 FreeUsageLimitError: Rate limit exceeded` on both. That is
-  the vendor's free contributor allowance, spent by the six Muse Spark packets this machine
-  dispatched on 2026-09-09 — not a relay fault, and a 429 proves egress but not translation.
-  **Property (what remains):** with the allowance refilled, one request per front through
-  `pool/medium` is SERVED (HTTP 200) by that deployment with a tool call and streaming, and
-  `llm-relay cost` shows its `cached_tokens`. Recorded with the served-by header and the date.
-  **Checked 2026-09-16, still open, and the blocker changed.** A direct request to
-  `opencode/muse-spark-1.3-contributor-free` now answers `HTTP 400 MissingSessionID: "OpenCode's
-  free tier can only be used in OpenCode"` — a vendor session-identity check, not the rate limit
-  this entry was written against. This is not fixable by sending a stronger request: the vendor is
-  asking the caller to prove it IS the OpenCode CLI, and manufacturing that proof would mean the
-  relay impersonating another vendor's own client, which this project's terms-compliance position
-  rules out. The property stays open; the honest next step is confirming with OpenCode Zen support
-  whether a relay-forwarded request can ever qualify, not a code change here.
+- **AGY answer-envelope unwrapping needs first-party evidence before implementation (M1).**
+  The repository still has no raw archived successful AGY envelope from which to freeze the exact
+  schema. Do not implement from an assumed JSON shape.
+  **Property:** once one real archived AGY success envelope exists, either implement narrowly scoped
+  AGY response unwrapping from that observed schema with raw stdout preserved, or explicitly decline
+  the feature.
 
-- **Verify the Codex `relay` agent end to end in Codex Desktop** (owner-driven, 2026-09-04).
-  Commit `e73d113` added `~/.codex/agents/relay.toml` via `scripts/install-skill.mjs`; standalone
-  `codex exec` exposes no MCP tools, so only a live Codex Desktop session driven by the owner can
-  verify it. **Property:** one Codex Desktop `relay` subagent reply carries a `provenance:` line
-  (e.g. spawning `relay` with "read C:\Code\llm-relay\package.json and reply version=<field>"
-  returns the version and provenance from a dispatch lane).
+- **Route B is vendor-blocked.**
+  Relay egress to OpenCode Zen over the Responses wire was demonstrated, but the current free-tier
+  response is `HTTP 400 MissingSessionID`: the vendor requires session identity associated with its
+  own client. The relay must not manufacture another client's identity.
+  **Property:** either OpenCode confirms a supported relay-forwarded session path and one streamed
+  tool-calling request is served successfully through each front, or this route is explicitly
+  recorded as unsupported and removed from active expectations.
 
+- **Live owner/operator verification remains.**
+  These are not repository implementation packets:
+  - verify a >60 s dispatch through a freshly restarted MCP host and confirm the public activity
+    verdict remains sufficient;
+  - verify the Codex Desktop `relay` agent end to end and observe real `provenance:`;
+  - review chronically unsuccessful lanes before changing their enabled state;
+  - clear or deliberately retain the outstanding refusal/eligibility queue.
+  **Property:** each live check is completed and recorded, or explicitly declined by the owner.
 
+## Historical plans
+
+[`history/stabilization-plan-2026-09-17.md`](history/stabilization-plan-2026-09-17.md) is historical
+evidence. D1, D2, D5, D6 and the other completed stabilization packets are not an active queue.

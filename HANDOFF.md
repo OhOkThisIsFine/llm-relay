@@ -1,464 +1,124 @@
 # HANDOFF
 
-Entry point for any agent picking up llm-relay, on any provider. Read this before `CLAUDE.md`.
+Entry point for any agent picking up llm-relay. Read this before `CLAUDE.md`.
 
-## 0. State through 2026-09-20
+## 0. Current state — 2026-09-21
 
-- **The documentation is now usable by a third party (2026-09-17, lap `ca8814f5`, commit
-  `cfb5420`, no source change).** Owner instruction: third-party contributors and testers are
-  coming, so everything must be clear, succinct and free of personal information.
-  - `docs/` top level holds LIVE documents only. The 73 dated records moved to `docs/history/`,
-    whose README states they are evidence and points at the live document for each subject. Six
-    undated records of the same kind and the two existing evidence subdirectories (`reviews/`,
-    `evidence-2026-08-16/`) moved with them, so the move is 99 files and `docs/history/` holds 100.
-    The rule is now in `CLAUDE.md`: a dated file is WRITTEN into `docs/history/`, never moved later.
-  - Machine paths and personal identifiers are scrubbed from every tracked text file.
-  - New: `CONTRIBUTING.md` (set up, the gate, the seven invariants, four test conventions, and the
-    tester section naming the three files that hold credentials), `docs/architecture.md` (a source
-    map for a person), `docs/README.md` (the index).
-  - `docs/reference.md` gained a 48-entry table of contents. No heading TEXT changed, so every
-    existing deep link still resolves.
-  - Verified: gate green on tree `fa86cf9813ea` for `cfb5420` and on tree `55531b8b1d60` for
-    `6ca62d0`; CI green on `main` for both (runs 35266840782 and 35268109263). A link check over
-    all 130 tracked documents, using the resolution rules of `test/doc-links.test.ts`, found 408
-    relative links and 4 broken. Inside that test's own scope there are 378 links and 0 broken. The
-    4 sit in `AGENTS.md` and `.github/copilot-instructions.md`, inside generated installer marker
-    blocks, and are logged in `C:\Code\docs\backlog.md`, not here.
-  - **Released as v0.84.1** (commit `f9fff49`, publish run 35270604176, owner decision). The
-    release carries NO source change — the built output differs from v0.84.0 only in the version
-    string — and exists so the npm page points at `CONTRIBUTING.md` and `docs/architecture.md`.
-    The global binary was reinstalled at 0.84.1. At that release closeout, the running daemon
-    and MCP processes still held behaviourally identical v0.84.0 code; do not treat that historical
-    process-version note as current state.
-- **Later the same day (v0.83.2, v0.84.0).**
-  - The desktop Code tab did not get the long wait: Desktop gave the session its own server copy,
-    named `llm-relay`, which hid the Code tab's own server, and Desktop calls as `claude-ai` with a
-    60 s limit on that path. v0.83.2 gives `claude-ai` a 50 s wait and renames the Desktop entry to
-    `llm-relay-desktop` (setup was re-run on this machine). Evidence:
-    `docs/history/mcp-host-timeouts-2026-09-17.md`.
-  - v0.84.0 (owner decision): the walk stops a lane only when it is IDLE for
-    `routing.dispatchWalk.idleMs` (300 s): no tagged relay traffic, no output, no owned-process CPU
-    increase, and no file change. `src/lane-activity.ts` and `GET /dispatch/activity` supply the
-    relay-traffic signal; each attempt now has its own activity baseline and published
-    `walk-verdict`.
-  - **Owner verification still pending:** a Code-tab walk through a freshly restarted MCP process
-    should be checked end to end; do not infer current host-process versions from this document.
+The repository is in a consolidation phase after a large post-v0.85.0 development run.
 
-- **What the dispatch-fidelity lap shipped (2026-09-17, lap `f8d56109`).** Goal: dispatch from
-  Claude Desktop, Codex Desktop and other hosts works as closely as possible to each host's
-  native subagent dispatch. Seven commits, `85a7ba2..42b2745`:
-  - Several `llm-relay mcp` processes share the job files, and a terminal `dispatch_status`
-    returns the full answer (`85a7ba2`).
-  - Claude Code gets the answer in ONE call: for `clientInfo.name` `claude-code` the server waits
-    until the job ends and sends `notifications/progress`. Other hosts keep the 25 s ceiling. A
-    1,500 s call passed. Evidence: `docs/history/mcp-host-timeouts-2026-09-17.md` (`62c7dbf`, `9f341da`).
-  - The lane launcher expands `%VAR%` environment values (or removes one that does not resolve),
-    and an AGY lane gets `--add-dir <cwd>`. The job shows both on a `launch:` line (`9f341da`).
-  - An agent-mode answer ends with a `tree delta` block: what the lane changed in `git status`,
-    with an optional `scope` that marks paths OUT OF SCOPE. A restart-killed job carries its
-    bounded starting status in the running-job journal and labels the recovered delta as measured
-    at restart adoption time, not at death. Report only (`4e1899e`).
-  - The walk skips a rung whose derived `capability` is below the dispatch tier. Since 2026-09-20
-    the ceiling comes from synced capability data (or a dynamic pool's effort band), never from a
-    hand-set rung value; unknown evidence imposes no limit.
-  - The Codex `relay` agent template writes provenance only from a real dispatch result
-    (`05db5b8`), and a test replays a lane that outlives `waitMs` (`d984b87`).
-- **The stabilization plan is now historical packet detail, not an unblocked implementation
-  queue.** [docs/history/stabilization-plan-2026-09-17.md](docs/history/stabilization-plan-2026-09-17.md)
-  records the packets and evidence behind the remaining owner/external tasks. Use
-  `docs/backlog.md` for current unmet properties. As of this closeout, no source implementation
-  packet in that plan is unblocked.
-- **2026-09-19–20 closeout of the dispatch-fidelity leftovers.** Multi-process journal/archive
-  writes are transactional; the public liveness verdict no longer exposes an internal idle-stop
-  transition; restart-killed jobs recover a bounded tree delta measured at adoption time; the
-  Windows S4 measurement proved a lane dies with its MCP parent; and lane capability is now derived
-  from synced model evidence. The legacy `capability` key loads with a no-effect warning.
-- **Repeated 5xx/402 failure escalation is shipped with this lap (S5).** Failures 1–2 keep
-  the old behavior; failure 3 onward gains a 10m → 1h → 6h → 24h recovery floor, without ever
-  removing the member from failover. The background recovery loop re-probes relay-invented
-  `failure-escalation` cooldowns, and a 200 probe can end one early for 402/5xx.
-- **M1 remains evidence-blocked.** Its first required input is one raw archived AGY success
-  envelope; neither the repository nor available connected context contains one, so no parser is
-  being written from an assumed schema.
-- **D1 restart-safe execution is implemented end to end.** The relay daemon installs the configured
-  lane broker by default and owns fresh spawned MCP agent attempts. The MCP process journals an
-  opaque execution id before the idempotent start, never falls back locally after a start may have
-  reached the daemon, and labels the pre-start local fallback as non-restart-safe. A replacement
-  MCP process atomically claims the journal row, observes or collects the same daemon execution, and
-  routes explicit cancellation back to the daemon; ordinary MCP shutdown leaves daemon-owned work
-  running. The Windows process-boundary regression kills only the original MCP parent and verifies
-  that the lane survives, can be collected by a replacement MCP, and can be cancelled there.
-  See `docs/history/mcp-restart-safe-lane-execution-design-2026-09-20.md`.
-- **D2 config hot reload is implemented end to end.** `POST /reload` is on the existing
-  control-token boundary and applies only the field-by-field reload-safe subset after a complete
-  `loadConfig` validation. Restart-only differences reject the entire candidate with 409 and
-  field paths; no sibling change is partially applied. `llm-relay reload` is the operator command,
-  and successful reload updates the loaded mtime so telemetry returns to current. The production
-  loader preserves startup `--listen`, `--mode`, and `--default` overrides. A real-daemon
-  regression proves one PID serves routing value A, reloads to B, then refuses a restart-only
-  candidate C while retaining B. See
-  `docs/history/config-reload-design-2026-09-20.md`.
-- **D5 has started: Vitest 5 is the first isolated major-upgrade lap.** Vitest moved from
-  `^4.1.11` to `^5.0.1` with no compatibility edits: full Linux `npm run check` and the
-  Windows process-boundary suite both pass, including the dashboard tests under Vitest 5. The new
-  default `clearMocks: true` is retained because the suite does not depend on cross-test mock
-  history. The package baseline was re-measured at 1,212,895 packed bytes, 5,979,413 unpacked
-  bytes, and 460 entries, all within the existing ceilings.
-- **D5-b Vite 8 is green.** Vite moved from `^6.4.3` to `^8.3.0`; its first-party
-  React adapter moved from `^4.4.1` to `^6.1.1` in the same lap because the old adapter's peer
-  range cannot install against Vite 8. No dashboard config rewrite was needed. The production
-  graph now carries `rolldown/runtime.js` beside Vite's module-preload helper, so the checked
-  bundle inventory and third-party notices were updated from observed build evidence. Full Linux
-  and Windows gates pass. The dashboard shrank to 388,654 raw bytes; package measurement is
-  1,208,601 packed bytes, 5,966,259 unpacked bytes, and 460 entries, all within the existing
-  ceilings.
-- **D5-c jsdom 30 is green.** jsdom moved from `^26.1.0` to `^30.1.0`. The repo
-  uses it only as the dashboard Vitest DOM environment, not through direct API imports. Its newer
-  Node floor is satisfied by CI's Node 22.23.2 without changing the product runtime engine.
-  All 4,490 core tests and 46 dashboard tests pass, including focus/accessibility coverage; Windows
-  process-boundary and packed-dashboard smoke also pass. Dashboard output is byte-identical to
-  D5-b; package measurement is 1,208,600 packed bytes, 5,966,259 unpacked bytes, and 460 entries.
-- **D5-d Tailwind 4 is migrated.** Tailwind moved from `^3.4.19` to `^4.3.3` using
-  the first-party `@tailwindcss/vite` plugin; the old PostCSS/autoprefixer integration and empty
-  JavaScript Tailwind config are gone. The v4 stylesheet disables automatic source detection and
-  explicitly scans only dashboard HTML/source, preserving the old server-source exclusion.
-  4,490 core tests and 46 dashboard tests pass, as does the Windows process-boundary suite.
-  Dashboard output is 391,229 raw bytes (367,804 JS / 22,174 CSS); package measurement is
-  1,208,855 packed bytes, 5,968,835 unpacked bytes, and 460 entries, all within ceilings. Tailwind
-  4 also establishes a dashboard browser floor of Safari 16.4+, Chrome 111+, and Firefox 128+.
-- **D5-e TypeScript 7 compiler is green, with a deliberate API split.** Build and typecheck
-  scripts run native TypeScript 7.0.2 explicitly from `@typescript/native`. The root
-  `typescript` runtime package remains 5.9.3 because `delegate-gate` needs the classic
-  in-process Compiler API and TypeScript 7.0 does not ship its stable replacement; that root
-  version also satisfies current typescript-eslint and Madge peers. A clean-install probe confirmed
-  API=5.9.3 and compiler=7.0.2. Native TS7 build/declaration emit, 4,490 core tests, 46 dashboard
-  tests, delegate-gate regressions, Windows process coverage, and packed smoke all pass. Package
-  measurement is 1,208,872 packed bytes, 5,970,011 unpacked bytes, and 460 entries.
-- **D5-f jest-dom 7 is green.** `@testing-library/jest-dom` moved from 6.9.1 to 7.0.1
-  with no matcher migration: the repo uses none of v7's removed deprecated matcher names. Its
-  Node >=22 and DOM/Vitest peers are already satisfied. Full Linux, all 46 dashboard tests,
-  Windows process coverage and packed smoke pass. Package measurement is 1,208,869 packed bytes,
-  5,970,011 unpacked bytes, and 460 entries.
-- **The unnamed D5 remainder is now known.** The exact pre-D5 manifest's registry report shows the
-  remaining independent major laps are `@types/node` 22→26 and `lucide-react` 0.x→1.x.
-  plugin-react 4→6 was already consumed as Vite 8's required adapter in D5-b.
-- **D5-g deliberately keeps Node types on major 22.** `@types/node` 26 was reviewed
-  and rejected while the package still supports Node >=22: compiling against Node-26 declarations
-  would widen the accepted API beyond the runtime floor. The matching line was refreshed instead
-  from 22.20.1 to 22.20.4. Native TS7 build/typechecks, Linux, Windows and package smoke all pass;
-  package measurement is 1,208,871 packed bytes, 5,970,011 unpacked bytes, and 460 entries.
-- **D5-h lucide-react 1 is the final dependency-major lap.** Lucide moved from 0.468.0
-  to 1.47.0; all named icon imports still build, 4,490 core tests and 46 dashboard tests pass,
-  and bundle attribution/packed smoke pass. Dashboard output is 394,900 raw bytes
-  (371,476 JS / 22,174 CSS); package measurement is 1,209,741 packed bytes, 5,973,679 unpacked
-  bytes, and 460 entries, all within ceilings.
-- **D5 is complete.** Shipped: Vitest 5, Vite 8 + plugin-react 6, jsdom 30, Tailwind 4,
-  native TypeScript 7 compiler, jest-dom 7, and lucide-react 1. Node types intentionally stay on
-  major 22 while Node 22 remains supported. No original D5 major remains.
-- **No repo-local implementation packet is currently unblocked.** M1 must not be written from an
-  assumed AGY schema: it still needs one raw archived first-party AGY success envelope. Repository
-  CI enforcement requires an administrator to enable branch protection or a ruleset requiring the
-  existing `check` and `windows-process-boundary` jobs. Route B needs an answer from OpenCode
-  about its session-identity restriction. O2–O4 and the Codex Desktop relay-agent check require
-  owner/operator interaction with the live applications.
+- Published package version: **0.85.0**.
+- `main` is substantially ahead of that release and contains several behavioral changes that
+  should be checkpointed in the next release before another large architectural feature lands.
+- Current `main` CI is green:
+  - 4,490 core tests passed, 4 skipped;
+  - 46 dashboard tests passed;
+  - 51 targeted Windows process-boundary/concurrency tests passed;
+  - build, typecheck, package checks and packed-dashboard smoke passed.
+- D1 restart-safe daemon-owned lane execution is implemented.
+- D2 transactional config hot reload is implemented.
+- Public dispatch/liveness state is explicit rather than inferred from circumstantial clues.
+- Multi-process journal/archive mutations use cross-process transactional locking.
+- Lane capability is derived from synced model evidence/pool bands; the legacy hand-set capability
+  value has no routing authority.
+- Repeated 402/5xx failures use bounded recovery escalation and remain eligible for failover.
+- D5 dependency modernization is complete: Vitest 5, Vite 8, jsdom 30, Tailwind 4, native
+  TypeScript 7 compilation, jest-dom 7 and lucide-react 1. Node declarations intentionally remain
+  on the Node 22 line while Node 22 is supported.
 
-### 0.1 Prior lap (2026-09-17, v0.82.2)
+### Immediate next
 
-- **What that lap shipped — the relay agent's model line (v8).** Owner direction
-  2026-09-16: the generated `~/.claude/agents/relay.md` must never run on the calling session's
-  model ("there is absolutely no reason for Fable to be running a dispatch like that"). `llm-relay
-  setup` now writes `model: haiku` (`DEFAULT_RELAY_AGENT_MODEL`), accepts `--relay-model <alias>`,
-  and refuses `inherit` by name at the CLI and in `installRelayAgent` (`relayAgentModelRefusal`).
-  This reverses the v4 (2026-09-04) direction "do not hard-code a model name"; both measurements
-  are recorded above `DEFAULT_RELAY_AGENT_MODEL` in `src/setup-claude.ts` — `haiku` failed the
-  echo test on the v1 template and passed it on v7 (2026-09-16, two tool calls, verbatim answer,
-  real provenance line). The Codex agent file has no model key and is untouched. **Immediate
-  next:** none from this lap. ⚠ An installed `relay.md` is read by Claude Code once per session:
-  after `llm-relay setup` regenerates it, a new session is needed before the v8 marker shows.
+The immediate source task is **cross-process MCP persistence stability**.
 
-### 0.2 Prior lap (2026-09-16, v0.82.0 and v0.82.1)
+Two Windows CI runs on 2026-09-21 failed the real concurrent-process persistence regression with one
+journal row missing. Those failures occurred on unrelated dependency changes, while later runs
+passed. Do not classify this as harmless flakiness until the mechanism is known.
 
-- **What that lap shipped — the backlog-clearing lap.** Owner instruction: clear up everything from
-  the backlog and open bugs, orchestrated through parallel relay-agent dispatches. Eight pieces
-  landed, each independently gate-verified (typecheck, full suite, dashboard checks, package
-  checks) after merge, not just trusted from the dispatching agent's own report:
-  - **Self-pacing from observed throttling** (`src/pacing.ts`, new) — the relay now holds its own
-    attempt rate under a stated or learned rate limit, across every client, via a third demotion
-    term beside `quota-demotion.ts`/`latency-demotion.ts`. A learned `rate-limit-*` fact paces
-    live without the `routing.quota.enforceLearned` opt-in. `ping/cadence.ts` gained a narrow
-    `RateLimitRecoveryPort` so a 200 probe ends a 429-sourced breaker cooldown early, with bounded
-    re-probing of cooling cells. `routing.pacing: false` reverts byte-for-byte.
-  - **Model catalog refreshes on evidence** (`src/catalog.ts` `noteProviderStale`) — a 404 stating
-    a currently-listed model does not exist now triggers one bounded per-provider re-fetch, wired
-    through `candidate-runner.ts`/`server.ts`.
-  - **MCP dispatch subsystem** (`src/mcp/lane-runner.ts`, `src/mcp/server.ts`,
-    `src/mcp/job-archive.ts` new, `src/mcp/readonly-boundary.ts`) — a silent, stalled lane is now
-    reported (not silently left `running`); finished dispatch jobs survive
-    an MCP-server restart via the archive; job handles are now process-unique rather than a shared counter; `dispatch(readOnly: true)` now binds the lane's own
-    read-only tool flags (`claude`/`codex`), not only its cwd (`opencode`/`agy` refused by name,
-    the gap stated rather than claimed).
-  - **Dashboard's first write** (`routes/admin.ts` `operatorLanePin`) — `POST /dispatch
-    {"pin"|"unpin"}` reuses the existing `lane-affinity.ts` pin, on the same admission boundary as
-    every other `POST /dispatch` (Host, Origin, content-type, control token). The SPA control for
-    it is NOT built yet — left open, see below.
-  - **Dashboard usability pass** — Quota panel grouped by provider with basis badges and relative
-    reset times, dark mode as the default theme (persisted, try/catch-wrapped), a collapsible-panel
-    pass, empty-state styling, hover/focus states.
-  - **Three smaller fixes**, each closing its own backlog item: `config set` can address a numbered
-    ladder-rung array segment; a pre-commit stream failure names its upstream stop reason
-    (`stream-commit.ts`); a DeepSeek response's `reasoning_content` now reaches the caller on both
-    fronts, closing the loop `openai-request.ts` opened.
-- **Verification note.** One dispatched agent's own report claimed a green gate that a second,
-  independent run in a properly-wired worktree contradicted (a double-count failure in the
-  catalog-staleness change, found and fixed as a test-hermeticity bug, not a source bug — see git
-  log `ad6f4e9`). Full suite at this lap's HEAD: 191 test files, 4280 tests on CI's Linux leg
-  (GitHub Actions run 35076653338); a local Windows run reports 4275, the documented gap
-  ("Some tests are POSIX-only and skip on Windows" — §3) — CI is the authoritative count.
-- **What remains open, all three deliberately left, not overlooked** (see `docs/backlog.md`):
-  Route B's live served request (blocked on a NEW vendor session-identity check, not the rate
-  limit the item was written against — not fixable by a stronger request); the Codex Desktop
-  `relay`-agent live verification (needs the owner at the keyboard); the dashboard SPA control for
-  the operator pin (the endpoint half landed this lap, the UI half did not).
-- **Pipeline carried through to release.** Landed on `main`, released as v0.82.0 (npm Trusted
-  Publishing, run 35093394265), global bin reinstalled, and the daemon restarted via its own
-  `Startup\llm-relay.vbs` launcher — confirmed live (`/telemetry`, `/dispatch` both answering on
-  the fresh process). **Immediate next:** none from this lap; the three open items above are each
-  blocked on something outside this repo (a vendor, the owner's own keyboard, or a follow-up SPA
-  change nobody has started).
+Work in this order:
 
-### 0.3 Prior lap (2026-09-10, v0.81.0)
+1. reproduce/stress and resolve the persistence-concurrency failure;
+2. require `check` and `windows-process-boundary` on `main`;
+3. perform a release-readiness pass over the post-v0.85.0 delta and publish a stable checkpoint;
+4. clear evidence/vendor/operator-blocked items as their inputs become available;
+5. begin active hard-cap continuation as staged, harness-specific work.
 
-- **What that lap shipped — the dispatch give-up fixes.** Diagnosis:
-  [docs/history/dispatch-giveup-diagnosis-2026-09-10.md](docs/history/dispatch-giveup-diagnosis-2026-09-10.md).
-  Agents gave up on `dispatch` because the walk stopped the one working lane (`free-pool`) at a
-  90 s budget that its own window could never raise, walked on through lanes that could not
-  answer, ended on the `anthropic` pass-through that the MCP server cannot run, and then told the
-  agent to stop delegating. All nine planned fixes landed (F1–F9), with DeepSeek's two
-  request-shape 400s (F10/F11, written by a Sonnet lane and verified here) and the windowless-console
-  wrap for `routing.cliLane` (the popup fix). The owning symbols are in the `CLAUDE.md` rows for
-  `dispatch.ts`, `dispatch-lane-stats.ts`, `mcp/server.ts`, `mcp/agy-quota-log.ts` and
-  `openai-request.ts`.
-- **What an operator will notice.** `dispatch` takes `model`; the default blocking wait is 25 s
-  (it was 40 s, past Codex's 31 s limit); a reply with no answer names a lane the walk stopped and
-  the call that lets it finish; `dispatch_status` states the running lane's usual time to answer;
-  `dispatch_lanes` shows each lane's time to answer and failure streak; a lane with five own
-  failures in a row is ordered last until it answers; `/telemetry` shows `tierType: null` for an
-  undeclared tier; and an `llm-relay mcp` process older than the installed package says so in
-  every reply. The `relay` agent description (Claude v7, Codex v2), the skill and the MCP
-  instructions no longer call the pools free, because paid DeepSeek leads them.
-- **Verified live on an isolated relay** (port 8792, this lap's build, a copy of the operator's
-  config and lane history). `dispatch_lanes` showed `anthropic` unreachable for the MCP server and
-  `opencode-muse-spark` failing at 12 own failures; `model: "deepseek/deepseek-flash"` answered in
-  1.8 s; an agent-mode dispatch handed back its job at 25.0 s; and with the agent floor set to 60 s,
-  `free-pool` ran a 100 s command to its answer in 107 s — the walk withheld the budget because
-  every later lane was failing, exhausted or unreachable. The transposed lane ran through
-  `lane-launch.ps1`, and a window watcher saw no new window and no focus change from it. The first
-  run also found old lane history reading as a time to answer (`anthropic` "0s" at 0 of 24),
-  fixed in `3a798ca`.
-- **Operator config, this lap (backups taken).** `providers.deepseek.stallTimeoutMs: 120000` (F7)
-  and the four free-pool rung notes, which say that paid DeepSeek leads the pool, are LOADED: the
-  daemon was restarted at 13:55 (PID 20364) onto the global v0.80.0, after the last config write
-  (13:15). The stopgap `routing.dispatchWalk: false` (owner decision "walk off, no restart now")
-  was loaded then too. The closeout REMOVED it again (owner decision 2026-09-10: turn the walk
-  back on; backup `config.json.bak-2026-09-11-pre-walk-on`), so the default walk returns at the
-  next restart.
-- **Immediate next:** the owner restarts the daemon onto v0.81.0; the global package is already
-  reinstalled (owner decision 2026-09-10: "reinstall now, I'll restart"). The restart loads this
-  lap's daemon-side code (`requester=mcp`, mode-keyed windows, `model`, `tierType: null`, the
-  launcher wrap in `GET /dispatch`) and the walk. After it, `GET /dispatch` should show walk
-  budgets, and a view built with `requester=mcp` should show `anthropic` unreachable. The next lap
-  is decided (owner, same day): pacing from observed throttling, then a catalog refresh on a stale
-  hint — the two owner-direction entries in `docs/backlog.md`.
-- **Refusal queue (owner decision 2026-09-10).** The two OpenCode Zen 429s
-  (`muse-spark-1.3-contributor-free`, `mimo-v2.5-free`) are no longer in the queue, so there is
-  nothing to accept: the circuit breaker cools a model that answers 429, and a served success
-  clears it. `nim/deepseek-ai/deepseek-v4-flash-0731`'s "degraded function cannot be invoked"
-  stays pending, as kimi-k3's does; the stated cost of both is one attempt per walk on each of those
-  NIM deployments. The groq network-block refusal also stays pending on purpose (`network-block.ts`
-  says never to reject it). The three DeepSeek request-shape refusals in the queue are the
-  F10/F11 defects this lap fixed; they should stop once the daemon runs v0.81.0.
+Detailed sequence and exit conditions:
+[`docs/history/development-plan-2026-09-21.md`](docs/history/development-plan-2026-09-21.md).
 
-### 0.4 Previous laps
-
-- **v0.78.0–v0.80.0 (2026-09-09/10).** The 27-items lap closed every backlog entry open at
-  `3abbafd` (route B `wire: "responses"`, the probation band, the first-byte deadline, the crawl
-  abort, `POST /stop`, the `maxConcurrent` cap and more); v0.79.0 carried DeepSeek's thinking
-  control and pool effort; v0.80.0 made the MCP server reap lane process trees, journal running
-  jobs, and refuse a read-only dispatch in the caller's own tree.
-- **v0.77.1, the `parseRouting` split (2026-09-09, morning).** Validation order pinned FIRST
-  (`test/config/routing-parser-order.test.ts`; cognitive complexity 125 → 12; `parseOffload` and
-  `parseLadder` untouched by design). Two pre-existing quirks pinned as behaviour: the
-  pool-member warning lacks the `config.` prefix and the consequence sentence, and
-  `routing.subagents` stays attached as `{}` when its only entry is dropped.
-- **v0.77.0, breaker persistence (2026-09-08/09).** The WHOLE circuit-breaker cell survives a
-  restart (failure counters, the credential fault, the served-request ping window
-  `GET /telemetry` scores from, quota observations), and every write-behind store flushes at a
-  graceful shutdown. Three stated behaviour changes: restore is faithful, not future-only; a
-  credential fault survives for its five-minute window (owner-accepted); every outcome dirties
-  the file, bounded by `WriteBehindTimer`. Residue: the logon-started daemon dies by
-  `TerminateProcess`, so the flush never runs there (backlog). Evidence:
-  [docs/history/breaker-persistence-audit-2026-09-08.md](docs/history/breaker-persistence-audit-2026-09-08.md).
-- **v0.74.0–v0.76.0, the dispatch lane walk and its safety review.** `dispatch` walks the
-  ladder, pins the lane that answered, demotes the one that did not, and budgets each lane from
-  its own p80. Three defects fixed in review: a demotion did not retract the pin; the budget
-  measured itself; a clamped budget was labelled `history`. ⚠ Review coverage was PARTIAL — 24 of
-  33 second-pass findings are UNVERIFIED, two filed in the backlog. That count is historical, not
-  a current verification ledger: the review document does not identify those findings individually,
-  and v0.84 removed the time-budget stop that many concerned. Do not claim the remainder was later
-  verified. ⚠ The demotion is EVIDENCE, not a calibrated statistic; never point the HTTP path's
-  numbers at a lane. Full record:
-  [docs/history/lane-walk-safety-review-2026-09-08.md](docs/history/lane-walk-safety-review-2026-09-08.md).
-
-### 0.5 Offload, measured
-
-Free lanes CANNOT do open-ended reconnaissance here — 7 of 7 packets fabricated on 2026-09-05.
-They CAN review a concrete diff against a stated claim, and they carry a mechanical rewrite with
-a stated rule. The test is whether the output can be checked by running or reading something
-specific. Never key a fallback on a `null` result; never make a lane the only check.
-
-The 27-items lap (2026-09-09) added the numbers. `opencode-muse-spark` carried six whole
-implementation packets ALONE (101–998 s each, clean at `delegate-gate`) and starved every packet
-handed to it as a second or third concurrent lane (2100 s, nothing written) — `maxConcurrent: 1`
-on its rung is the fix, shipped this lap and owed to the operator config. The free pool hit its
-1800 s ceiling on every implementation packet and left a partial tree worth taking. Codex Spark
-spent two whole usage windows reading (193k and 477k tokens) and wrote nothing, twice. DeepSeek
-on the Codex harness died five of five times on the relay's own 1024 cap. Nine Sonnet lanes
-carried the rest at 25–41 minutes each with honest red-then-green evidence. Verify every lane by
-running and reading: one lane's test passed with its fix removed, one lane's six-step fallback
-silently changed a legacy rule, one lane's threshold triple could never fire, and one lane wrote
-the DeepSeek key literal into a scratch launcher despite a brief that forbade it.
-
-### 0.6 Earlier releases
-
-Earlier releases are deliberately not restated here. `git log --oneline`, the tags, and the dated
-documents under `docs/` are the trail; what survived each release lives in the `CLAUDE.md` rows
-and gotchas.
+The authoritative unmet-property list is [`docs/backlog.md`](docs/backlog.md).
 
 ## 1. What still binds
 
-These were **not** removed and are load-bearing. Do not relax them:
+These are load-bearing constraints. Do not relax them casually:
 
-- **Loopback only.** Startup refuses a non-loopback bind. But loopback is not authorization —
-  mutating endpoints carry admission checks plus a capability token.
-- **Logs are metadata only**, enforced at the sink by an allow-list in `src/log.ts`. Never headers,
-  never bodies, never URL parameter *values*.
-- **The repair boundary.** The proxy fixes protocol *form* (malformed tool calls), never *judgment*.
-  No LLM opinion may enter the request path. Routing comes from config and deterministic
-  classification.
+- **Loopback only.** Startup refuses a non-loopback bind. Loopback is not authorization; mutating
+  endpoints also use admission checks and the control token.
+- **Logs are metadata only.** Never log headers, bodies or URL parameter values.
+- **Repair protocol form, not judgment.** Tool-call repair may fix malformed protocol form; no LLM
+  opinion enters the request path. Routing remains deterministic/config-driven.
 - **Destructive tool calls are refused, never fabricated.**
-- **Health demotes, never drops.** Learned from a real outage where filtering unhealthy candidates
-  narrowed a pool to nothing.
+- **Health demotes, never drops.** A temporarily unhealthy candidate remains available to the
+  failover/recovery machinery.
+- **Unknown capability is not weak capability.** Missing capability evidence must not silently
+  exclude a lane.
+- **One logical lane attempt may own at most one live process incarnation at a time.** This becomes
+  especially important when hard-cap continuation is implemented.
 
-The invariant recalibration is applied and authoritative in `CLAUDE.md` §Invariants and
-`docs/project-goals.md`; the retired rules and their replacements are recorded in
-[docs/history/rubric-recalibration-2026-08-16.md](docs/history/rubric-recalibration-2026-08-16.md) §2 and in git
-history - do not reintroduce them.
+Authoritative rationale lives in `CLAUDE.md`, `docs/project-goals.md`, and the relevant dated
+design records.
 
 ## 2. Where to read
 
-| Document | For |
+| Document | Purpose |
 |---|---|
-| `CLAUDE.md` | Architecture map, file-to-responsibility table, gotchas. Invariants are authoritative there. |
-| `docs/history/metering-reconciliation-2026-08-22.md` | Implemented vs open against the quota-metering spec: gap/stage/decision tables. |
-| `docs/history/rubric-recalibration-2026-08-16.md` | What went wrong, the revised invariants (copy-ready), 55 re-adjudicated rejections. |
-| `docs/history/credential-fleet-design-2026-08-16.md` | Custody, pooling, cost accounting: components, staged build order. |
-| `docs/history/quota-metering-spec-2026-08-16.md` | The metering pipeline: metrics, collection sites, storage, stages. |
-| `docs/history/spa-dashboard-design-2026-08-20.md` | Read-only Analytics SPA design, protocol, contract, staged gates. |
-| `docs/history/rejection-ledger-2026-08-16.md` | Every past rejection and its reason, grouped by reason-kind. |
-| `docs/reference.md` | Full user-facing reference: credential fleets, protected diagnostic surfaces. |
-| `docs/history/three-axis-assessment-2026-08-28.md` | The owner's three-axis capability assessment: verdicts per axis, the live-signal finding. |
-| `docs/history/advisory-findings-verification-2026-08-28.md` | The 32 advisory findings: the closed-vocabulary bug class and all eight instances. |
-| `docs/history/documentation-pass-2026-08-27.md` | The doc-vs-source pass: what was wrong, in what classes, what was deliberately left. |
-| `docs/history/dispatch-integration-review-2026-08-27.md` | Historical cross-CLI dispatch review; its AGY focus-safety conclusion is superseded by the next row. |
-| `docs/history/dispatch-smoothness-2026-08-31.md` | Current per-agent routing matrix, MCP spawn guarantees, PowerShell/OpenCode repairs. |
+| `docs/README.md` | Documentation index |
+| `docs/backlog.md` | Current unmet properties |
+| `docs/history/development-plan-2026-09-21.md` | Current development sequence |
+| `CLAUDE.md` | Architecture map, invariants, responsibility table and gotchas |
+| `docs/architecture.md` | Human-facing codebase overview |
+| `docs/reference.md` | User-facing commands, configuration, APIs and caveats |
+| `docs/history/mcp-restart-safe-lane-execution-design-2026-09-20.md` | D1 design/evidence |
+| `docs/history/config-reload-design-2026-09-20.md` | D2 design/evidence |
+| `docs/history/active-hard-cap-lane-continuation-plan-2026-09-20.md` | Planned continuation feature |
+| `docs/history/stabilization-plan-2026-09-17.md` | Historical stabilization packets; not the live queue |
 
-## 3. Verification — the one gate
+## 3. Verification
+
+The complete local gate is:
 
 ```bash
 npm run gate
 ```
 
-- `npm run gate` = `npm run build && npm run check`. It is ONE script because
-  `verify-green.mjs record -- <cmd>` takes one command, and a fresh lap worktree has no `dist/`
-  (gitignored), so `check:package` fails unless the build ran first. Record the ledger with
-  `node ~/.agent-config/verify-green.mjs record -- npm run gate`.
-- `npm run check` = both typechecks (`src/` and `test/`) + the server vitest suite + the dashboard
-  checks (`tsc -p dashboard/tsconfig.json --noEmit` and the dashboard suite) + the package checks
-  (bundle-inventory equality, size ratchets, packed smoke). **CI runs exactly this and nothing
-  else.**
-- Bundle sizes live in `docs/dashboard-package-baseline.json` and are ratcheted: regenerate the
-  baseline in the SAME change that adds or removes bundle weight, or `check:package` goes red.
-- Tests read `src/` directly; `scripts/*.mjs` read `dist/` - rebuild before running any script.
-- Some tests are POSIX-only and skip on Windows; CI's ubuntu leg is the only place they run. A
-  store path nested under a regular file reads `ENOENT` on Windows but `ENOTDIR` on Linux, so
-  fixtures inject the stat/read seam.
-- A failing test may pin a defect it should have caught; fix test and source in one commit.
-- A test doing real machine work has the machine's worst case in its 5 s budget: a spawn measured
-  at ~50 ms idle took 2.8–4 s under full-suite contention and flaked two CLI tests for weeks. Fix
-  at the root with an injected seam, never by raising one test's timeout.
-- Static analysis (`npm run analysis:run`) is advisory and deliberately outside the gate.
+`npm run gate` builds first, then runs both typechecks, the core test suite, dashboard checks and
+package checks. CI additionally has the targeted `windows-process-boundary` job for process,
+persistence and Windows-specific lifecycle behavior.
 
-## 4. Things that will bite you
+Important rules:
 
-1. Do not trust this repo's documentation without checking source; three mechanical guards exist
-   (`test/architecture-map.test.ts`, `test/scripts-inventory.test.ts`, `test/doc-links.test.ts`)
-   and everything a doc SAYS is still unguarded.
-2. A recorded "open gap" is a claim; verify its mechanism before working it.
-3. A CLI process's environment is not the running relay's environment; `GET /registry` is
-   authoritative for `has_key`.
-4. `/health` and `/ping` return 403 by design; use `/telemetry`.
-5. Headless offload lanes must be told not to stop and ask.
-6. A spent pool member stays walkable by design; address a healthy member directly with
-   `--model <provider>/<model>`.
-7. A multi-lane burst degrades the free pool it runs on; relaunch each dead lane pinned to a
-   different healthy member from `/candidates`.
-8. The vitest interpretations/fact stores are per-PROCESS files; assert entry-specific facts,
-   never queue lengths.
-9. Worktrees: edit and run tests in that path; `vitest.config.ts` scopes the suite on purpose.
+- scripts under `scripts/*.mjs` consume `dist/`; rebuild before running them;
+- tests read `src/` directly;
+- bundle/package baselines are ratcheted and must change in the same commit as intentional bundle
+  weight changes;
+- do not fix contention flakes by increasing an arbitrary test timeout unless the measured failure
+  is actually timeout exhaustion;
+- a failing regression may be exposing a source defect rather than a test defect. Prove the
+  mechanism before weakening the assertion.
 
-## 5. Definition of done
+Static analysis remains advisory and is outside the gate.
 
-- `npm run gate` green on a clean, committed tree.
-- Both request paths covered by any new policy.
-- New behaviour pinned by a test. Failover tests use **≥2 candidates** — with one candidate,
-  "fails over correctly" and "cannot fail over" are the same observation.
-- Commit trailer names the model that authored the change:
-  `Co-Authored-By: <model> <noreply@anthropic.com>`.
-- No half-done state. Deliberate intermediate states must be called out explicitly so they are not
-  mistaken for bugs.
+## 4. Definition of done
 
-## 6. Recorded trades with no other home
+For source changes:
 
-Everything here is a settled trade kept for its reason, not work; the queue is `docs/backlog.md`.
+- `npm run gate` is green on the final committed tree;
+- the targeted Windows process-boundary suite is green when the change touches process,
+  persistence, spawning or lifecycle semantics;
+- new behavior is pinned by a regression that fails when the implementation is removed;
+- both request fronts are covered by any policy that applies to both;
+- failover tests use at least two candidates;
+- docs/backlog/handoff are updated only when the change alters a live property or immediate next
+  step;
+- deliberate intermediate states are labeled explicitly.
 
-1. **Custody residuals (v0.45.0):** `keys rotate` mints the control token when no relay runs (same
-   side effect as `cooldowns clear`); the macOS `security` and Linux `secret-tool` lanes have
-   injected-double coverage only, no CI leg runs them. (The keystore flake of 2026-09-09 is
-   closed: its mechanism was a four-character leak-check needle colliding with base64 ciphertext,
-   and the shared worker-default path only made the haystack longer; both halves fixed in
-   `test/keystore.test.ts`.) Plan:
-   [docs/history/custody-sprint-plan-2026-08-24.md](docs/history/custody-sprint-plan-2026-08-24.md).
-2. **SPA and test nits standing:** the flat 30 s poll with no failure backoff (mitigated by
-   abort-on-hide/offline), the CSS-structure test mirroring styles.css, a few wall-clock-sleep
-   tests, dashboard fixtures cast via `as unknown as`, `aria-description` support patchier than
-   described-by, SIGKILL leaking the test interpretations file; and the misleading body-problem
-   error codes (N8), a versioned wire change no consumer reads. (Theme preference now defaults to
-   dark and persists via `localStorage`, closed 2026-09-16.)
-3. **`delegate-gate` findings waived (2026-09-04, extended 2026-09-09):** the module-level
-   `servers` test-fixture pattern and `as unknown as typeof fetch` casts are pre-existing
-   repository convention, not new defects. Added 2026-09-09, each with its reason in the commit
-   that carries it: a partial-`Config` fixture cast `as unknown as Config` where the file's own
-   `Harness` already casts a partial literal (P8); the tautological-assertion detector's
-   local-helper false positive (`provider()`, `budgetOf()`); a double cast through the accounting
-   store's returned `writerStatus` reference to reach a `lease_refused` state that has no
-   single-process producer (P11-b); a `WeakMap` set on the Responses path that the Chat path
-   in the same file already performs (P7); and, for the probation band (P13), the same
-   local-helper false positive (`attempt()`) plus an `as unknown as typeof fetch` cast that is
-   `test/dynamic-pools.test.ts`'s existing fixture convention.
-4. **Where every other settled decision lives:** the owner decisions of 2026-09-04 (`freeOnly`
-   stays `false`; contributor SKUs route automatically) in the `dynamic-pools.ts` row of
-   `CLAUDE.md` and `docs/history/muse-spark-1.3-opencode-zen-2026-09-04.md`; the Class B deferrals, the
-   type-level 7 keep and the WITHDRAWN currency-per-week spend ceiling in
-   `docs/history/advisory-findings-verification-2026-08-28.md`; the dropped Gaps 15/16/P4 and the accepted
-   streaming usage parity in `docs/history/metering-reconciliation-2026-08-22.md` §7; the uncovered-areas
-   verdicts in `docs/history/uncovered-areas-review-2026-08-26.md`.
+Do not use this file as a release diary. Historical measurements, designs, audits and closeouts
+belong under `docs/history/` and in git history.
