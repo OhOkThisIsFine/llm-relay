@@ -283,66 +283,18 @@ export interface Routing {
    * evidence stated. Unknown quota has no effect whatsoever.
    */
   quota?: QuotaEnforcementConfig;
-  /**
-   * Sustained MEASURED latency as a demotion term (owner decision 2026-08-30). **Default ON** —
-   * absent means enabled with the tunable defaults in `src/latency-demotion.ts`. `false` is the
-   * shorthand for `{ enabled: false }` and restores the pre-2026-08-30 behaviour exactly.
-   *
-   * Like quota, it only ever REORDERS: never drops, never refuses, and unmeasured latency has no
-   * effect whatsoever.
-   */
+    /** Latency demotion policy. Default on; reorders only and has no effect without enough samples. */
   latency?: LatencyDemotionConfig;
-  /**
-   * Hedged attempts (owner proposal + decisions 2026-08-30,
-   * docs/history/hedged-attempts-design-2026-08-30.md §7). **Default ON**, and confined to deployments
-   * `assessCost()` calls FREE.
-   *
-   * ⚠ This is the FIRST behaviour here that does not merely reorder — it DUPLICATES a request onto
-   * a second candidate. The `CLAUDE.md` invariant reads "Acting on counts is optional, always
-   * announced, and may only reorder"; the owner amended it for this feature on 2026-08-30 and
-   * bounded the duplication three ways: free deployments only (D1), the loser aborted the moment a
-   * winner commits, and the response announcing it (`x-llm-relay-hedged`).
-   *
-   * `false` is the shorthand for `{ enabled: false }` and restores the pre-hedge behaviour exactly.
+    /**
+   * Hedging policy. Default on for free deployments with known pricing; may duplicate one in-flight
+   * request and aborts the loser once a winner commits.
    */
   hedge?: HedgeConfig;
-  /**
-   * Untested-free-members-first probation band (owner direction 2026-09-09). **Default ON** —
-   * absent means enabled with `minSamples: 5`.
-   *
-   * Like latency and hedging, it only ever REORDERS (probation members lead; nothing is
-   * dropped and nothing is refused), and unmeasured PAID/unknown deployments are unaffected.
-   *
-   * `false` is the documented shorthand for `{ enabled: false }` and restores the
-   * pre-probation behaviour exactly, byte for byte.
-   */
+    /** Probation policy for under-sampled free deployments. Default on; reorders only. */
   probation?: ProbationConfig;
-  /**
-   * Self-pacing against a STATED rate limit (owner direction 2026-09-10, built 2026-09-15). **Default
-   * ON.** A cell whose provider-stated, operator-configured or LEARNED (`rate-limit-*` fact) ceiling
-   * the relay's own trailing-window attempt count has reached joins a `paced` band behind `live`
-   * and `slow`, so the next request goes elsewhere while the window drains. Counted from the
-   * breaker's per-cell attempt-start log, which every client routing through the relay feeds.
-   *
-   * Like latency and probation it only ever REORDERS — nothing is dropped, nothing is refused —
-   * and a limit nobody stated has no effect at all. `false` is the shorthand for
-   * `{ enabled: false }` and restores the pre-pacing order exactly, byte for byte.
-   */
+    /** Self-pacing policy from stated/learned rate ceilings. Default on; reorders only. */
   pacing?: PacingConfig;
-  /**
-   * Post-commit CRAWL abort (backlog item 18, built 2026-09-09 after
-   * `docs/history/post-commit-stall-measurement-2026-09-09.md` measured that both Claude Code and Codex
-   * retry a stream that goes bad after content has already arrived — Claude Code once, downgraded
-   * to non-streaming; Codex up to five times, staying streaming). A silent stall after commit is
-   * already caught by `withStallWatchdog` at `stallTimeoutMs`; this catches the case nothing else
-   * does — bytes keep arriving inside that inter-byte window while the sustained per-token rate,
-   * over a sliding window, is far worse than the same deployment's own history supports.
-   *
-   * **Default ON.** `false` is the shorthand for `{ enabled: false }` and restores the pre-crawl
-   * behaviour exactly — the watchdog is not installed at all. An object with no keys is legal and
-   * means the defaults. The thresholds live in `src/stream-pipeline.ts` beside the measurement
-   * that calibrated `msPerToken`.
-   */
+    /** Post-commit sustained-slow-stream watchdog. Default on; `false` disables it. */
   crawl?: CrawlWatchdogConfig;
   /**
    * Background lane re-probing (owner decision 2026-08-29,
