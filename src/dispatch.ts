@@ -81,12 +81,7 @@ export interface DispatchLaneStats {
   failures: number;
   timeouts: number;
   medianWallClockMs: number | null;
-  /**
-   * 95th percentile of the same window. Reported BESIDE the median rather than instead of it,
-   * because the two answer different questions and the median alone hid the answer an operator
-   * giving up on a lane was actually looking for (median 111.5 s against p95 900 s on the live
-   * store, 2026-09-05). Null when the window is empty — unknown stays null, never 0.
-   */
+    /** 95th percentile of the same wall-clock window; null when the window is empty. */
   p95WallClockMs: number | null;
   lastAt: number | null;
 }
@@ -146,15 +141,7 @@ export interface DispatchLane {
   invoke?: { command: string; args: string[]; env?: Record<string, string | null> };
   /** relay rungs: the spec to address (`pool/<name>`, `<provider>/<model>`, …). */
   spec?: string;
-  /**
-   * relay rungs only: with this client's subagent offload OFF, a bare subagent will NOT route to
-   * this spec — the host must put `@relay: <spec>` in the prompt or turn the client rule on.
-   * Surfaced so a host never silently spends primary quota believing it offloaded.
-   *
-   * ⚠ Never set for a bypassed host. There, the directive is not merely insufficient — it is
-   * inert, and reaches the model as literal prompt text. A hint that cannot work is worse than
-   * no hint, because the host acts on it and believes it offloaded.
-   */
+    /** Relay rung needs an `@relay:` directive while client offload is disabled. Never set for a bypassed host. */
   requiresDirective?: boolean;
   /**
    * This rung was a `relay` rung rendered as a CLI invoke, because the calling host's traffic
@@ -196,51 +183,13 @@ export interface DispatchLane {
    * Never changes `state`, `next`, or the ladder order — a column, not an input.
    */
   stats?: DispatchLaneStats;
-  /**
-   * This lane answered recently, so it is preferred over its ladder position for a window
-   * (`lane-affinity.ts`). Present only while the pin is live.
-   *
-   * ⚠ **A pin PROMOTES; it never RESURRECTS.** It reorders lanes that are already selectable and
-   * nothing more — a pinned lane that is exhausted, disabled, unreachable or not servable is still
-   * not selected, and this field never appears on one. That is the mirror of "health demotes,
-   * never drops": a memory of past success must not outrank present evidence of unavailability.
-   */
+    /** Recent-success preference. Pins reorder only already-selectable lanes; they never restore availability. */
   pinned?: { until: string; reason: string };
-  /**
-   * This lane was recently abandoned by the dispatch walk after going idle, so ready lanes
-   * carrying no demotion are tried ahead of it for a window (`lane-affinity.ts`).
-   *
-   * ⚠ **It is a FIELD, not a `LaneState` member, and that is load-bearing.** `buildDispatch`
-   * selects on `state === "ready"`, so a `slow` member of that union would REMOVE a slow lane
-   * rather than demote it — breaking "health demotes, never drops" inside the very change that
-   * exists to honour it. Demotion is a TERM in the ordering, exactly as quota demotion is a term
-   * inside `targetUsability` on the HTTP path rather than a state.
-   *
-   * ⚠ **The evidence is first-party and needs no threshold.** `docs/backlog.md` asks for a
-   * calibrated wall-clock statistic and warns, correctly, never to borrow the HTTP path's numbers
-   * — a lane legitimately runs an agent loop for minutes. This carries no statistic at all: "the
-   * walk gave this lane its budget and it did not answer" is a measurement of this lane, by this
-   * relay, moments ago.
-   */
+    /** Recent walk demotion. Ordering metadata only: the lane remains selectable. */
   demoted?: { until: string; reason: string };
-  /**
-   * The lane's usual time to ANSWER in the requested mode: median and 80th percentile of the
-   * most specific completed-run history window — since 2026-09-10 only a COMPLETED run adds
-   * one, and `restoreLaneStatsRows` empties an older window that provably holds anything else.
-   * Present only when that window holds a duration. A poll renders it (`describeJob` in `mcp/server.ts`), so a caller can tell a slow
-   * lane from a stuck one — 23 of the 182 unanswered dispatches in the 2026-09-10 transcript sweep
-   * ended with the caller simply no longer polling.
-   */
+    /** Median/p80 time to answer from the most specific completed-run history window. */
   timeToAnswer?: { medianMs: number; p80Ms: number; samples: number; mode: DispatchMode | null };
-  /**
-   * Own failures (`failed` or `timed_out`, never a walk abandonment) in a row, read from the same
-   * window as the budget. Present only when above zero.
-   *
-   * ⚠ Evidence the walk reads: a later lane on a streak of `LANE_UNRELIABLE_STREAK` or more cannot
-   * be relied on to answer, so the walk does not stop an earlier lane that is still working in
-   * order to reach it (`runWalk`). Measured 2026-09-10: the walk stopped `free-pool` at 90 s to try
-   * `opencode-muse-spark` (0 of 12), `agy-claude-opus` (0 of 34) and `anthropic` (0 of 21).
-   */
+    /** Consecutive own failures; walk abandonment does not increment this streak. */
   recentFailures?: number;
   /**
    * Set at `FAILING_LANE_STREAK` own failures in a row: the lane is ordered behind every lane that
@@ -269,19 +218,9 @@ export interface DispatchView {
    */
   host: HostRoutingState;
   ladder: DispatchLane[];
-  /**
-   * Lane ids that MAY be selected, best first — the ONE definition of selection order.
-   * `next` is `order[0]` resolved against `ladder`; a dispatch WALK iterates the same list.
-   *
-   * ⚠ It exists so the order has one owner. The alternative — a walking caller re-deriving the
-   * order from `ladder` — puts two definitions of one rule in two files, which is the shape this
-   * repository's history warns about more often than any other (`orderByUsability` versus
-   * `targetUsability`, the pool-failover incident, the two hand-assembled announcement sets).
-   *
-   * ⚠ `ladder` itself stays in CONFIG order, because `position` is documented as stable and a
-   * reader needs to see the configured ladder rather than a re-sorted one. Unselectable rungs
-   * (exhausted, disabled, unreachable, not servable) are absent from `order` entirely — this is
-   * the order of what may be TRIED, not a ranking of everything.
+    /**
+   * Selectable lane ids in selection order. `ladder` remains in stable config order; `next` is
+   * `order[0]` resolved against it, and walkers use this same list.
    */
   order: string[];
   /** The lane the host should use now, or null when every rung is spent or none configured. */
@@ -336,26 +275,14 @@ export interface DispatchOptions {
    * existed. Never guess a number here: see `specContextWindow`.
    */
   publishedContextWindow?: (spec: string) => ResolvedContextWindow | null;
-  /**
-   * WHO is asking, when that changes what can run. `"mcp"` is the `llm-relay mcp` server: it runs
-   * lanes itself and has no `Agent` tool, so a pass-through relay rung — one that forwards the
-   * caller's own Anthropic credential — can never run there. It comes back `unreachable`, never as a
-   * lane the walk tries and fails in 0 s (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §4).
-   * Absent ⇒ exactly the behaviour before this existed.
-   */
+    /** Requester-specific execution constraints; currently MCP cannot execute pass-through relay rungs. */
   requester?: "mcp";
   /**
    * The mode the caller will run lanes in, so its time-to-answer history comes from runs of the
    * SAME mode. Absent ⇒ the mode-less legacy window, as before this existed.
    */
   mode?: DispatchMode;
-  /**
-   * A routing spec (`deepseek/deepseek-flash`, `pool/high`, …) to run as its OWN one-lane view
-   * instead of the ladder. Validated against the configured providers and pools: an unknown spec
-   * yields no lane and a reason. `dispatch` could not name a model before 2026-09-10, so agents that
-   * had to use DeepSeek wrote their own HTTP calls to the relay
-   * (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §7).
-   */
+    /** Routing spec to run as its own validated one-lane view instead of the configured ladder. */
   model?: string;
 }
 
@@ -1364,16 +1291,8 @@ function laneWindows(cfg: Config, laneId: string, tier: string | null, mode: Dis
 }
 
 /**
- * Everything the view says about one lane from its OWN recorded runs: its usual time to answer and
- * its streak of own failures.
- *
- * A history window is selected most-specific first. `attemptMinSamples` remains live after the
- * 2026-09-17 idle-only stopping change: it is the sample floor before a more-specific window is
- * trusted over a legacy fallback, and it is also the sample floor for recent-vs-history outlier
- * demotion in `routes/admin.ts`. It no longer has anything to do with a lane stop budget.
- *
- * Only completed runs enter `wallClockMs`, so the rendered median/p80 describe time to ANSWER,
- * never time to failure or the relay's own abandonment decision.
+ * Per-lane history facts, choosing the most specific adequately sampled window first. Only completed
+ * runs contribute to answer-time statistics; `attemptMinSamples` also gates outlier demotion.
  */
 function laneHistoryFacts(
   cfg: Config,
@@ -1458,15 +1377,7 @@ function annotateLaneStats(cfg: Config, ladder: DispatchLane[]): void {
   }
 }
 
-/**
- * Fill each lane's history columns from ITS OWN recorded runs on this ladder, in this mode
- * (`laneHistoryFacts`): the usual time to answer, the streak of own failures, and —
- * with the walk on — the `failing` mark at `FAILING_LANE_STREAK`.
- *
- * ⚠ `failing` is gated on the walk for the reason `annotateAffinity` states: `dispatchWalk: false`
- * restores the pre-walk order exactly, and a mark that reorders lanes is walk behaviour. It goes on a
- * selectable lane only, because a mark on a lane nothing can select says nothing.
- */
+/** Add per-lane answer-time/failure history. The `failing` reorder applies only when walking is enabled. */
 function annotateLaneHistory(cfg: Config, ladder: DispatchLane[], tier: string | null, mode: DispatchMode | null): void {
   const walkOn = cfg.routing.dispatchWalk?.enabled === true;
   for (const lane of ladder) {
@@ -1483,16 +1394,8 @@ function annotateLaneHistory(cfg: Config, ladder: DispatchLane[], tier: string |
 }
 
 /**
- * The view for a host override (`?lane=`): that ONE lane, whatever its state.
- *
- * An explicit override is honoured even when the rung is cooling down, parked, or unreachable from
- * this host: the host asked for THIS target, and second-guessing it would defeat the point of an
- * override. The `unreachable` field still travels on the lane, so the caller can see what it
- * overrode rather than discovering it at spawn time.
- *
- * ⚠ `order` is that ONE lane, so a walking caller honours the override too: an override means "use
- * this target", and walking past it to a lane the caller did not ask for would defeat the override
- * just as silently as ignoring it.
+ * Explicit lane override: return exactly that rung even when unavailable, preserving its diagnostic
+ * state. `order` also contains only that lane so a walk cannot move past the override.
  */
 function forcedLaneView(base: ViewBase, laneId: string): DispatchView {
   const forced = base.ladder.find((l) => l.id === laneId);
@@ -1575,16 +1478,8 @@ function unknownModelReason(cfg: Config, spec: string): string | null {
 }
 
 /**
- * The view for a caller-named `model` (`DispatchOptions.model`): ONE ad-hoc relay lane addressing
- * that spec, built by `toLane` like any rung, so agent mode gets the same `routing.cliLane`
- * transposition and the MCP server gets the same pass-through verdict.
- *
- * ⚠ The spec is VALIDATED before a lane exists: an unknown one yields no lane and a reason naming
- * what exists, not a lane that fails at the relay with a routing error. `lane` and `model` together
- * are refused, because they name two different targets and honouring either would ignore the other.
- *
- * ⚠ The lane is appended to `ladder`, because a walk resolves ids against it; `adHoc` marks it so no
- * surface mistakes it for a configured rung, and its `position` is past every real one.
+ * Build one validated ad-hoc relay lane for a caller-named model spec. It is appended to `ladder`
+ * so normal id resolution works, but marked `adHoc` and used as the only selectable lane.
  */
 function modelView(
   cfg: Config,
@@ -1618,25 +1513,8 @@ function modelView(
 }
 
 /**
- * Attach each lane's live pin and demotion, when it has one and is selectable.
- *
- * ⚠ The `state === "ready"` guard is the "a pin promotes, never resurrects" rule made mechanical.
- * A pin rendered on an exhausted lane would read as a recommendation to use it, on the one surface
- * a host reads to decide; and a demotion on a lane nothing can select says nothing at all. Neither
- * memory is DELETED by the guard — both stay in the store and reappear the moment the lane is
- * selectable again, because unavailability disproves neither.
- *
- * ⚠⚠ **It reads nothing at all when the walk is OFF**, and that gate was MISSING until 2026-09-08.
- * `DispatchWalkSettings`'s own field doc promises that `dispatchWalk: false` "restores the pre-walk
- * behaviour exactly: one lane per call, no memory" — and `recordLaneAffinity` does honour it, so no
- * NEW memory is written. But rows written while the walk was ON are still restored from
- * `lane-affinity.json` at startup, and this function annotated them regardless, so `rankSelectable`
- * kept reordering the ladder and `next` kept naming a pinned lane. An operator who turned the walk
- * off to revert got the old behaviour only once every surviving memory had lapsed — up to the
- * six-hour `MAX_AFFINITY_MS` ceiling. Gating HERE rather than at the call site makes
- * `rankSelectable` a no-op by construction: with no lane carrying either field, every lane ranks 1
- * and the sort is stable, so the configured order is returned unchanged. Found by an adversarial
- * review; pinned in `test/dispatch-lane-walk.test.ts`.
+ * Attach live pin/demotion metadata only to selectable lanes and only while walking is enabled.
+ * Stored memory cannot resurrect or reorder an unavailable lane.
  */
 function annotateAffinity(cfg: Config, ladder: DispatchLane[], tier: string | null, now: number): void {
   const walk = cfg.routing.dispatchWalk;
@@ -1655,44 +1533,15 @@ function annotateAffinity(cfg: Config, ladder: DispatchLane[], tier: string | nu
 }
 
 /**
- * Order the selectable lanes: pinned first, then undemoted, then demoted or failing. Within a band
- * the configured ladder order is preserved, because `Array.prototype.sort` is stable and the input
- * is already in that order — the operator's own ordering remains the tie-break, exactly as pool
- * ranking keeps config order on a tie.
- *
- * ⚠ A `failing` lane shares the demoted band: `FAILING_LANE_STREAK` own failures in a row is
- * first-party evidence like a missed budget, and the answer to it is the same — a reorder, never a
- * drop. Health demotes; it never drops.
- *
- * ⚠ A lane carrying BOTH memories ranks as PINNED. That state is reachable — a lane can answer,
- * be pinned, then miss a budget on a later walk — and the pin is the more recent evidence in the
- * only case that matters, because a demotion RETRACTS the pin when it is recorded and a success
- * retracts the demotion (`clearLaneAffinity`). Ranking it as demoted instead would let one missed
- * budget outrank a fresh success.
+ * Stable ranking bands: pinned, ordinary, then demoted/failing. Config order breaks ties. If legacy
+ * data contains both pin and demotion, pin wins.
  */
 function rankSelectable(usable: readonly DispatchLane[]): DispatchLane[] {
   const rank = (lane: DispatchLane): number => (lane.pinned ? 0 : lane.demoted || lane.failing ? 2 : 1);
   return [...usable].sort((a, b) => rank(a) - rank(b));
 }
 
-/**
- * Why `next` is what it is, in one line the ladder view and the CLI both print.
- *
- * ⚠⚠ **A reason string is a CLAIM about the ordering code, and two of these were false until
- * 2026-09-08** — found by an adversarial review, reproduced against the built binary, and pinned
- * in `test/dispatch-lane-walk.test.ts`. Both said something `rankSelectable` does not do:
- *
- * 1. `"the least recently demoted"` — `rankSelectable` consults NO timestamp. Its comparator is a
- *    stable sort on a three-valued band rank, so the lane named is simply the FIRST IN LADDER ORDER
- *    among the demoted ones. Demoting `beta` and then `alpha` named `alpha`, i.e. the MOST recently
- *    demoted, while claiming the opposite.
- * 2. `"N ahead of it unavailable"` — with demotion reordering, a lane ahead in ladder order can be
- *    perfectly READY and merely demoted. It reported available lanes as unavailable.
- *
- * The counts are therefore taken from the selectable set rather than from `position` arithmetic,
- * and the two populations are named separately, because they call for opposite responses: an
- * unavailable lane needs attention, a demoted one is the walk working as intended.
- */
+/** Explain selection from the same ranking facts used by `rankSelectable`. */
 function selectionReason(next: DispatchLane, after: string | undefined, usable: readonly DispatchLane[]): string {
   if (next.pinned) return `lane "${next.id}" is pinned (${next.pinned.reason})`;
   if (after !== undefined) return `first ready lane after "${describeId(after)}"`;
