@@ -18,17 +18,20 @@
 > 2026-09-17, are in [`history/stabilization-plan-2026-09-17.md`](history/stabilization-plan-2026-09-17.md). Delete
 > this pointer when that plan's exit condition is met.
 
-- **The default branch does not enforce the CI gate (verified 2026-09-18,
-  medium/repository hardening).** GitHub reports `main` as unprotected and the repository has no
-  rulesets, so the documented PR gate can still be bypassed by a direct push. The platform half is
-  covered by the targeted `windows-process-boundary` CI job; what remains is repository settings.
-  **Property:** the default branch requires the CI gate before changes can land, through branch
+- **The default branch still does not enforce the CI gate (rechecked 2026-09-20,
+  medium/repository hardening).** GitHub reports no repository rulesets. The repository already has
+  the two checks that should be required — the full `check` job and the targeted
+  `windows-process-boundary` job — but requiring them before a change reaches `main` is a
+  repository-administrator setting, not a source change.
+  **Property:** the default branch requires both CI checks before changes can land, through branch
   protection or a repository ruleset.
 
-- **The stabilization plan holds work that has no entry here (2026-09-17).** M1,
-  operator tasks O2 to O5, and design item D5 of
-  `history/stabilization-plan-2026-09-17.md`. D2 hot reload shipped 2026-09-20.
-  **Property:** each remaining packet is shipped, or the owner declined it and the plan says so.
+- **The stabilization plan now holds only evidence-blocked or owner/operator work without a
+  separate backlog entry.** D5 and O5 are complete. M1 cannot begin until one real archived AGY
+  success envelope exists; O2 to O4 are live owner/operator tasks rather than repository
+  implementation packets. There is currently no unblocked source packet in that plan.
+  **Property:** M1 ships or is declined once its required evidence exists, and O2 to O4 are
+  completed or explicitly declined by the owner.
 
 - **Route B reaches the vendor; the SERVED half waits for the free allowance to refill**
   (route B shipped 2026-09-09: `wire: "responses"` on a `kind: "openai"` provider, `src/backend.ts`;
