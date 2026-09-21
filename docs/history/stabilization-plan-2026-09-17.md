@@ -510,7 +510,9 @@ the owner these questions.
   operator-declared prices again unless the owner raises it.
 
 ### D5 Major development-dependency upgrades
-Three additional major-upgrade laps from the original inventory remain. None is a defect today.
+The original unnamed remainder has now been reconstructed from the pre-D5 manifest: after
+jest-dom 7, the remaining major laps are `@types/node` 22 → 26 and `lucide-react` 0.x → 1.x.
+None is a defect today.
 Recommendation: one upgrade per lap, each with the full gate and the package baseline measured
 again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
 
@@ -618,8 +620,23 @@ again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
 - **Future API transition.** Revisit the runtime Compiler API only when TypeScript's new native API
   is stable and this repo's API-consuming peers support it. TypeScript 7.0 itself cannot complete
   that replacement because it deliberately has no stable in-process API.
-- **Next D5 lap.** Re-survey the three remaining major development dependencies from the original
-  inventory, then upgrade one at a time with the same full-gate and package-baseline discipline.
+- **Next D5 lap (historical plan).** Re-survey the three remaining major development
+  dependencies from the original inventory, then upgrade one at a time with the same full-gate and
+  package-baseline discipline.
+
+#### D5-f DONE (2026-09-20) jest-dom 6 → 7
+- **Shipped candidate.** `@testing-library/jest-dom ^6.9.1` → `^7.0.1`; no other major moved.
+- **Migration review.** No removed deprecated matcher names are used in the repo. v7's Node >=22
+  floor matches llm-relay's existing runtime floor; its Testing Library DOM 10 and Vitest peers
+  are already satisfied.
+- **Proof.** 4,490 core tests, all 46 dashboard tests, Windows process-boundary coverage, and
+  packed-dashboard smoke pass. Dashboard bytes are unchanged. Package measurement is
+  `packBytes=1208869`, `unpackedBytes=5970011`, `packageEntries=460`.
+- **Original D5 remainder resolved.** Re-running `npm outdated --depth=0` against the exact
+  pre-D5 manifest identified the unnamed independent majors as jest-dom 6→7,
+  `@types/node` 22→26, and `lucide-react` 0.x→1.x. The apparent fourth major,
+  `@vitejs/plugin-react` 4→6, was the required Vite 8 adapter already shipped in D5-b.
+- **Next D5 lap.** Upgrade `@types/node` 22 → 26 alone, then lucide-react 0.x → 1.x.
 
 ### D6 A lane's capability must come from the synced capability data (owner correction, 2026-09-17)
 - **Owner statement.** "The capability value is supposed to be set by data scraped from
