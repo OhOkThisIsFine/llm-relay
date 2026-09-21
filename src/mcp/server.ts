@@ -71,7 +71,7 @@ import {
 } from "./lane-runner.js";
 import { readOnlyInvoke, readOnlyVerdict, type LaneInvocation } from "./readonly-boundary.js";
 import { agyQuotaStatement, type AgyLogSnapshot } from "./agy-quota-log.js";
-import { nullJobJournal, type JobJournal } from "./job-journal.js";
+import { nullJobJournal, type JobJournal, type JournalRow } from "./job-journal.js";
 import { nullJobArchive, type JobArchive } from "./job-archive.js";
 import type { LaneExecutionSnapshot } from "../lane-execution-broker.js";
 import type { LaneExecutionClient } from "./lane-execution-client.js";
