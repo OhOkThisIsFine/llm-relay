@@ -128,6 +128,18 @@ harness. Each candidate must pass a real interruption/resume probe on a supporte
 
 ### AGY — first probe
 
+Repeatable harness: `scripts/measure-agy-continuation.mjs`.
+
+```bash
+npm run build:server
+node scripts/measure-agy-continuation.mjs
+```
+
+It uses a fresh temporary workspace, requests no tools, interrupts only after an ACTIVE
+`agent_response` event, resumes by the captured `conversation_id`, and proves retained context by
+recovering a random marker that is not repeated in the resume prompt. The output line is safe to
+record because it hashes rather than prints the raw conversation id.
+
 1. Start a headless run with `--output-format stream-json` and a task long enough to remain active.
 2. Capture the first `init.conversation_id`.
 3. Wait for first-party activity after init, then terminate the owned process tree.
