@@ -1370,7 +1370,8 @@ export class LaneJobStore {
     const kill = this.kills.get(id);
     this.kills.delete(id);
     this.owned.delete(id);
-    const brokerOwned = this.brokerExecutions.delete(id) !== undefined;
+    const brokerOwned = this.brokerExecutions.has(id);
+    this.brokerExecutions.delete(id);
     if (!job) {
       this.journal.clear(id);
       return;
