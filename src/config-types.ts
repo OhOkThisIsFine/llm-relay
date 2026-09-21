@@ -421,8 +421,9 @@ export interface Routing {
    *
    * Before it, `dispatch` ran ONE lane and reported a failure when that lane was slow; the calling
    * agent then picked the next lane by hand, which is the friction the owner reported. With it,
-   * the relay walks the ladder past a lane that does not answer inside `attemptMs`, pins the lane
-   * that does, and demotes the lane it left.
+   * the relay walks the ladder past a lane only after it has remained idle for `idleMs` with no
+   * relay traffic, output, owned-process CPU increase or working-tree change; it pins the lane
+   * that answers and demotes the lane it left.
    *
    * ⚠ Read ONLY by `llm-relay mcp`, exactly like `mcp` below — the MCP walk owns delegation
    * policy even when D1 asks the daemon's token-gated broker to own the physical process tree.
