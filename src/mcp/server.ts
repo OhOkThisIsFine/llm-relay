@@ -77,8 +77,12 @@ import { readOnlyInvoke, readOnlyVerdict, type LaneInvocation } from "./readonly
 import { agyQuotaStatement, type AgyLogSnapshot } from "./agy-quota-log.js";
 import { nullJobJournal, type JobJournal, type JournalRow } from "./job-journal.js";
 import { nullJobArchive, type JobArchive } from "./job-archive.js";
-import type { LaneExecutionSnapshot } from "../lane-execution-broker.js";
-import type { LaneExecutionClient } from "./lane-execution-client.js";
+import type { LaneExecutionSnapshot, LaneExecutionStartRequest } from "../lane-execution-broker.js";
+import {
+  createLaneExecutionId,
+  type LaneExecutionClient,
+  type LaneExecutionClientResult,
+} from "./lane-execution-client.js";
 import {
   RPC_INTERNAL_ERROR,
   RPC_INVALID_PARAMS,
@@ -909,6 +913,19 @@ interface LaneAttemptOutcome {
   refusal?: string;
 }
 
+interface StartedLaneHandle {
+  result: Promise<LaneAttemptOutcome>;
+  kill: () => void;
+  pids?: () => number[];
+  /** Present only when the daemon broker owns this attempt. */
+  brokerExecutionId?: string;
+  /** Broker cancellation is asynchronous; idle advancement waits for its acknowledgement. */
+  waitForKill?: () => Promise<void>;
+}
+
+/** Loopback broker status cadence while the original MCP process still owns the walk. */
+export const BROKER_STATUS_POLL_MS = 1_000;
+
 /** A run that produced nothing: the shape an abandoned or never-started attempt reports. */
 function emptyRun(): LaneRunResult {
   return { code: null, stdout: "", stderr: "", timedOut: false };
@@ -1081,6 +1098,8 @@ export class McpDispatchServer {
   private readonly processCpu = new Map<string, number>();
   /** Last daemon-reported cumulative CPU reading for each recovered broker execution. */
   private readonly brokerCpu = new Map<string, number>();
+  /** Latest broker snapshot for a fresh daemon-owned attempt in this still-running MCP walk. */
+  private readonly liveBrokerSnapshots = new Map<string, LaneExecutionSnapshot>();
   /** Full restart enrichment; status/result wait for final tree fidelity. */
   private readonly startup: Promise<void>;
   /** Broker orphan claiming/reconciliation only; explicit cancel waits on this, never on git. */
