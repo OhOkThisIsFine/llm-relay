@@ -18,6 +18,7 @@ import { LaneJobStore } from "../src/mcp/lane-runner.js";
 import { createJobJournal, nullJobJournal } from "../src/mcp/job-journal.js";
 import { McpDispatchServer } from "../src/mcp/server.js";
 import type { Config } from "../src/config.js";
+import type { DispatchLane, DispatchView } from "../src/dispatch.js";
 import { LANE_EXECUTION_SCHEMA, type LaneExecutionSnapshot } from "../src/lane-execution-broker.js";
 import type { LaneExecutionClient, LaneExecutionClientResult } from "../src/mcp/lane-execution-client.js";
 import type { TreeSnapshot, TreeSnapshotReader } from "../src/mcp/tree-delta.js";
@@ -344,6 +345,81 @@ describe("D1 broker-backed MCP restart recovery", () => {
       );
       expect(out.find((message) => message.id === 5)?.result?.content?.[0]?.text).toContain("cancelled");
       expect(actions).toContain("cancel");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("waits for broker recovery before evaluating maxConcurrent on a fresh dispatch", async () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const seeded = seed(path);
+      let releaseRecovery!: () => void;
+      let recoveryReleased = false;
+      const actions: string[] = [];
+      const client: LaneExecutionClient = {
+        request: async (request) => {
+          actions.push(request.action);
+          if (request.action === "start") throw new Error("fresh dispatch must be skipped at the cap");
+          if (!recoveryReleased) {
+            await new Promise<void>((resolve) => { releaseRecovery = resolve; });
+            recoveryReleased = true;
+          }
+          return {
+            ok: true,
+            execution: brokerSnapshot(seeded.jobId, seeded.laneId),
+          };
+        },
+      };
+      const lane: DispatchLane = {
+        id: seeded.laneId,
+        kind: "cli",
+        position: 1,
+        state: "ready",
+        invoke: { command: "codex", args: ["exec", "{task}"] },
+        maxConcurrent: 1,
+      };
+      const dispatchView: DispatchView = {
+        tier: "medium",
+        offload: false,
+        client: "claude",
+        host: "bypassed",
+        ladder: [lane],
+        order: [lane.id],
+        next: lane,
+        reason: "test",
+        source: "daemon",
+      };
+      const out: Array<{ id?: number; result?: { content?: Array<{ text?: string }>; isError?: boolean } }> = [];
+      const server = new McpDispatchServer({
+        config: {
+          host: "127.0.0.1",
+          port: 8791,
+          routing: { default: "x", dispatchWalk: { enabled: true, idleMs: 300_000, maxLanes: 4 } },
+        } as unknown as Config,
+        buildView: async () => dispatchView,
+        journal: createJobJournal(path),
+        laneExecutionClient: client,
+        write: (chunk) => out.push(JSON.parse(chunk)),
+      });
+
+      const pending = server.ingest(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 60,
+          method: "tools/call",
+          params: { name: "dispatch", arguments: { task: "new work" } },
+        }) + "\n",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(out.find((message) => message.id === 60)).toBeUndefined();
+
+      releaseRecovery();
+      await pending;
+      const result = out.find((message) => message.id === 60)?.result;
+      expect(result?.content?.[0]?.text).toContain("maxConcurrent");
+      expect(result?.isError).toBe(true);
+      expect(actions).not.toContain("start");
     } finally {
       cleanup();
     }
