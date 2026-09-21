@@ -49,6 +49,25 @@ describe("replaceFileWithRetrySync", () => {
     }
   });
 
+  it("gives up after the bounded Windows retry schedule", () => {
+    let calls = 0;
+    const delays: number[] = [];
+    const rename = (): never => {
+      calls += 1;
+      throw Object.assign(new Error("still locked"), { code: "EPERM" });
+    };
+
+    expect(() =>
+      replaceFileWithRetrySync("state.tmp", "state.json", {
+        platform: "win32",
+        rename,
+        sleep: (ms) => delays.push(ms),
+      }),
+    ).toThrow("still locked");
+    expect(calls).toBe(9);
+    expect(delays).toEqual([10, 20, 40, 80, 160, 250, 250, 250]);
+  });
+
   it("does not retry a non-Windows or non-transient rename failure", () => {
     for (const [platform, code] of [["linux", "EPERM"], ["win32", "ENOENT"]] as const) {
       let calls = 0;
