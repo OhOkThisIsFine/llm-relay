@@ -1,3 +1,5 @@
+/* Keep Tailwind's source scan dashboard-only. source(none) is load-bearing: v4 otherwise
+   auto-detects from the process cwd (the repo root), so server-source words could ship utilities. */
 @import "tailwindcss" source(none);
 @source "../index.html";
 @source "./";
