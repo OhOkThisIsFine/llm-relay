@@ -352,25 +352,15 @@ describe("D1 broker-backed MCP restart recovery", () => {
     }
   });
 
-  it("waits for broker recovery before evaluating maxConcurrent on a fresh dispatch", async () => {
+  it("claims recovered broker rows before evaluating maxConcurrent on a fresh dispatch", async () => {
     const { path, cleanup } = tempJournalPath();
     try {
       const seeded = seed(path);
-      let releaseRecovery!: () => void;
-      let recoveryReleased = false;
       const actions: string[] = [];
       const client: LaneExecutionClient = {
         request: async (request) => {
           actions.push(request.action);
-          if (request.action === "start") throw new Error("fresh dispatch must be skipped at the cap");
-          if (!recoveryReleased) {
-            await new Promise<void>((resolve) => { releaseRecovery = resolve; });
-            recoveryReleased = true;
-          }
-          return {
-            ok: true,
-            execution: brokerSnapshot(seeded.jobId, seeded.laneId),
-          };
+          throw new Error(`fresh dispatch should be capped before broker request: ${request.action}`);
         },
       };
       const lane: DispatchLane = {
@@ -405,7 +395,7 @@ describe("D1 broker-backed MCP restart recovery", () => {
         write: (chunk) => out.push(JSON.parse(chunk)),
       });
 
-      const pending = server.ingest(
+      await server.ingest(
         JSON.stringify({
           jsonrpc: "2.0",
           id: 60,
@@ -413,15 +403,10 @@ describe("D1 broker-backed MCP restart recovery", () => {
           params: { name: "dispatch", arguments: { task: "new work" } },
         }) + "\n",
       );
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      expect(out.find((message) => message.id === 60)).toBeUndefined();
-
-      releaseRecovery();
-      await pending;
       const result = out.find((message) => message.id === 60)?.result;
       expect(result?.content?.[0]?.text).toContain("maxConcurrent");
       expect(result?.isError).toBe(true);
-      expect(actions).not.toContain("start");
+      expect(actions).toEqual([]);
     } finally {
       cleanup();
     }
