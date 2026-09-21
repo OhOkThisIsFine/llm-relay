@@ -285,6 +285,47 @@ describe("cross-process MCP persistence", () => {
     }
   }, 20_000);
 
+  it("retries when a contended lock is released before the contender inspects it", () => {
+    const { dir, cleanup } = tempDir();
+    try {
+      const path = join(dir, "state.json");
+      const lockPath = `${path}.lock`;
+      mkdirSync(lockPath);
+      writeFileSync(
+        join(lockPath, "owner.json"),
+        JSON.stringify({
+          version: 1,
+          pid: process.pid,
+          instance: "incumbent-test-lock",
+          acquiredAt: Date.now(),
+        }),
+      );
+
+      let contentions = 0;
+      expect(
+        transactionalUpdateJsonSync(
+          path,
+          () => ({ value: 1 }),
+          {
+            strict: true,
+            lock: {
+              retryMs: 1,
+              timeoutMs: 500,
+              onContention: () => {
+                contentions += 1;
+                if (contentions === 1) rmSync(lockPath, { recursive: true, force: true });
+              },
+            },
+          },
+        ),
+      ).toBe(true);
+      expect(contentions).toBeGreaterThanOrEqual(1);
+      expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ value: 1 });
+    } finally {
+      cleanup();
+    }
+  });
+
   it("ignores an abandoned unpublished claim directory", () => {
     const { dir, cleanup } = tempDir();
     try {
