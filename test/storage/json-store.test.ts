@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   atomicWriteJsonSync,
+  replaceFileWithRetrySync,
   safeReadJsonSync,
   transactionalUpdateJsonSync,
 } from "../../src/storage/json-store.js";
@@ -16,6 +17,58 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
+});
+
+describe("replaceFileWithRetrySync", () => {
+  it("retries transient Windows replacement failures and keeps the same source/destination", () => {
+    for (const code of ["EPERM", "EACCES", "EBUSY"]) {
+      const calls: Array<[string, string]> = [];
+      const delays: number[] = [];
+      let failuresLeft = 2;
+      const rename = (source: string, target: string): void => {
+        calls.push([source, target]);
+        if (failuresLeft > 0) {
+          failuresLeft -= 1;
+          throw Object.assign(new Error(`transient ${code}`), { code });
+        }
+      };
+
+      expect(() =>
+        replaceFileWithRetrySync("state.tmp", "state.json", {
+          platform: "win32",
+          rename,
+          sleep: (ms) => delays.push(ms),
+        }),
+      ).not.toThrow();
+      expect(calls).toEqual([
+        ["state.tmp", "state.json"],
+        ["state.tmp", "state.json"],
+        ["state.tmp", "state.json"],
+      ]);
+      expect(delays).toEqual([10, 20]);
+    }
+  });
+
+  it("does not retry a non-Windows or non-transient rename failure", () => {
+    for (const [platform, code] of [["linux", "EPERM"], ["win32", "ENOENT"]] as const) {
+      let calls = 0;
+      let sleeps = 0;
+      const rename = (): never => {
+        calls += 1;
+        throw Object.assign(new Error(`${platform} ${code}`), { code });
+      };
+
+      expect(() =>
+        replaceFileWithRetrySync("state.tmp", "state.json", {
+          platform,
+          rename,
+          sleep: () => { sleeps += 1; },
+        }),
+      ).toThrow(code);
+      expect(calls).toBe(1);
+      expect(sleeps).toBe(0);
+    }
+  });
 });
 
 describe("atomicWriteJsonSync", () => {
