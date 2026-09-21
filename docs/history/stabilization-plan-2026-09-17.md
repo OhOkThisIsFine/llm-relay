@@ -510,9 +510,9 @@ the owner these questions.
   operator-declared prices again unless the owner raises it.
 
 ### D5 Major development-dependency upgrades
-The original unnamed remainder has now been reconstructed from the pre-D5 manifest: after
-jest-dom 7, the remaining major laps are `@types/node` 22 → 26 and `lucide-react` 0.x → 1.x.
-None is a defect today.
+The original unnamed remainder has now been reconstructed from the pre-D5 manifest. After the
+Node-types alignment decision below, only `lucide-react` 0.x → 1.x remains as an independent
+major-upgrade lap. None is a defect today.
 Recommendation: one upgrade per lap, each with the full gate and the package baseline measured
 again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
 
@@ -636,7 +636,24 @@ again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
   pre-D5 manifest identified the unnamed independent majors as jest-dom 6→7,
   `@types/node` 22→26, and `lucide-react` 0.x→1.x. The apparent fourth major,
   `@vitejs/plugin-react` 4→6, was the required Vite 8 adapter already shipped in D5-b.
-- **Next D5 lap.** Upgrade `@types/node` 22 → 26 alone, then lucide-react 0.x → 1.x.
+- **Next D5 lap (historical plan).** Review `@types/node` 22 → 26 alone, then
+  lucide-react 0.x → 1.x.
+
+#### D5-g DONE (2026-09-20) keep Node types aligned to runtime 22
+- **Decision.** Do NOT move `@types/node` to 26 while `engines.node` remains `>=22`. The
+  DefinitelyTyped Node major tracks the Node API major; using v26 declarations would let TypeScript
+  accept APIs that are not guaranteed on the supported Node 22 runtime.
+- **Shipped maintenance.** Refresh the matching declaration line only:
+  `@types/node` 22.20.1 → 22.20.4 (`package.json ^22.20.4`). Runtime floor remains Node 22.
+- **Proof.** Native TS7 build/typechecks, 4,490 core tests, 46 dashboard tests, Windows
+  process-boundary coverage, and packed-dashboard smoke pass. Dashboard bytes are unchanged.
+  Package measurement is `packBytes=1208871`, `unpackedBytes=5970011`,
+  `packageEntries=460`.
+- **Revisit condition.** Upgrade the declaration major only in the same lap that raises and tests
+  llm-relay's Node runtime floor to that major (or otherwise adds a lower-runtime compatibility
+  guard).
+- **Next D5 lap.** Upgrade `lucide-react` 0.x → 1.x, the final independent major from the
+  original inventory.
 
 ### D6 A lane's capability must come from the synced capability data (owner correction, 2026-09-17)
 - **Owner statement.** "The capability value is supposed to be set by data scraped from
