@@ -396,24 +396,25 @@ because a later reader may meet the old wording in git history.
 Each item states what is true, why it matters, and a recommendation. The closeout of this lap asks
 the owner these questions.
 
-### D1 A host restart kills every running lane (17% of archived jobs)
-- **True now.** The `llm-relay mcp` process owns its lane children. When the host restarts that
-  process, the journal reports the jobs `killed`, and the work is lost.
-- **Options.** (a) Accept: the loss is reported, and the caller dispatches again. (b) Detach: start
-  a lane with its output redirected to files under the cache directory, record pid and paths in the
-  journal, and let the next MCP process re-adopt a live lane or read a finished lane's output.
-- **Trade.** (b) removes the largest measured loss. It also weakens the rule "the store reaps what
-  it started" (`LaneJobStore.reap`), needs a pid-reuse defence, and is a strong-model design, not
-  a cheap packet. S4 measured on 2026-09-19 that the lane dies with its MCP parent on Windows.
-- **Recommendation.** Design (b) in its own lap; S4 proves re-adoption without detachment is
-  insufficient.
-- **DESIGNED 2026-09-20.** The independent lifetime is a daemon-owned, token-gated lane-execution
-  broker rather than pid adoption or ordinary child detachment. The daemon resolves only configured
-  lanes, owns/reaps the process tree, and lets replacement MCP processes observe/collect the same
-  execution through a journaled execution id. Full design:
+### D1 DONE (2026-09-20) Restart-safe daemon-owned lane execution
+- **Historical measurement.** S4 proved on Windows that an MCP-owned lane dies with its MCP
+  parent; archived jobs showed this was a material loss mode. Re-adopting an ordinary child was
+  therefore insufficient.
+- **Design.** The independent lifetime is a daemon-owned, token-gated lane-execution broker rather
+  than pid adoption or ordinary child detachment. Full design:
   [mcp-restart-safe-lane-execution-design-2026-09-20.md](mcp-restart-safe-lane-execution-design-2026-09-20.md).
-  Implementation is split into four phases; Phase 1 is protocol/store only and changes no MCP
-  dispatch behavior.
+- **Shipped.** The daemon installs the configured broker by default. Fresh spawned MCP agent
+  attempts journal an opaque execution id before an idempotent broker start; after a start may have
+  been sent, the MCP process never falls back locally. A definite pre-start broker failure may use
+  the existing local launcher and is labelled non-restart-safe. Replacement MCP processes
+  atomically claim broker-backed journal rows, collect the original result, and send explicit
+  cancellation to the daemon. MCP shutdown leaves daemon-owned work running; daemon shutdown reaps
+  every process tree the broker still owns.
+- **Proof.** Unit/integration coverage pins broker idempotency, fallback boundaries, walk
+  continuation, restart reconciliation and cancellation. The targeted Windows process-boundary
+  test kills only the original MCP parent, verifies the lane survives and is collected by a
+  replacement MCP, then separately verifies replacement-process cancellation kills the daemon-owned
+  lane tree.
 
 ### D2 The daemon does not reload `config.json`
 - **True now.** An edit takes effect at the next restart. `/telemetry` and three CLI commands
