@@ -97,8 +97,14 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   regression proves one PID serves routing value A, reloads to B, then refuses a restart-only
   candidate C while retaining B. See
   `docs/history/config-reload-design-2026-09-20.md`.
-- **Immediate next after D2.** D5 major development-dependency upgrades remains the repo-internal
-  design item (one upgrade per lap, Vitest first). M1 remains blocked on a first-party AGY success
+- **D5 has started: Vitest 5 is the first isolated major-upgrade lap.** Vitest moved from
+  `^4.1.11` to `^5.0.1` with no compatibility edits: full Linux `npm run check` and the
+  Windows process-boundary suite both pass, including the dashboard tests under Vitest 5. The new
+  default `clearMocks: true` is retained because the suite does not depend on cross-test mock
+  history. The package baseline was re-measured at 1,212,895 packed bytes, 5,979,413 unpacked
+  bytes, and 460 entries, all within the existing ceilings.
+- **Immediate next in D5.** Upgrade Vite 6 → 8 alone, then re-run the full gate and package
+  measurement before touching another major. M1 remains blocked on a first-party AGY success
   envelope. Separately open: repository CI enforcement, Route B's vendor blocker, and the
   owner-driven Codex/Code-tab checks.
 

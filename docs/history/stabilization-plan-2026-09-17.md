@@ -510,10 +510,24 @@ the owner these questions.
   operator-declared prices again unless the owner raises it.
 
 ### D5 Major development-dependency upgrades
-`typescript` 5.9 → 7.0 (also a RUNTIME dependency for `delegate-gate`), `vite` 6 → 8, `vitest`
-4 → 5, `tailwindcss` 3 → 4, `jsdom` 26 → 30, and three more. None is a defect today.
-Recommendation: one upgrade per lap, `vitest` first, each with the full gate and the package
-baseline measured again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
+`typescript` 5.9 → 7.0 (also a RUNTIME dependency for `delegate-gate`), `vite` 6 → 8,
+`tailwindcss` 3 → 4, `jsdom` 26 → 30, and three more remain. None is a defect today.
+Recommendation: one upgrade per lap, each with the full gate and the package baseline measured
+again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
+
+#### D5-a DONE (2026-09-20) Vitest 4 → 5
+- **Shipped candidate.** `vitest ^4.1.11` → `^5.0.1`; Vite remains `^6.4.3` and every other
+  planned major is unchanged.
+- **Migration review.** The repository already meets Vitest 5's Node/Vite floor. No removed
+  sequential API or deprecated Vitest entrypoint needed migration. The full suite passed with
+  Vitest 5's new default `clearMocks: true`, so the config deliberately does not restore the v4
+  behavior.
+- **Proof.** PR CI: full Linux `npm run check` green; Windows process-boundary suite green.
+  Dashboard suite ran under Vitest 5.0.1. Package measurement: `packBytes=1212895`,
+  `unpackedBytes=5979413`, `packageEntries=460`, all below the existing
+  1300000 / 6500000 / 480 ceilings.
+- **Next D5 lap.** Upgrade Vite 6 → 8 by itself; do not combine it with TypeScript, Tailwind,
+  jsdom, or the remaining majors.
 
 ### D6 A lane's capability must come from the synced capability data (owner correction, 2026-09-17)
 - **Owner statement.** "The capability value is supposed to be set by data scraped from
