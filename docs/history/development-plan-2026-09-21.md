@@ -28,7 +28,7 @@ stable:
 
 The commits that happened to trigger those runs were unrelated to MCP persistence.
 
-The investigation found two independent defects:
+The investigation found three correctness holes:
 
 1. **Unrelated journal writes performed liveness-based garbage collection.** A normal journal
    mutation preserved only foreign rows whose owner passed a process-liveness probe. That made a
@@ -37,8 +37,13 @@ The investigation found two independent defects:
 2. **Transactional reads failed open.** `transactionalUpdateJsonSync(..., strict: true)` still read
    through `safeReadJsonSync`, which maps any read/parse/validation failure to `null`. An existing
    but temporarily unreadable or invalid file could therefore be treated as empty and replaced with
-   a partial new snapshot. That mechanism applies to both journal and archive and explains why the
-   historical failures appeared in both stores.
+   a partial new snapshot. This defect applied equally to journal and archive.
+3. **Lock acquisition had a release-after-contention TOCTOU.** A contender could fail
+   `rename(claim, lock)` because the incumbent lock existed, then the incumbent could release the
+   lock before the contender called `existsSync(lockPath)`. The old code propagated the now-stale
+   rename error instead of retrying. Journal persistence is intentionally best-effort, so that
+   transaction error was swallowed and surfaced only later as a missing row. The race is now pinned
+   deterministically by removing the incumbent lock in exactly that inspection gap.
 
 The fix:
 
@@ -47,15 +52,22 @@ The fix:
   exact startup row identity;
 - transactional updates distinguish true `ENOENT` from read/parse/validation failure and fail
   closed on the latter;
-- the real worker fixture now verifies that its own journal/archive mutation actually committed, so
-  a swallowed persistence failure is reported at the worker rather than only as a later missing-row
+- a contender retries when a contention-shaped rename error is followed by a vanished stable lock,
+  rather than propagating the stale error;
+- the real worker fixture verifies that its own journal/archive mutation actually committed, so a
+  swallowed persistence failure is reported at the worker rather than only as a later missing-row
   assertion;
-- deterministic tests pin both failure mechanisms and orphan acknowledgement ordering.
+- deterministic tests pin all three mechanisms and orphan acknowledgement ordering;
+- the real four-process journal+archive regression now runs five independent rounds per CI
+  execution.
 
 No timeout was increased.
 
-Exit evidence: the protected PR's full `check` job and targeted Windows process-boundary suite are
-green on the source fix. The final documentation head must pass both again before merge.
+Exit evidence on the repaired source:
+- Windows run 750 completed its targeted job green after the lock fix;
+- run 751 passed both `check` and `windows-process-boundary` with the deterministic lock test;
+- run 752 passed both required jobs with the repeated five-round real-process stress test.
+The final documentation head must pass both required checks again before merge.
 
 ## Phase 2 — CI enforcement — completed 2026-09-21
 
