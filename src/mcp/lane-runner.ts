@@ -1285,10 +1285,10 @@ export class LaneJobStore {
       if (row.startingTree !== undefined) {
         this.adoptedStartingTrees.set(row.jobId, { cwd: row.cwd, startingTree: row.startingTree });
       }
-      // ⚠ Archived at adoption, because the journal's first write by THIS process rewrites the file
-      // with only its own rows — so without this, the killed report survived exactly one restart
-      // and a second one answered `unknown jobId` for it all over again.
-      this.archive.record(killed);
+      // Archive before acknowledging the orphan. Foreign journal rows are intentionally preserved
+      // across unrelated writes, so the recovery evidence stays durable until this terminal report
+      // has committed. If the archive write fails, leave the orphan in place for a later process.
+      if (this.archive.record(killed)) this.journal.clearOrphan?.(row);
     }
   }
 
