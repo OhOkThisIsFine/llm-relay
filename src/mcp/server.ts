@@ -2335,15 +2335,12 @@ export class McpDispatchServer {
     };
   }
 
-  /**
-   * Start ONE lane and hand back its promise plus a kill handle. Two shapes, decided exactly as
-   * `toolDispatch` used to decide them: a `relay` rung in answer mode is a direct HTTP call to
-   * this relay's own `/v1/messages`; everything else is a spawned command.
-   *
-   * ⚠ A lane that cannot run HERE returns a failed OUTCOME, not a refusal, so the walk moves on.
-   * Only a bad working directory is a `refusal`, because that is the caller's own error and every
-   * remaining lane would hit it identically.
+    /**
+   * Start one lane and return its result plus a kill handle. A relay rung in answer mode is a
+   * direct loopback HTTP call; other lanes use the configured execution path. Lane-specific
+   * inability is a failed attempt so the walk can continue; invalid caller cwd is a refusal.
    */
+
   private async startLane(
     jobId: string,
     lane: DispatchLane,
