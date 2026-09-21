@@ -161,11 +161,12 @@ Implement it as separate packets.
 
 ### 5.1 Harness capability survey
 
-**First-party survey complete:** see
+**First-party survey and repeatable measurement tooling complete:** see
 [`active-hard-cap-harness-survey-2026-09-21.md`](active-hard-cap-harness-survey-2026-09-21.md).
-AGY is the strongest first live candidate. Claude, Codex and OpenCode all expose exact resume
-primitives as well, with harness-specific caveats. The remaining gate is a real kill/resume probe;
-no harness is implementation-ready until it passes that probe.
+Manual probes now exist for AGY, Claude, Codex and OpenCode and share one shell-free process/NDJSON
+helper. The remaining gate is live evidence: no harness is implementation-ready until an exact-ID
+interruption/resume probe succeeds. Phase 5.2 remains intentionally blocked while quota/provider
+capacity prevents that measurement.
 
 For Claude, Codex, AGY and OpenCode, measure:
 
@@ -234,7 +235,7 @@ tested. Unsupported harnesses keep the current timeout semantics.
 | 2 | Required CI checks on `main` | repository admin | **complete** |
 | 3 | Release-readiness audit and release | verification/release | **complete — v0.86.0 published** |
 | 4 | M1 and live/vendor/operator blockers | evidence/operations | close as inputs become available |
-| 5 | Continuation harness survey | design/evidence | exact-resume matrix exists |
+| 5 | Continuation harness survey + probe tooling | design/evidence | **tooling complete; live exact-resume result pending** |
 | 6 | Continuation substrate | source | no behavior change, gate green |
 | 7 | First harness continuation | source | active rollover proved end to end |
 | 8 | Routing continuity + telemetry | source | logical-attempt semantics preserved |
