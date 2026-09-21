@@ -1501,11 +1501,6 @@ export class McpDispatchServer {
   }
 
   private async toolDispatch(args: Record<string, unknown>, ctx: CallContext): Promise<unknown> {
-    // After an MCP restart, daemon-owned attempts may still be active. Claim/reconcile them before
-    // maxConcurrent is evaluated so this replacement process does not briefly undercount its own
-    // surviving lanes. This waits only on broker recovery, never git/tree enrichment.
-    await this.brokerStartup;
-
     const task = readString(args, "task");
     if (!task) return textResult("dispatch requires a non-empty task", true);
 
@@ -1576,6 +1571,11 @@ export class McpDispatchServer {
       callerRoot: this.cwd(),
     });
     if (!readOnlyVerdictResult.ok) return textResult(readOnlyVerdictResult.refusal, true);
+
+    // After an MCP restart, daemon-owned attempts may still be active. Claim/reconcile them before
+    // maxConcurrent is evaluated inside runWalk so this replacement process does not briefly
+    // undercount its own surviving lanes. This waits only on broker recovery, never git enrichment.
+    await this.brokerStartup;
 
     const first = view.ladder.find((l) => l.id === ordered[0]) ?? view.next;
     const job = this.jobs.create(first.id, first.spec, opts.cwd, opts.dispatchSource, taskLabel(task));
