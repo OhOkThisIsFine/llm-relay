@@ -161,6 +161,12 @@ Implement it as separate packets.
 
 ### 5.1 Harness capability survey
 
+**First-party survey complete:** see
+[`active-hard-cap-harness-survey-2026-09-21.md`](active-hard-cap-harness-survey-2026-09-21.md).
+AGY is the strongest first live candidate. Claude, Codex and OpenCode all expose exact resume
+primitives as well, with harness-specific caveats. The remaining gate is a real kill/resume probe;
+no harness is implementation-ready until it passes that probe.
+
 For Claude, Codex, AGY and OpenCode, measure:
 
 - whether an exact resumable session/conversation/thread ID exists;
