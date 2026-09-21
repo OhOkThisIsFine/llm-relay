@@ -35,8 +35,9 @@ The repository is in a consolidation phase after a large post-v0.85.0 developmen
 **v0.86.0 is published.** Phase 3 is complete. The first-party hard-cap continuation harness
 survey is also complete: AGY is the strongest first candidate, while Claude, Codex and OpenCode
 have exact resume primitives with additional caveats. The immediate gate is a real AGY
-kill/resume probe; do not add continuation substrate until at least one harness passes the live
-protocol. Evidence/vendor/operator blockers remain parallel work.
+kill/resume probe; run `npm run build:server` then `node scripts/measure-agy-continuation.mjs`.
+Do not add continuation substrate until at least one harness passes the live protocol.
+Evidence/vendor/operator blockers remain parallel work.
 
 Audit evidence:
 [`docs/history/release-readiness-audit-2026-09-21.md`](docs/history/release-readiness-audit-2026-09-21.md).

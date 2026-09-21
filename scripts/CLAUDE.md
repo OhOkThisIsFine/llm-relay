@@ -66,6 +66,17 @@ red without anyone invoking a script by hand:
   per-step report and `<step>.exit.txt`, which is the attribution the sweep consumes. An unknown
   `--only` name, or any other argument, exits 2 touching nothing.
 
+Needs a locally authenticated harness account (manual measurement; never CI):
+- `measure-agy-continuation.mjs` — Phase 5.1 exact-resume measurement for active hard-cap
+  continuation. Run `npm run build:server` first, then
+  `node scripts/measure-agy-continuation.mjs`. It starts AGY in a fresh temp workspace with
+  `--output-format stream-json`, captures the exact `conversation_id`, waits until AGY emits an
+  ACTIVE agent-response event, terminates that process tree, then starts a NEW AGY process with
+  `--conversation <captured-id>`. The resumed process must report the same conversation id and
+  recover a random marker that appears only in the interrupted user turn. It never uses
+  `--continue`, requests no tools, and prints one `AGY_CONTINUATION_MEASUREMENT {...}` line. A
+  negative `success:false` is a valid capability measurement; setup/protocol failures throw.
+
 Offline / unit-test-safe (no external creds):
 - `measure-lane-orphan.mjs` (Windows only; run `npm run build:server` first) — S4's real
   process-lifetime measurement. It starts the built `llm-relay mcp` on an isolated config/port,
