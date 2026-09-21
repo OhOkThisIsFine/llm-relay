@@ -297,19 +297,11 @@ export class CredentialWalk {
   #skipped = 0;
   #stopped = false;
   #startedAt: number | undefined;
-  /**
-   * Every attempt currently in flight, in the order they were offered.
-   *
-   * ⚠ This was a SINGLE optional record until 2026-08-30, and the change is the prerequisite for
-   * hedging: `next()` used to open with `if (this.#pending) return this.#pending.attempt;`, so
-   * while an attempt was live it re-offered THAT SAME ATTEMPT, and asking for a hedge candidate
-   * handed back the primary. A `Map` keyed by the attempt keeps insertion order, so "the oldest
-   * in flight" is well defined and the saturated case behaves exactly as the single slot did.
-   *
-   * ⚠ At `maxInFlight` 1 — the default — every observable behaviour is unchanged. That is the
-   * load-bearing property: this class is the sole budget/LRU mutation boundary, so a regression
-   * here is a regression in every request the relay serves.
+    /**
+   * In-flight attempts in offer order. A map supports hedging while preserving the single-attempt
+   * behavior when `maxInFlight` is 1.
    */
+
   readonly #pending = new Map<ResolvedAttempt, AttemptPlan>();
   readonly #maxInFlight: number;
 

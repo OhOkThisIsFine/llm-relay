@@ -1,24 +1,7 @@
 /**
- * The `llm-relay mcp` server — one dispatch verb, callable from any MCP host.
- *
- * WHAT PROBLEM THIS SOLVES. `llm-relay dispatch --next-command` answers "which lane" correctly and
- * then hands the caller a COMMAND to execute. Two things go wrong with that, and both are measured:
- *
- * 1. The answer's SHAPE depends on the host. A routed Claude Code session gets a `target:` spec to
- *    address as a subagent; a bypassed or headless one gets a `run:` command. The caller must
- *    branch on mechanism, which is exactly what the owner asked never to be necessary.
- * 2. Executing the command correctly is hard. `lane-runner.ts` lists five distinct measured ways
- *    to get it wrong, each of which cost a release or a wasted lane run.
- *
- * This server removes both. Every host makes the same call and receives an ANSWER, not a command.
- *
- * WHERE IT RUNS. As a stdio child of the HOST, launched as `llm-relay mcp`. It is NOT part of the
- * relay daemon, and it answers no HTTP. The daemon's rule that no HTTP turn may spawn a lane is
- * therefore untouched — this process is the host's own spawn mechanism wearing a protocol.
- *
- * SEAMS. Every environment dependency is injected (`buildView`, `spawn`, `now`, `cwd`), so the
- * suite exercises the whole surface without spawning a real lane or spending real quota. Same
- * discipline as `lane-quota-probe.ts` and `availability-snapshot.ts`.
+ * MCP dispatch server for host-launched stdio clients. It gives every host the same task-to-answer
+ * interface and delegates lane execution to `lane-runner.ts`. It is separate from the HTTP relay
+ * daemon; external effects are injected for tests.
  */
 import type { Config } from "../config.js";
 import { buildLaneEnv } from "../lane-launch-env.js";
@@ -163,11 +146,7 @@ export interface McpServerDeps {
   /** The platform whose environment rules the lane launcher applies; defaults to `process.platform`. */
   platform?: NodeJS.Platform;
   maxDepth?: number;
-  /**
-   * Version reported in `serverInfo`. Injected because `process.env.npm_package_version` is only
-   * set when npm launched the process, and a host launches this one directly — so reading it here
-   * reported "0.0.0" to every real client. Measured on the first live handshake.
-   */
+  /** Version reported in `serverInfo`; injected because hosts launch the binary outside npm. */
   version?: string;
   /** Reports positive lane quota evidence to the relay's exhaustion state. */
   reportExhaustion?: (report: DispatchedQuotaReport) => Promise<void> | void;
@@ -194,12 +173,7 @@ export interface McpServerDeps {
    * orphan rows are reconciled instead of being declared killed from the MCP owner pid alone.
    */
   laneExecutionClient?: LaneExecutionClient;
-  /**
-   * The llm-relay version INSTALLED on disk now, read fresh on each call — or null when unknown.
-   * When it differs from `version` (the code this process started with), every tool reply says so:
-   * the Claude desktop app keeps one MCP process alive across sessions and releases, and on
-   * 2026-09-10 two processes from before v0.78.0 were still serving old code with no sign of it.
-   */
+  /** Current installed version, used to warn when a long-lived MCP process is running older code. */
   installedVersion?: () => string | null;
   /**
    * AGY's log, read after an AGY lane ends or is stopped, so a quota death AGY stated only in its
@@ -217,17 +191,8 @@ interface ToolDefinition {
 }
 
 /**
- * The `initialize` instructions. An MCP host puts this in the model's system prompt
- * unconditionally, so it is the ONE channel here that cannot be deferred, collapsed to a bare
- * tool name, or missed because the model never went looking. The tool descriptions below say
- * WHAT each tool does; a host only reads them once the model has already decided to delegate.
- *
- * ⚠ So this text must state WHEN to delegate, not just what the tool is. It carried only the
- * "what" until 2026-08-30, and the measured consequence was that the operator had to say
- * "use llm-relay for offload" out loud — on a machine whose own CLAUDE.md already said
- * "PREFER THE MCP TOOL" in bold. Prose the model must go and find is not a trigger.
- *
- * Keep it short: every host pays for it in every session. Pinned by `test/mcp-server.test.ts`.
+ * Always-loaded MCP instructions. They must state when to delegate as well as what the tools do,
+ * and stay short because every host pays for them in every session.
  */
 export const MCP_INSTRUCTIONS =
   "Use dispatch from every MCP host — Claude, Codex, desktop, CLI, or otherwise — to hand a " +
@@ -507,15 +472,7 @@ function readRecord(params: Record<string, unknown>, key: string): Record<string
   return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
 }
 
-/**
- * `"timed_out"` and `"killed"` join `"failed"` as error results for the MCP `isError` flag — a
- * caller that only checks `isError` must not read a lane that never finished as a success.
- *
- * ⚠ A total switch closed with `const _never: never`, not an `||` chain. The union grew a member
- * this lap (`"killed"`) and the chain form would have absorbed it silently as a SUCCESS — the
- * closed-union defect CLAUDE.md records eight times, in the one function whose whole job is to keep
- * a dead lane from reading as a live answer.
- */
+/** MCP error classification. The exhaustive switch forces new job statuses to be handled explicitly. */
 function isFailureStatus(status: JobStatus): boolean {
   switch (status) {
     case "completed":
@@ -546,8 +503,7 @@ function formatTimeToAnswer(t: {
 }): string {
   const s = (ms: number | null): string => (ms === null ? "n/a" : `${Math.round(ms / 1000)}s`);
   const inMode = t.mode ? `, ${t.mode} mode` : "";
-  // "on record", not "completed": a window written before 2026-09-10 may still hold a duration of a
-  // run that did not answer (`restoreLaneStatsRows` empties only a window that PROVABLY does).
+  // Legacy restored windows may contain durations that predate completed-only sampling.
   const runs = `${t.samples} run${t.samples === 1 ? "" : "s"} on record${inMode}`;
   return `usually answers in: median ${s(t.medianMs)}, p80 ${s(t.p80Ms)} (${runs})`;
 }
@@ -564,13 +520,8 @@ function runningTimeToAnswer(job: LaneJob): string | null {
 }
 
 /**
- * A RUNNING spawned attempt's output so far: how long the lane has been silent, or how much it has
- * written and how long ago. Null for anything else — a finished job, or an answer-mode call, which
- * has no output stream and must not read as "silent".
- *
- * ⚠ The zero-output line says why silence alone proves nothing: `claude -p` buffers its whole
- * answer until exit. Without that, a caller reading "silent for 300 s" on the free pool would cancel
- * a healthy run — the false failure the backlog item names as worse than an honest slow status.
+ * Output diagnostics for a running spawned attempt. Null for terminal jobs and answer-mode calls.
+ * Silence is descriptive only; some harnesses buffer output until exit.
  */
 export function describeActivity(job: LaneJob, now: number): string | null {
   if (job.status !== "running" || job.activity === undefined) return null;
@@ -601,17 +552,7 @@ function laneEvidenceBits(lane: DispatchLane): string[] {
   return bits;
 }
 
-/**
- * Render a job for a caller.
- *
- * ⚠ The lane's own stdout is reported as the ANSWER, and the lane is NAMED beside it. This
- * repository's rule is that dispatch "never pretends a CLI answered" — a result that hid which
- * lane produced it would do exactly that, so provenance rides every response.
- */
-/**
- * Answer-mode provenance — the direct-HTTP sibling of the lane id/spec/elapsed every job already
- * carries. Empty for every agent-mode job, which never touches HTTP directly.
- */
+/** Answer-mode HTTP provenance. Agent-mode jobs have no relay headers to report. */
 function relayProvenanceLines(job: LaneJob): string[] {
   const relay = job.relay;
   if (!relay) return [];
@@ -683,71 +624,34 @@ function describeJob(job: LaneJob, now: number): string {
   // the caller follows walk-verdict rather than inferring "stuck" from historical duration.
   const usually = runningTimeToAnswer(job);
   if (usually !== null) head.push(usually);
-  // And what the running attempt has produced, so a caller can see a SILENT lane for what it is
-  // rather than reading `running` for nine minutes (`LaneActivity`).
+  // Also expose current output diagnostics for spawned attempts.
   const output = describeActivity(job, now);
   if (output !== null) head.push(output);
-  // ⚠ Only when there is something to say. Every ordinary job reaps cleanly, and a line on all of
-  // them would be noise that trains the reader to skip the one that matters. A SURVIVOR is the case
-  // `docs/backlog.md` measured — nothing short of a process enumeration finds those — so it is
-  // named here with the pid, beside the job id that owned it.
+  // Survivor reporting is exceptional; omit the line for ordinary successful cleanup.
   if (job.process?.survivors.length) {
     head.push(
       `owned processes STILL RUNNING after ${job.id} ended: ${job.process.survivors.join(", ")} ` +
         "(relay-started, not reaped)",
     );
   }
-  // ⚠ The lanes already tried belong HERE, not only on the final answer. A poll of a running walk
-  // has to say which lanes it has already spent — otherwise `dispatch_status` reports one lane
-  // name and the operator cannot tell a walk on its third lane from one that never moved.
+  // Running polls include settled attempts so a caller can see how far the walk has progressed.
   const walked = describeAttempts(job);
   return walked ? `${head.join("\n")}\n\n${walked}` : head.join("\n");
 }
 
-/**
- * What a caller is told when the walk tried every lane it had and none of them answered.
- *
- * ⚠ **This IS the last rung of the ladder.** The owner's request ends *"until finally reaching the
- * base agent's own subagents"*, and the relay cannot start the caller's subagent — it decides
- * ORDER, the host executes, which is the standing boundary this project keeps everywhere else. So
- * the final fallback is an ANSWER, and the text carries the whole instruction: what to do now, and
- * what NOT to do. Without the second half a caller retries `dispatch` for the same task, which is
- * the loop this feature exists to end.
- *
- * Pinned by `test/dispatch-lane-walk.test.ts` on its CLAIMS rather than its wording — reword it
- * freely, but change the assertion deliberately instead of deleting it. (This said
- * `test/mcp-server.test.ts` until an independent closeout audit caught it on 2026-09-08; the
- * assertions never lived there. A citation that sends the reader to the wrong file is the exact
- * failure the repository's cite-symbols-not-line-numbers rule exists to avoid.)
- */
+/** Final advice only when the walk actually tried every selectable lane and none answered. */
 export const LANE_LADDER_EXHAUSTED_ADVICE =
   "Every dispatch lane has now been tried for this task and none of them answered. "
   + "Do NOT call dispatch again for this task — it would pick the same lanes. "
   + "Do the work in this session instead, with your own subagent if you have one.";
 
-/**
- * What a caller is told when lanes REMAIN untried — the walk stopped at its own `maxLanes` bound.
- *
- * ⚠ This exists because the advice above was firing on a walk that had not exhausted anything
- * (found by adversarial review, 2026-09-06). Both of its sentences were then false: lanes remained,
- * and "it would pick the same lanes" is wrong precisely because the walk has just DEMOTED every
- * lane it tried, so the next dispatch reorders around them. Telling an autonomous caller to stop
- * delegating, on a false premise, abandons capacity that was never contacted.
- */
+/** Advice when selectable lanes remain untried, such as after a `maxLanes` cutoff. */
 export const LANE_LADDER_PARTIAL_ADVICE =
   "Lanes remain untried: this dispatch stopped at its maxLanes bound. Call dispatch again to "
   + "reach them — the lanes above are now demoted, so it will pick different ones — or do the "
   + "work in this session.";
 
-/**
- * What a caller is told when the walk STOPPED an idle lane and nothing answered after.
- *
- * ⚠ The stopped lane did not fail on its own: the walk stopped it because it showed no activity the
- * relay could see. So "every dispatch lane has now been tried" is false there, and would end the
- * caller's use of dispatch for a task the lane might still finish
- * (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §5). A NAMED lane is never stopped for idleness,
- * so this names the call that lets it run to its own timeout.
- */
+/** Advice when the walk idle-stopped a lane; a forced retry can let it run to its own timeout. */
 export function laneStoppedAdvice(laneId: string): string {
   return (
     `The walk stopped lane "${laneId}" because it showed no activity for a while — it did not fail ` +
@@ -756,24 +660,12 @@ export function laneStoppedAdvice(laneId: string): string {
   );
 }
 
-/**
- * What a caller is told when it NAMED the lane or the model and that one lane did not answer. Only
- * that lane ran, so "every dispatch lane has now been tried" would be false — measured 2026-09-10 on
- * jobs 0023 and 0024, which each ran one forced lane and were told to stop delegating.
- */
+/** Advice when the caller forced one lane/model, so the rest of the ladder was intentionally untouched. */
 export const FORCED_LANE_ADVICE =
   "Only the lane you named was tried, and it did not answer. Call dispatch without lane or model to "
   + "let the walk try the other lanes, or do the work in this session.";
 
-/**
- * The advice that ends a reply in which no lane answered — the one place that chooses it, so a new
- * case cannot be handled in one renderer and missed in another.
- *
- * ⚠ Order matters: with the walk off, no advice at all (the documented byte-for-byte revert); a
- * forced lane next, because it ran alone on purpose; then a lane the walk stopped while it still
- * worked, because that lane is the likeliest to answer; then lanes left untried; and only when every
- * lane ran and failed on its own, the advice to stop delegating this task.
- */
+/** Choose terminal no-answer advice from walk scope, forced-target state, and settled attempts. */
 function terminalAdvice(job: LaneJob): string {
   if (job.walkEnabled !== true) return "";
   if (job.forcedLane === true) return `\n\n${FORCED_LANE_ADVICE}`;
@@ -783,14 +675,7 @@ function terminalAdvice(job: LaneJob): string {
   return `\n\n${LANE_LADDER_EXHAUSTED_ADVICE}`;
 }
 
-/**
- * Render the lanes a walk tried, oldest first, so both a poll and the final answer show what it
- * cost to get here.
- *
- * ⚠ Empty string for a walk that has tried nothing yet. A bare "lanes tried:" header with no lanes
- * under it reads as a walk that tried and found nothing, which is the opposite of the truth for a
- * walk still on its first lane — or for one the caller cancelled before any lane settled.
- */
+/** Render settled walk attempts; omit the section when nothing settled and no lanes were skipped. */
 function describeAttempts(job: LaneJob): string {
   if (job.attempts.length === 0 && !job.lanesNotTried) return "";
   const lines = job.attempts.map((a, i) => {
@@ -815,17 +700,8 @@ function jobAnswer(job: LaneJob, now: number): string {
 function jobAnswerBody(job: LaneJob, now: number): string {
   const header = describeJob(job, now);
   const body = job.stdout.trim();
-  // ⚠ The lanes tried are NOT rendered here — `describeJob` owns them now, so a poll and the final
-  // answer show the same list rather than two nearly-identical renderings that can drift apart.
-  // The terminal fallback fires only when the walk ended with NO answer from any lane. A cancelled
-  // job is excluded: the caller stopped it, so the ladder was never exhausted.
-  // ⚠ Three conditions, and the last two were MISSING until adversarial review found it
-  // (2026-09-06). "No lane answered" is not the same claim as "every lane was tried":
-  //   - with `routing.dispatchWalk: false` exactly ONE lane runs, and the pre-walk answer carried
-  //     no advice at all — emitting it there breaks the documented byte-for-byte revert;
-  //   - with `maxLanes` below the selectable count the walk stopped early, and the answer would
-  //     then contain BOTH "N further lanes not tried" and "every lane has now been tried".
-  // A caller that stops delegating on a false premise abandons capacity nothing contacted.
+  // `describeJob` owns attempt history so polling and final results render consistently.
+  // Terminal advice applies only when a non-cancelled walk ran at least one lane and none completed.
   const nothingAnswered =
     job.status !== "running"
     && job.status !== "cancelled"
@@ -846,10 +722,7 @@ function jobAnswerBody(job: LaneJob, now: number): string {
       : `${header}\n\nThe lane was KILLED when the llm-relay MCP server restarted — it did not fail and it did not time out. Its process is gone. Re-dispatch from scratch, and check the working directory first: only files the lane wrote before the restart survive.`;
   }
   if (job.status === "timed_out") {
-    // ⚠ A timed-out dispatch must never render nothing (C:\Code\docs\backlog.md — a bounded
-    // design dispatch consumed its full 1,200s wait and surfaced no usable answer). The header
-    // above already carries status + elapsed + the one-line reason (`error:`); this adds
-    // whatever partial output the killed run actually captured, when any survived.
+    // Preserve usable partial output from a timed-out run; the header already states the timeout.
     const partial = isContentEmpty(body) ? "" : `\n\nPartial output before the timeout:\n\n${body}`;
     const tail = isContentEmpty(body) ? job.stderr.trim().slice(-1500) : "";
     return `${header}\n\nThe lane exceeded its timeout and was stopped before it finished.${partial}${
@@ -857,9 +730,7 @@ function jobAnswerBody(job: LaneJob, now: number): string {
     }${exhausted}`;
   }
   if (isContentEmpty(body)) {
-    // ⚠ Exit 0 (or HTTP 200) with content-empty output is a KNOWN lane failure mode (agy discards
-    // long answers; a free model sometimes answers a lone `#`), and it must not read as a
-    // successful empty answer. Say so rather than returning nothing.
+    // Content-empty output is a lane failure even when process/HTTP status says success.
     const tail = job.stderr.trim().slice(-1500);
     return `${header}\n\nThe lane returned NO output. Treat this as a lane failure and retry, or pick another lane.${
       tail ? `\n\nstderr tail:\n${tail}` : ""
@@ -961,10 +832,7 @@ function attemptReason(status: DispatchLaneStatus, outcome: LaneAttemptOutcome, 
   if (outcome.semanticFailure !== undefined) return outcome.semanticFailure;
   if (status === "timed_out") return "the lane exceeded its own configured timeout";
   if (status === "failed") return "the lane failed";
-  // ⚠ Total over `DispatchLaneStatus`, not a bare fall-through. The union GREW this sprint
-  // (`abandoned`), which is the proof it grows; before this, a fifth member would have rendered
-  // silently as "the lane failed" — the repository's most repeated defect class, an unhandled
-  // member of a closed union resolving to a claim nobody checked.
+  // Exhaustive over `DispatchLaneStatus`; new statuses must choose their own reason.
   const _never: never = status;
   return String(_never);
 }
@@ -1046,25 +914,12 @@ function laneSummary(lane: DispatchLane, inFlight: number): string {
   return bits.join(" ");
 }
 
-/**
- * MCP clients (`initialize` `clientInfo.name`) measured to survive a long tool call, so `dispatch`
- * may wait for the answer the way the host's own subagent does, up to `routing.mcp.blockingWaitMs`.
- *
- * Measured 2026-09-17 (`docs/history/mcp-host-timeouts-2026-09-17.md`): Claude Code 2.1.237 (`claude-code`)
- * completed a 240 s tool call headless, with and without progress. Two hosts are deliberately NOT
- * here: the Claude desktop chat client (`claude-ai`) cancelled at exactly 60 s, and Codex runs a
- * call inside a code-mode `exec` that yields at 31 s. An unknown client keeps `maxWaitMs`.
- */
+/** Clients verified to support the long blocking wait when they supply a progress token. */
 export const BLOCKING_WAIT_CLIENTS: readonly string[] = ["claude-code"];
 
 /**
- * MCP clients whose tool-call limit is known and above `maxWaitMs`, but which send no progress
- * token and never reset that limit. `dispatch` waits up to this figure for them, with no progress.
- *
- * `claude-ai` is the Claude Desktop app (read from its 2.110.1 bundle, 2026-09-17). It calls a local
- * server on two paths: desktop chat passes a 300 s timeout, and a Code tab session passes none, so
- * the MCP SDK default of 60 s applies. The server cannot tell the two paths apart, so the figure
- * stays 10 s under the smaller one. `blockingWaitMs: 0` turns this off too.
+ * Known host ceilings for clients without progress tokens. Values stay below the smallest verified
+ * host timeout; `blockingWaitMs: 0` disables this path.
  */
 export const HOST_WAIT_CEILING_MS: Readonly<Record<string, number>> = { "claude-ai": 50_000 };
 
@@ -1122,12 +977,8 @@ export class McpDispatchServer {
   }
 
   /**
-   * Feed raw stdin bytes. Complete messages are handled concurrently; a partial tail is carried
-   * over. Resolves once every handler in THIS chunk has settled.
-   *
-   * ⚠ Deliberately not `async`: the split runs to completion before the first handler starts, so
-   * two calls in flight at once cannot interleave or reorder the buffer — message order is the
-   * write order whatever the caller awaits. `serve` depends on exactly that.
+   * Feed raw stdin bytes. Complete messages run concurrently; a partial tail is retained. Splitting
+   * is synchronous so concurrent handlers cannot reorder the input buffer.
    */
   ingest(chunk: string): Promise<void> {
     this.buffer += chunk;
@@ -1137,22 +988,9 @@ export class McpDispatchServer {
   }
 
   /**
-   * Serve a stream of stdin chunks until the source ends.
-   *
-   * ⚠ Reads every chunk the moment it arrives and NEVER awaits a handler. Until 2026-09-05
-   * `cli.ts` ran `for await (chunk) { await server.ingest(chunk) }`, and `ingest` resolves only
-   * when every handler in the chunk has settled — so a `tools/call` written while another was in
-   * flight was not even READ until the first returned. Two requests were concurrent only when
-   * they landed in the same chunk; a host that issues parallel tool calls in separate writes
-   * (Claude Code does) had its second `dispatch` wait behind the first's full `waitMs`, and
-   * `dispatch_status` / `dispatch_cancel` could not reach a job while a blocking `dispatch` held
-   * the loop. Each handler now settles on its own promise; the per-job wait/poll policy
-   * (`awaitOrPoll`) is unchanged. Responses may therefore leave out of request order, which
-   * JSON-RPC permits — ids correlate.
-   *
-   * A rejected `ingest` (a response write failed — the host closed the pipe mid-answer; every
-   * handler error is already contained inside `handleLine`) is reported on stderr and never
-   * takes the loop down. Resolves after the source ends AND every handler it started has settled.
+   * Read stdin continuously without awaiting individual handlers, so status/cancel calls can reach
+   * jobs while a dispatch blocks. JSON-RPC ids permit out-of-order replies. Resolves after input ends
+   * and all started handlers settle.
    */
   async serve(source: AsyncIterable<string>): Promise<void> {
     const inFlight = new Set<Promise<void>>();
@@ -1295,13 +1133,7 @@ export class McpDispatchServer {
     }
   }
 
-  /**
-   * Append a notice to a tool reply when this process runs OLDER code than the version installed on
-   * disk. The Claude desktop app keeps one MCP process alive across sessions and releases, and on
-   * 2026-09-10 two processes from before v0.78.0 were still serving old code with nothing to say so.
-   * Only a plain one-block text reply is touched; anything else passes through unchanged. A version
-   * that cannot be read is unknown, and unknown adds nothing.
-   */
+  /** Warn plain-text replies when this long-lived process is older than the installed package. */
   private withVersionNotice(result: unknown): unknown {
     const running = this.deps.version;
     const installed = ((): string | null => {
@@ -1343,12 +1175,7 @@ export class McpDispatchServer {
     return textResult(`tier: ${view.tier ?? "default"}${rule}\n\n${lines.join("\n")}${next}`);
   }
 
-  /**
-   * ⚠ A TERMINAL job's status IS its result. A native subagent hands its answer back the moment it
-   * ends; a caller that polls `dispatch_status` and never thinks to call `dispatch_result` was
-   * measured polling one finished job 2,023 times over 71 minutes (2026-09-16). So the first poll
-   * that sees the job end already holds the answer; a running job keeps the short form.
-   */
+  /** Terminal status replies include the result; running jobs keep the short status form. */
   private async toolStatus(args: Record<string, unknown>): Promise<unknown> {
     const jobId = readString(args, "jobId");
     if (!jobId) {
@@ -1478,13 +1305,7 @@ export class McpDispatchServer {
     return textResult(cancelled ? `cancelled ${jobId}` : `${jobId} was already ${job.status}`);
   }
 
-  /**
-   * The blocking-wait cap for this call, or null when the call gets the ordinary `maxWaitMs`.
-   * Three conditions: the host is one measured to survive a long call, the call asked for progress
-   * (so the host shows the wait and, per its documentation, resets its idle timer), and the
-   * operator did not turn the blocking wait off. A host in `HOST_WAIT_CEILING_MS` instead gets its
-   * known ceiling, with no progress and no token required.
-   */
+  /** Resolve a host-specific blocking wait, or null to use the ordinary `maxWaitMs`. */
   private blockingWaitFor(
     ctx: CallContext,
     maxWaitMs: number,
@@ -1506,10 +1327,7 @@ export class McpDispatchServer {
     const task = readString(args, "task");
     if (!task) return textResult("dispatch requires a non-empty task", true);
 
-    // ⚠ Recursion bound. A dispatched lane is itself an agent that can reach this same server, so
-    // without this a delegation loop is reachable and would spend quota until something died.
-    // Checked before anything branches, and before the spawn/fetch it bounds — the refusal must
-    // cost nothing.
+    // Refuse recursive delegation before any lane work starts.
     const depth = currentDepth();
     if (depth >= this.maxDepth) {
       return textResult(
@@ -1521,8 +1339,7 @@ export class McpDispatchServer {
 
     const lane = readString(args, "lane");
     const model = readString(args, "model");
-    // ⚠ Refused before anything is built or spawned: `lane` names a ladder rung and `model` a routing
-    // spec, so honouring either one would silently ignore the other.
+    // `lane` and `model` name different target namespaces; accepting both would ignore one.
     if (lane !== undefined && model !== undefined) {
       return textResult(
         "dispatch takes lane or model, not both: lane names a ladder rung, model names a routing spec",
@@ -1538,10 +1355,7 @@ export class McpDispatchServer {
     // claim the whole ladder was tried (`FORCED_LANE_ADVICE`).
     const forced = lane !== undefined || model !== undefined;
 
-    // ⚠ `?.` on `routing`, not just on the key. `McpServerDeps.config` is a public interface and a
-    // programmatic caller may hand over a partial config; a bare `.routing.dispatchWalk` throws
-    // there, and a throw inside a tool handler becomes a JSON-RPC error with no lane run at all.
-    // Absent settings mean the walk is off, which is the WEAKER claim and the safe fall-through.
+    // Programmatic embeds may provide partial config; absent walk settings mean walking is off.
     const declared = this.deps.config.routing?.dispatchWalk;
     const walk = declared !== undefined && declared.enabled ? declared : null;
     const { ordered, notTried } = this.walkOrder(view, walk, forced, view.next.id);
@@ -1562,10 +1376,7 @@ export class McpDispatchServer {
       dispatchSource: view.source === "local-fallback" ? "fallback" : "daemon",
     };
 
-    // ⚠ The read-only boundary is checked HERE, before anything spawns. A read-only dispatch asked
-    // to run in the caller's own tree is refused with zero egress, for the same reason the recursion
-    // bound and the `waitMs` refusal are checked before the spawn: a refusal must cost no lane run.
-    // The instruction "do not edit any file" is advice; the working directory is the mechanism.
+    // Enforce read-only containment before any egress or process spawn.
     const readOnlyVerdictResult = readOnlyVerdict({
       readOnly: opts.readOnly,
       mode: opts.mode,
@@ -1584,10 +1395,7 @@ export class McpDispatchServer {
     // What this dispatch was allowed to reach. Both halves gate the terminal advice below: it may
     // claim the ladder was exhausted only when a walk actually ran and nothing was left untried.
     this.jobs.noteWalkScope(job.id, { enabled: walk !== null, lanesNotTried: notTried, forced });
-    // ⚠ The blocking wait is bounded by the host's tool-call ceiling, never by the caller's
-    // ask alone: above ~45 s the host fails the call AND destroys the job handle. `?.` on
-    // `routing` for the same partial-config reason the walk lookup states above; an absent
-    // ceiling means the default.
+    // Bound blocking wait by the host/config ceiling so the caller keeps a pollable job handle.
     const maxWaitMs = this.deps.config.routing?.mcp?.maxWaitMs ?? DEFAULT_MCP_MAX_WAIT_MS;
     const blocking = this.blockingWaitFor(ctx, maxWaitMs);
     const ceiling = blocking?.ms ?? maxWaitMs;
@@ -1596,10 +1404,7 @@ export class McpDispatchServer {
     // A `waitMs` the server cannot honour is refused BEFORE anything spawns — the refusal must
     // cost no lane run, exactly like the recursion bound above.
     if ("refusal" in waitMs) return textResult(waitMs.refusal, true);
-    // ⚠ A walk must ALWAYS leave the job terminal. `runWalk` is written not to reject — every
-    // failure a lane can produce is an attempt — but the worst outcome available here is a caller
-    // polling a handle that can never settle, so an unexpected throw is caught and turned into a
-    // terminal failure rather than trusted not to happen.
+    // Unexpected walk errors still settle the job; a job handle must never remain permanently running.
     const settled = this.runWalk(job.id, view, ordered, task, opts)
       .catch(async (e: Error) => {
         await this.recordTreeDelta(job.id);
@@ -1618,21 +1423,9 @@ export class McpDispatchServer {
   }
 
   /**
-   * The lanes this dispatch will try, best first, and how many selectable lanes it leaves untried.
-   *
-   * `view.order` is the ONE definition of selection order (`dispatch.ts`). With the walk turned off
-   * — or with a view that carries no order — this collapses to EXACTLY the pre-walk behaviour: the
-   * single lane the view named as `next`, tried once, and never stopped for idleness.
-   *
-   * ⚠ The `Array.isArray` test is a VERSION SKEW guard, not defensive noise. `buildView` reaches the
-   * running daemon over HTTP, and a daemon started before this field existed answers without it — an
-   * MCP child upgraded ahead of a long-running daemon is the normal state on a machine that starts
-   * the relay at logon and leaves it up for days. Reading `.length` off `undefined` there would throw
-   * on EVERY dispatch, turning a new optional field into a total outage.
-   *
-   * ⚠ A second skew guard: a daemon older than `requester=mcp` still offers a pass-through rung as
-   * ready, and this process can never run one (`mcpPassThroughReason`). Such a lane is dropped from an
-   * UNFORCED walk here; a caller who named it still reaches it and reads why it cannot run.
+   * Resolve the lanes this dispatch will try. `view.order` owns selection order; missing order
+   * preserves single-lane behavior for version skew. Unforced walks also drop pass-through lanes an
+   * MCP child cannot execute.
    */
   private walkOrder(
     view: DispatchView,
@@ -1659,17 +1452,8 @@ export class McpDispatchServer {
   }
 
   /**
-   * Try each lane in turn until one answers. THE JOB IS THE WALK.
-   *
-   * ⚠ That is the load-bearing choice, and it is forced by a measurement: an MCP client tool call
-   * on this machine fails somewhere between 45 s and 100 s, and above that ceiling it destroys the
-   * job handle as well (a filed machine-wide defect; five lanes were lost to it in one night). So
-   * the walk cannot finish inside the blocking call. It continues in the background behind ONE
-   * handle, `dispatch_status` reports the lane running now, and `attempts` records the rest.
-   * Re-pointing the handle at each new lane instead would break polling outright.
-   *
-   * Never rejects: every failure a lane can produce is an ATTEMPT, and the walk decides what to do
-   * with it. Only a caller error ends the walk early — see `refusal` on `LaneAttemptOutcome`.
+   * Walk lanes behind one persistent job handle until one answers. Lane failures become attempt
+   * records; only caller errors end the walk as refusals.
    */
   private async runWalk(
     jobId: string,
@@ -1710,11 +1494,7 @@ export class McpDispatchServer {
       this.jobs.setCurrentLane(jobId, lane.id, lane.spec, lane.timeToAnswer);
       if (readOnly.bound !== undefined) this.jobs.noteReadOnly(jobId, lane.id, readOnly.bound.binding);
 
-      // ⚠ A lane is stopped only when it is IDLE — no relay traffic, no output, no file change for
-      // `idleMs` (owner decision 2026-09-17) — never because it ran longer than other runs did. The
-      // LAST lane is never stopped: with nowhere to move to, stopping it throws away the only answer
-      // still coming. Nor is a lane with nothing reliable after it (`stopWithheld`). Its own
-      // `timeoutMs` still bounds every lane.
+      // Idle stopping applies only when a useful later lane exists; each lane's own timeout still applies.
       const isLast = i === laneIds.length - 1;
       const idleMs = this.stopWithheld(view, laneIds, i) ? null : opts.idleMs;
       const startedAt = this.now();
@@ -2067,15 +1847,12 @@ export class McpDispatchServer {
     }
   }
 
-  /**
-   * Is the lane at position `i` never stopped, even when idle? The last lane is not — there is
-   * nowhere to move to. Nor is a lane whose later lanes are all unlikely to answer: each is on a
-   * streak of `LANE_UNRELIABLE_STREAK` own failures or more, or marked `failing`. Stopping a lane
-   * that may still answer in order to reach those trades an answer for a near-certain failure —
-   * measured 2026-09-10, when the walk stopped `free-pool` to try lanes that had answered 0 of 12,
-   * 0 of 34 and 0 of 21 runs (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §1). A lane with no
-   * record counts as reliable: unmeasured is no opinion, never a failure.
+      /**
+   * Withhold idle stopping when there is nowhere reliable to advance: the current lane is last, or
+   * every later lane has enough own failures to be considered unreliable. Unmeasured lanes remain
+   * eligible because missing evidence is not failure evidence.
    */
+
   private stopWithheld(view: DispatchView, laneIds: readonly string[], i: number): boolean {
     return !laneIds.slice(i + 1).some((id) => {
       const later = view.ladder.find((l) => l.id === id);
@@ -2114,14 +1891,11 @@ export class McpDispatchServer {
     return this.skipIfAtConcurrencyCap(jobId, lane) || this.skipIfBelowTier(jobId, lane, opts);
   }
 
-  /**
-   * A rung that declares a `capability` below this dispatch's tier — SKIP it, so the walk never
-   * moves a packet to a weaker lane only because the operator listed it in that tier's ladder
-   * (measured 2026-09-16: a `high` implementation packet was stopped on `free-pool` and restarted on
-   * a lane kept for short advisory work). Recorded like a concurrency-cap skip. A caller who NAMED
-   * the lane or a model still reaches it, and a tier or capability outside the effort vocabulary
-   * limits nothing.
+      /**
+   * Skip an unforced rung whose known capability is below the requested tier. Unknown or
+   * out-of-vocabulary capability imposes no ceiling, and explicit lane/model selection is never skipped.
    */
+
   private skipIfBelowTier(jobId: string, lane: DispatchLane, opts: WalkOptions): boolean {
     if (lane.capability === undefined || opts.tier === undefined) return false;
     if (this.jobs.get(jobId)?.forcedLane === true) return false;
@@ -2561,15 +2335,12 @@ export class McpDispatchServer {
     };
   }
 
-  /**
-   * Start ONE lane and hand back its promise plus a kill handle. Two shapes, decided exactly as
-   * `toolDispatch` used to decide them: a `relay` rung in answer mode is a direct HTTP call to
-   * this relay's own `/v1/messages`; everything else is a spawned command.
-   *
-   * ⚠ A lane that cannot run HERE returns a failed OUTCOME, not a refusal, so the walk moves on.
-   * Only a bad working directory is a `refusal`, because that is the caller's own error and every
-   * remaining lane would hit it identically.
+    /**
+   * Start one lane and return its result plus a kill handle. A relay rung in answer mode is a
+   * direct loopback HTTP call; other lanes use the configured execution path. Lane-specific
+   * inability is a failed attempt so the walk can continue; invalid caller cwd is a refusal.
    */
+
   private async startLane(
     jobId: string,
     lane: DispatchLane,
@@ -2672,9 +2443,7 @@ export class McpDispatchServer {
     }
 
     const result = run.result.then((r) => this.settleSpawnedRun(jobId, lane, invoke, opts, startedAt, r));
-    // ⚠ The pids travel WITH the handle: `runOneLane` registers it, and the reaper names a survivor
-    // by them. Until 2026-09-10 this returned `{ result, kill }` alone, so the v0.80.0 survivor
-    // report had no pid to check for any lane a walk started.
+    // Carry root pids with the handle so cleanup can verify and report survivors.
     return { result, kill: run.kill, ...(run.pids === undefined ? {} : { pids: run.pids }) };
   }
 
@@ -2721,12 +2490,9 @@ export class McpDispatchServer {
     return { run: out, abandoned: false, ...(semanticFailure === undefined ? {} : { semanticFailure }) };
   }
 
-  /**
-   * The quota death an AGY lane stated only in AGY's own log (`agy-quota-log.ts`). AGY retries a
-   * spent quota in silence, so a lane stopped by the walk or by its own timeout printed nothing, and
-   * the death reached the relay only when a run happened to last its whole length
-   * (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §4). Undefined unless the lane is AGY, names its
-   * model, and the log is provably this run's — `agyQuotaStatement` refuses everything else.
+    /**
+   * Recover AGY quota evidence stated only in AGY's log. Returns a report only when the log can be
+   * tied to this run and model; otherwise no inference is made.
    */
   private agyLogReport(
     lane: DispatchLane,
@@ -2778,12 +2544,7 @@ export class McpDispatchServer {
     if (captured.adHoc) return;
     const job = this.jobs.get(jobId);
     if (!job) return;
-    // ⚠ A caller cancellation is never lane evidence. That guarantee used to come from narrowing
-    // the JOB's status through `isReportableJobStatus`; with a walk the job stays `running`
-    // BETWEEN lanes, so that test no longer describes the attempt being reported. The guarantee
-    // moved into the TYPE instead, where it is stronger: `DispatchLaneStatus` has no `cancelled`
-    // member, so no caller can pass one. This check remains for the walk's own race — a
-    // cancellation landing while an attempt was in flight.
+    // Cancellation is never lane evidence; keep the race guard even though the attempt type excludes it.
     if (job.status === "cancelled") return;
     const report: DispatchedTelemetryReport = {
       jobId: job.id,
@@ -2794,9 +2555,7 @@ export class McpDispatchServer {
       // The mode the lane RAN in, which keys its stats window. A `cli` lane asked for answer mode
       // spawns its harness exactly as in agent mode, so only a `relay` lane ever runs in answer mode.
       mode: captured.requestedMode === "answer" && captured.kind === "relay" ? "answer" : "agent",
-      // ⚠ THIS ATTEMPT's wall clock, not the walk's. The daemon's lane statistics and its routing
-      // memory are both per lane, so charging a third lane's answer with the two abandoned budgets
-      // ahead of it would make every late lane look slow.
+      // Lane telemetry records this attempt's duration, never the enclosing walk's duration.
       wallClockMs: Math.max(0, attempt.wallClockMs),
       exitCode: attempt.exitCode,
       status: attempt.status,
@@ -2872,14 +2631,7 @@ export class McpDispatchServer {
     }
 
     if (!response.ok) {
-      // ⚠ This READ HEADERS ON A FAILURE, which reverses the rule stated here until 2026-09-10, and
-      // the reversal is deliberate rather than an oversight. The old rule — status and a bounded
-      // body excerpt only — was written to keep a PROVIDER's arbitrary headers out of a
-      // relay-authored message. `readRelayAnnouncements` is a closed allow-list of five names the
-      // relay itself writes, so it carries none of that risk, and the measured cost of the rule was
-      // a failure the caller could not act on: `relay answered HTTP 504` names the LANE as the
-      // failure while the 504 came from the relay's OWN `/v1/messages`, and a pool exhaustion and a
-      // relay-side timeout call for opposite responses.
+      // Read only relay-owned announcement headers on failures; arbitrary upstream headers stay hidden.
       const bodyText = await response.text().catch(() => "");
       const relay = readRelayAnnouncements(response.headers);
       // The model this dispatch asked for is the one relay-side fact the caller already holds, so

@@ -1,22 +1,7 @@
 /**
- * The running-job journal — how a lane killed by its own server restarting is REPORTED as killed.
- *
- * ⚠ WHY THIS EXISTS, and it is the worst single recorded case in the dispatch backlog
- * (C:\Code\docs\backlog.md, 2026-09-06): an overnight lap had `job-0051` through `job-0055` in
- * flight. Every handle became `unknown jobId`, the counter restarted at `job-0003`, and a process
- * check showed every lane process gone — the restart does not merely orphan the handle, it KILLS
- * the lane. All five had written nothing, so roughly ninety lane-minutes were lost with nothing to
- * salvage and no report of what any of them had decided. **Nothing announced the restart; the first
- * symptom was `unknown jobId` on a routine poll.**
- *
- * ⚠ This does NOT make the job store durable, and it must not: `LaneJobStore` is in memory on
- * purpose, because this process is stdio-attached to one host session and a durable store would
- * outlive the processes it describes and start reporting jobs whose output no longer exists. The
- * journal carries only what is needed to answer "which jobs died", and a row is deleted the moment
- * its job reaches a terminal state — so what remains at startup is exactly the set that did not.
- *
- * ⚠ Ownership boundary, same as `lane-runner.ts`: this process is launched by the HOST, never by
- * the relay daemon, so it writes its own file under the cache directory and touches no relay state.
+ * Running-job journal for MCP restart recovery. It persists only live-job metadata; terminal jobs
+ * are removed immediately, so startup rows represent unfinished work. Each host-launched MCP
+ * process owns its rows independently.
  */
 import { safeReadJsonSync, transactionalUpdateJsonSync } from "../storage/json-store.js";
 import { MCP_PERSISTENCE_LOCK } from "./persistence-lock.js";
@@ -49,15 +34,9 @@ export interface JournalRow {
    */
   brokerExecution?: JournalBrokerExecution;
   /**
-   * The process and the journal instance that own the row. Absent on a row written before
-   * 2026-09-17, which is read exactly as before: an orphan.
-   *
-   * ⚠ Why both exist. Two hosts run their own `llm-relay mcp` process at the same time (Claude
-   * Desktop and Codex Desktop, measured), and both write this one file. Before the owner was
-   * recorded, the second process to start read the first one's LIVE jobs as orphans and reported
-   * them killed, and every write by either process erased the other's rows. The pid says whether
-   * the owner can still be running; the instance token tells two journals inside one process apart,
-   * which is how the suite simulates a restart without a second process.
+   * Process plus journal-instance ownership. The pid distinguishes live foreign processes; the
+   * instance token distinguishes journal lifetimes within one process. Missing owner means legacy
+   * orphan semantics.
    */
   owner?: { pid: number; instance: string };
 }
@@ -75,16 +54,10 @@ export interface JournalFile {
 
 export const JOB_JOURNAL_VERSION = 1;
 
-/**
- * Where the journal lives. Cache-kind (re-fetchable: it describes live processes, and a lost row
- * costs one unreported death, never a credential or an operator's own edit), and XDG-aware through
- * the one policy in `state-paths.ts` rather than a fourteenth hand-rolled resolver.
- */
+/** Cache-kind, XDG-aware path for live-job recovery metadata. */
 export function jobJournalPath(env: NodeJS.ProcessEnv = process.env): string {
   if (env["VITEST"]) {
-    // ⚠ Guarded at the RESOLVER, the `state-paths` rule: a call-site guard is how the
-    // control-token one came to be half-covered. A suite must never write the operator's real
-    // journal, and must never leave a row there that a later real start would report as killed.
+    // Tests must never write the operator's real recovery journal.
     return relayStatePath("cache", ["llm-relay-vitest", `mcp-jobs-${process.pid}.json`]);
   }
   return relayStatePath("cache", ["mcp-jobs.json"]);
@@ -164,16 +137,9 @@ function defaultIsAlive(pid: number): boolean {
 let instanceCounter = 0;
 
 /**
- * The real journal: a small JSON file rewritten on every change, read ONCE at construction.
- *
- * ⚠ The read happens before any write, and the file is left in place afterwards. It is NOT deleted
- * on startup: a second host session starting while this one runs would otherwise erase the rows
- * still describing this one's live jobs. Rows are removed one at a time, by the process that owns
- * them, as their jobs end.
- *
- * Corrupt or wrong-version ⇒ no orphans, and the file is left alone. Reporting a job as killed on
- * the strength of an unparseable file would invent deaths, which is the same fail-safe direction
- * `lane-manifest.ts` takes on a corrupt manifest.
+ * JSON journal read once at construction and transactionally rewritten on mutation. Startup never
+ * deletes the file because other MCP processes may own rows. Corrupt/wrong-version data fails closed
+ * and is left untouched.
  */
 export function createJobJournal(path: string = jobJournalPath(), options: JobJournalOptions = {}): JobJournal {
   const pid = options.pid ?? process.pid;
@@ -184,11 +150,6 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
   let loaded = false;
   let startupOrphans: JournalRow[] = [];
 
-  // ⚠ The option is spelled `validator`, and it was written as `validate` first — a misspelling
-  // that made the guard INERT, so a wrong-version file loaded as if it had passed. `safeReadJson`
-  // had no such option, so the call silently read whatever JSON was there. `test/mcp-restart-
-  // report.test.ts` caught it (the corrupt-JSON case passed regardless — `JSON.parse` throws on
-  // its own — and only the version-99 case distinguished); `tsc` reports it too, as TS2561.
   const readDisk = (): JournalRow[] | null => {
     const parsed = safeReadJsonSync<JournalFile>(path, { validator: isJournalFile });
     if (!parsed) return null;
@@ -201,13 +162,8 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
   };
 
   /**
-   * Is the row's owner still running, other than this journal? A row with no owner predates the
-   * field and is read as before. A row carrying THIS pid but another instance was written by an
-   * earlier journal in this process, which no longer holds it. A dead pid is gone.
-   *
-   * ⚠ Stated cost: the operating system reuses pids, so a dead owner whose pid now names an
-   * unrelated process reads as alive, and its jobs are reported killed only once that pid ends too.
-   * The failure is a LATE report, never a false one about a live job.
+   * Whether another live process owns the row. PID reuse fails safe toward delayed orphan reporting
+   * rather than falsely declaring a live job dead.
    */
   const ownedElsewhere = (row: JournalRow): boolean => {
     const owner = row.owner;

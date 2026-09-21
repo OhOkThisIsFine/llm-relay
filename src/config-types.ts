@@ -75,81 +75,34 @@ export interface ReshaperConfig {
 export type CredentialMode = "passthrough" | "contained";
 
 /**
- * What shape a provider's own validator demands of the tool-call ids the relay puts on the wire.
- *
- *  - `"preserve"` — forward the caller's ids verbatim. The default everywhere, and what the relay
- *    did for its whole life before 2026-08-23: an id is linkage, so not touching it is the safest
- *    thing a translation can do.
- *  - `"strict9"` — rewrite every outbound `tool_calls[].id` / `tool_call_id` to mistral's stated
- *    `^[a-zA-Z0-9]{9}$` shape. Mistral's `mistral-common` validator enforces it on BOTH halves of
- *    the pair (and, from v13, linkage and uniqueness on top), so an Anthropic `toolu_01…` id is a
- *    hard 400 there — see `src/openai-request.ts`.
+ * Outbound tool-call-id policy: preserve caller ids, or rewrite them to the strict nine-character
+ * form required by providers that validate that shape.
  */
 export type ToolCallIdMode = "preserve" | "strict9";
 
-/**
- * Whether a replayed assistant tool call must carry gemini 3.x's `thought_signature` field.
- *
- *  - `"none"` — emit nothing. The default everywhere, and byte for byte what this relay put on the
- *    wire before 2026-08-23.
- *  - `"sentinel"` — stamp Google's own documented opt-out token,
- *    `skip_thought_signature_validator`, at `tool_calls[].extra_content.google.thought_signature`
- *    on every replayed tool call. See `src/openai-request.ts` for the 400 that states the rule and
- *    for why echoing a REAL signature is not an option here.
- */
+/** Whether replayed tool calls need Google's documented thought-signature sentinel. */
 export type ThoughtSignatureMode = "none" | "sentinel";
 
 /**
- * How the relay maps the CALLER's reasoning/thinking intent onto an `openai`-kind target.
- *
- *  - `"none"` — emit nothing (the pre-2026-09-10 behaviour byte for byte): the caller's
- *    request-level `thinking` control and any `output_config.effort` are DROPPED, because a
- *    guessed `reasoning_effort` would be an invention for a provider that never stated one.
- *  - `"deepseek"` — DeepSeek's reasoning vocabulary. The caller's `thinking: {type:"disabled"}`
- *    is forwarded verbatim as OpenAI's `thinking: {type:"disabled"}`; an explicit thinking-on
- *    intent (a `thinking: {type:"enabled", budget_tokens}` block or an `output_config.effort`)
- *    maps to `reasoning_effort` at the caller's stated level or the routed pool's effort band;
- *    and when the caller sent NO thinking control at all the mapper defaults to
- *    `thinking: {type:"disabled"}` — DeepSeek's thinking mode requires the prior turn's
- *    `reasoning_content` to be replayed on a multi-turn conversation (HTTP 400 otherwise), and
- *    this relay deliberately holds no store to round-trip it (see
- *    docs/history/deepseek-responses-truncation-2026-09-09.md), so the default must not think.
+ * Outbound reasoning mapping. `none` emits no provider-specific reasoning controls; `deepseek`
+ * maps supported caller/pool effort and defaults unspecified thinking off for replay safety.
  */
 export type ReasoningMode = "none" | "deepseek";
 
 /**
- * Per-provider WIRE-SHAPE quirks — things a specific host's request validator demands that the
- * protocol itself does not. Deliberately not routing configuration and deliberately not a
- * per-provider switch in `src/`: a labelled provider fact may live in code only while config can
- * override it (see the "Provider knowledge is data" invariant), which is exactly the shape here —
- * a base-host default that any explicit value beats in both directions.
- *
- * Two keys today, one per vendor rule the relay has first-party evidence for. An unknown key or
- * value is a HARD load error naming it: the `configured-limits` precedent — an ignored typo
- * silently no-ops while reading like a declaration that took effect.
+ * Provider wire-shape compatibility overrides. Host-derived defaults may be overridden explicitly;
+ * unknown keys/values are load errors rather than silent no-ops.
  */
 export interface ProviderCompatConfig {
-  /** Absent ⇒ resolved from the base host by `resolveToolCallIdMode`. */
+  /** Resolved outbound tool-call-id policy. Absent on hand-built targets means `preserve`. */
   toolCallIds?: ToolCallIdMode;
-  /** Absent ⇒ resolved from the base host by `resolveThoughtSignatureMode`. */
+  /** Resolved thought-signature policy. Absent on hand-built targets means `none`. */
   thoughtSignature?: ThoughtSignatureMode;
-  /** Absent ⇒ resolved from the base host by `resolveReasoningMode`. */
+  /** Resolved reasoning-mapping policy. Absent on hand-built targets means `none`. */
   reasoning?: ReasoningMode;
 }
 
-/**
- * Which HTTP endpoint an `openai`-kind provider speaks upstream: `"chat"` (`/chat/completions`,
- * the default) or `"responses"` (`/responses`).
- *
- * OpenCode Zen's contributor SKUs — Muse Spark 1.3 included — answer HTTP 500 on
- * `/chat/completions` and on Zen's Anthropic-shaped `/messages`, and 200 only on `/responses`
- * (measured 2026-09-04, `docs/history/muse-spark-1.3-opencode-zen-2026-09-04.md` rows 3 and 6-8). A third
- * `Kind` value for this would touch roughly 55 `kind === "openai"` sites across 19 files (same
- * doc, §3 route B); this narrower option forks only the request/response builders `src/backend.ts`
- * selects on, leaving discovery, catalog and key-check paths unchanged. Declaring it on an
- * `anthropic`-kind provider is a hard config-load error — that kind never speaks either OpenAI
- * endpoint.
- */
+/** Upstream OpenAI-family endpoint: Chat Completions or Responses. Anthropic-kind providers cannot set this. */
 export const PROVIDER_WIRE_MODES = ["chat", "responses"] as const;
 /** Derived from `PROVIDER_WIRE_MODES` — one list, never a hand-copied second declaration. */
 export type ProviderWireMode = (typeof PROVIDER_WIRE_MODES)[number];
@@ -249,17 +202,7 @@ export interface ProviderConfig {
    * Default 90000 (fork-validated in freellmapi). Adoption review §1.2.
    */
   stallTimeoutMs?: number;
-  /**
-   * Time-to-first-byte deadline for a NON-STREAMED attempt, in ms — separate from `timeoutMs` so a
-   * backend that has produced no bytes at all fails fast while one that is merely slow to finish a
-   * buffered body is not killed. "First byte" is the moment `fetch()` resolves (response headers
-   * arrived); from there `timeoutMs` governs the body read exactly as before this existed. Default:
-   * `stallTimeoutMs` when that is set (same intent — "no bytes for this long means dead") — a
-   * value that is not explicit takes it, an explicit value wins over it. Otherwise OFF (no
-   * first-byte deadline, the pre-existing behaviour). Never armed on a streamed attempt, which
-   * already has `stallTimeoutMs`'s inter-byte watchdog once its own head is being served. `0` is a
-   * hard config-load error naming the key — it would bound nothing while looking like it did.
-   */
+  /** Resolved non-streamed first-byte/header deadline; absent means no separate first-byte deadline. */
   firstByteTimeoutMs?: number;
   /** "free": wholly free/free-tier catalog. "mixed": catalog contains free and paid models. */
   tierType?: ProviderTierType;
@@ -277,11 +220,7 @@ export interface ProviderConfig {
    * explicit value always wins.
    */
   compat?: ProviderCompatConfig;
-  /**
-   * Which upstream endpoint an `openai`-kind provider speaks. Absent ⇒ `"chat"`. Hard config-load
-   * error on an `anthropic`-kind provider, and on any value outside `ProviderWireMode`. See
-   * `ProviderWireMode`.
-   */
+  /** Resolved upstream wire mode. Absent on hand-built targets means `chat`. */
   wire?: ProviderWireMode;
   /** Web URL where users can sign up or obtain API keys. */
   signupUrl?: string;
@@ -344,95 +283,31 @@ export interface Routing {
    * evidence stated. Unknown quota has no effect whatsoever.
    */
   quota?: QuotaEnforcementConfig;
-  /**
-   * Sustained MEASURED latency as a demotion term (owner decision 2026-08-30). **Default ON** —
-   * absent means enabled with the tunable defaults in `src/latency-demotion.ts`. `false` is the
-   * shorthand for `{ enabled: false }` and restores the pre-2026-08-30 behaviour exactly.
-   *
-   * Like quota, it only ever REORDERS: never drops, never refuses, and unmeasured latency has no
-   * effect whatsoever.
-   */
+    /** Latency demotion policy. Default on; reorders only and has no effect without enough samples. */
   latency?: LatencyDemotionConfig;
-  /**
-   * Hedged attempts (owner proposal + decisions 2026-08-30,
-   * docs/history/hedged-attempts-design-2026-08-30.md §7). **Default ON**, and confined to deployments
-   * `assessCost()` calls FREE.
-   *
-   * ⚠ This is the FIRST behaviour here that does not merely reorder — it DUPLICATES a request onto
-   * a second candidate. The `CLAUDE.md` invariant reads "Acting on counts is optional, always
-   * announced, and may only reorder"; the owner amended it for this feature on 2026-08-30 and
-   * bounded the duplication three ways: free deployments only (D1), the loser aborted the moment a
-   * winner commits, and the response announcing it (`x-llm-relay-hedged`).
-   *
-   * `false` is the shorthand for `{ enabled: false }` and restores the pre-hedge behaviour exactly.
+    /**
+   * Hedging policy. Default on for free deployments with known pricing; may duplicate one in-flight
+   * request and aborts the loser once a winner commits.
    */
   hedge?: HedgeConfig;
-  /**
-   * Untested-free-members-first probation band (owner direction 2026-09-09). **Default ON** —
-   * absent means enabled with `minSamples: 5`.
-   *
-   * Like latency and hedging, it only ever REORDERS (probation members lead; nothing is
-   * dropped and nothing is refused), and unmeasured PAID/unknown deployments are unaffected.
-   *
-   * `false` is the documented shorthand for `{ enabled: false }` and restores the
-   * pre-probation behaviour exactly, byte for byte.
-   */
+    /** Probation policy for under-sampled free deployments. Default on; reorders only. */
   probation?: ProbationConfig;
-  /**
-   * Self-pacing against a STATED rate limit (owner direction 2026-09-10, built 2026-09-15). **Default
-   * ON.** A cell whose provider-stated, operator-configured or LEARNED (`rate-limit-*` fact) ceiling
-   * the relay's own trailing-window attempt count has reached joins a `paced` band behind `live`
-   * and `slow`, so the next request goes elsewhere while the window drains. Counted from the
-   * breaker's per-cell attempt-start log, which every client routing through the relay feeds.
-   *
-   * Like latency and probation it only ever REORDERS — nothing is dropped, nothing is refused —
-   * and a limit nobody stated has no effect at all. `false` is the shorthand for
-   * `{ enabled: false }` and restores the pre-pacing order exactly, byte for byte.
-   */
+    /** Self-pacing policy from stated/learned rate ceilings. Default on; reorders only. */
   pacing?: PacingConfig;
-  /**
-   * Post-commit CRAWL abort (backlog item 18, built 2026-09-09 after
-   * `docs/history/post-commit-stall-measurement-2026-09-09.md` measured that both Claude Code and Codex
-   * retry a stream that goes bad after content has already arrived — Claude Code once, downgraded
-   * to non-streaming; Codex up to five times, staying streaming). A silent stall after commit is
-   * already caught by `withStallWatchdog` at `stallTimeoutMs`; this catches the case nothing else
-   * does — bytes keep arriving inside that inter-byte window while the sustained per-token rate,
-   * over a sliding window, is far worse than the same deployment's own history supports.
-   *
-   * **Default ON.** `false` is the shorthand for `{ enabled: false }` and restores the pre-crawl
-   * behaviour exactly — the watchdog is not installed at all. An object with no keys is legal and
-   * means the defaults. The thresholds live in `src/stream-pipeline.ts` beside the measurement
-   * that calibrated `msPerToken`.
-   */
+    /** Post-commit sustained-slow-stream watchdog. Default on; `false` disables it. */
   crawl?: CrawlWatchdogConfig;
-  /**
-   * Background lane re-probing (owner decision 2026-08-29,
-   * docs/history/quota-reprobe-design-2026-08-29.md): keeping lane metadata fresh is the relay's own
-   * job, the way the ping loop already does for HTTP. **Default ON** — catalog probes are
-   * metadata commands that spend no quota, and quota probes fire only for buckets carrying an
-   * ACTIVE recorded death (an alive lane is re-tested by real use for free). Boolean shorthand
-   * toggles `enabled` with the default intervals. Absent on a hand-built `Config` means the
-   * defaults too — the cadence resolves absence itself.
+    /**
+   * Background lane re-probing. Default on: catalog probes refresh metadata without model quota;
+   * quota probes run only for buckets with an active recorded quota death.
    */
+
   laneProbe?: LaneProbeSettings;
-  /**
-   * The automatic dispatch lane WALK (owner request 2026-09-06,
-   * docs/history/dispatch-lane-walk-design-2026-09-06.md). **Default ON.**
-   *
-   * Before it, `dispatch` ran ONE lane and reported a failure when that lane was slow; the calling
-   * agent then picked the next lane by hand, which is the friction the owner reported. With it,
-   * the relay walks the ladder past a lane only after it has remained idle for `idleMs` with no
-   * relay traffic, output, owned-process CPU increase or working-tree change; it pins the lane
-   * that answers and demotes the lane it left.
-   *
-   * ⚠ Read ONLY by `llm-relay mcp`, exactly like `mcp` below — the MCP walk owns delegation
-   * policy even when D1 asks the daemon's token-gated broker to own the physical process tree.
-   * No PUBLIC MODEL HTTP turn spawns a lane. The daemon also reads the PIN and DEMOTION those
-   * walks record, because ordering a ladder is not choosing to delegate.
-   *
-   * `false` is the shorthand for `{ enabled: false }` and restores the pre-walk behaviour exactly:
-   * one lane per call, no memory.
+    /**
+   * Automatic MCP dispatch walk. Default on. It advances only after `idleMs` without relay traffic,
+   * output, owned-process CPU growth or working-tree change, and records routing memory. Public HTTP
+   * request handling never spawns a lane.
    */
+
   dispatchWalk?: DispatchWalkSettings;
   /**
    * Settings for `llm-relay mcp`, the stdio MCP server that exposes the dispatch verb to any MCP
@@ -496,17 +371,8 @@ export interface QuotaEnforcementConfig {
 }
 
 /**
- * `routing.latency` — sustained MEASURED latency as a demotion term (owner decision 2026-08-30).
- *
- * **Default ON.** A candidate whose measured p95 exceeds `p95Ms`, over at least `minSamples`
- * measurable samples, joins the cooling band instead of leading the walk. It is a demotion, so the
- * worst case is a reorder: nothing is dropped and nothing is refused.
- *
- * `false` is the documented shorthand for `{ enabled: false }` and restores the pre-2026-08-30
- * behaviour exactly. An object with no keys is legal and means the defaults — writing it down is
- * documentation, not a behaviour change.
- *
- * The thresholds live in `src/latency-demotion.ts` beside the measurement that calibrated them.
+ * `routing.latency`: one-way demotion of sufficiently sampled slow candidates. It reorders only;
+ * nothing is dropped or refused. `false` disables the term.
  */
 export interface LatencyDemotionConfig {
   /** Default true. false disables latency demotion entirely. */
@@ -526,42 +392,18 @@ export interface LatencyDemotionConfig {
 }
 
 /**
- * `routing.hedge` — start the NEXT candidate beside a slow in-flight attempt, instead of after it
- * (owner proposal 2026-08-30; the four decisions are in
- * `docs/history/hedged-attempts-design-2026-08-30.md` §7).
- *
- * **Default ON, free deployments only.** That is owner decision D1, taken against the
- * recommendation of off-by-default. `assessCost()` treats an UNKNOWN price as paid, so the rule is
- * fail-safe in the only direction that matters: a duplicate can never land on a deployment whose
- * price this relay cannot establish. The stated cost is that hedging silently does not fire on many
- * members whose prices are simply unpublished.
- *
- * ⚠ **Hedging DUPLICATES; every other term here only reorders.** `false` is the documented
- * shorthand for `{ enabled: false }` and restores the pre-hedge behaviour exactly, byte for byte.
- * An object with no keys is legal and means the defaults.
- *
- * The thresholds live in `src/hedge-trigger.ts`. ⚠ `margin` and `minSamples` are still PLACEHOLDERS
- * awaiting calibration and say so at their definition — do not quote them as measurements.
- * `msPerInputToken` IS calibrated (`scripts/calibrate-hedge-floor.mjs`, 2026-09-04) — see its own
- * doc comment in `hedge-trigger.ts` for why the fit came back out of range and what shipped instead.
+ * `routing.hedge`: start the next free candidate beside a slow in-flight attempt. Hedging may
+ * duplicate work, so unknown-price candidates are treated as paid and are not hedged. `false`
+ * disables the feature.
  */
 export interface HedgeConfig {
   /** Default true. false disables hedging entirely. */
   enabled?: boolean;
-  /**
-   * The floor's flat component, in ms. Owner direction 2026-09-04: the floor is no longer flat on
-   * its own — see `msPerInputToken` — but this still bounds the SMALL-prompt case, where the
-   * size-scaled component is negligible. Without it a deployment with a tiny p90 is hedged on
-   * ordinary noise, and a fast pool duplicates almost every request.
-   */
+    /** Flat minimum hedge delay for small prompts; combined with the size-scaled component. */
+
   minFloorMs?: number;
-  /**
-   * LEGACY alias of `minFloorMs`, kept for backward compatibility — an operator config written
-   * before 2026-09-04 (`{"floorMs": 8000}`) keeps loading and keeps meaning exactly what it always
-   * meant: the floor never drops below 8000 ms. Honoured only when `minFloorMs` itself is absent;
-   * `resolveHedgeSettings` in `hedge-trigger.ts` is the ONE place that resolves the alias, so a new
-   * caller of that function can never re-decide the precedence.
-   */
+    /** Legacy alias for `minFloorMs`, used only when `minFloorMs` is absent. */
+
   floorMs?: number;
   /**
    * The floor's size-scaled component, in ms per estimated INPUT token
@@ -576,21 +418,8 @@ export interface HedgeConfig {
 }
 
 /**
- * `routing.probation` — put an untested FREE deployment at the start of the pool so the relay
- * gathers data on it (owner direction 2026-09-09).
- *
- * **Default ON.** A free-class candidate with fewer than `minSamples` SERVED-REQUEST samples in
- * the probe dataset (the samples `recordRequestSample` writes — probe samples do not count)
- * joins a `probation` band AHEAD of `live`, in config order. It leaves the band by itself as
- * its request samples accumulate, so one untested member at a time gathers data. Breaker
- * cooling, credential faults, hard caps, quota demotion and latency demotion all OUTRANK
- * probation — a cooling probation member goes to `cooling`, a slow one to `slow`.
- *
- * `false` is the documented shorthand for `{ enabled: false }` and restores the pre-probation
- * behaviour exactly, byte for byte. An object with no keys is legal and means the defaults.
- *
- * An unmeasured free primary is already hedged (`hedge-trigger.ts`: unmeasured IS hedged), so
- * a probation member that hangs costs one hedge, not a timeout — no second mechanism here.
+ * `routing.probation`: temporarily lead with under-sampled free candidates so they gather served
+ * request data. Breaker/quota/latency evidence still outranks probation. `false` disables it.
  */
 export interface ProbationConfig {
   /** Default true. false disables the probation band entirely. */
@@ -600,26 +429,8 @@ export interface ProbationConfig {
 }
 
 /**
- * `routing.pacing` — hold the relay's OWN request rate under a ceiling a deployment stated
- * (owner direction 2026-09-10: *"use rate-limited messages to calculate when it might need to
- * slow something down"*; built 2026-09-15, `src/pacing.ts`).
- *
- * **Default ON.** For each credential×model cell, every (axis, period) bucket carrying a stated
- * ceiling — a provider-stated quota header's `limit`, an operator-declared `limits` figure, or a
- * LEARNED `rate-limit-rpm|rpd|tpm|tpd` fact parsed from a 429 body — is held against the
- * attempts this relay itself started in the trailing window of that period (a sliding window
- * over the breaker's per-cell start log; tokens count the request's own input estimate). At or
- * past the ceiling the cell joins a `paced` band behind `live` and `slow`, ahead of the failure
- * bands, and leaves it by itself as the window drains. Breaker cooling, credential faults and
- * quota demotion outrank it.
- *
- * ⚠ A learned ceiling PACES here without the `routing.quota.enforceLearned` opt-in — that is the
- * owner's 2026-09-10 direction and the backlog property ("a 429 that states a window updates
- * that pacing without a human verdict"). `routing.quota`'s own M2 gate is untouched: it governs
- * the ALLOWANCE path (remaining ≤ 0 ⇒ cooling until reset), which is a different question.
- *
- * `false` is the documented shorthand for `{ enabled: false }` and restores the pre-pacing
- * order exactly, byte for byte. An object with no keys is legal and means the defaults.
+ * `routing.pacing`: demote a credential/model cell when this relay's trailing-window attempts
+ * reach a stated or learned rate ceiling. Pacing reorders only and drains automatically.
  */
 export interface PacingConfig {
   /** Default true. false disables the paced band entirely. */
@@ -627,26 +438,8 @@ export interface PacingConfig {
 }
 
 /**
- * `routing.crawl` — abort a COMMITTED stream whose sustained per-token output rate, over a FULL
- * trailing window, is far worse than a deployment's own history supports (backlog item 18, built
- * 2026-09-09, arithmetic corrected the same day — see `DEFAULT_CRAWL_WINDOW_MS` in
- * `src/stream-pipeline.ts` for why the first pairing of defaults could never fire).
- *
- * **Default ON.** `false` is the shorthand for `{ enabled: false }` and restores the pre-crawl
- * behaviour exactly — the watchdog is never installed. An object with no keys is legal and means
- * the defaults. Every number must be finite and positive — the `routing.latency` precedent: a `0`
- * bounds nothing while looking like it does.
- *
- * The rule, in words (full detail on `resolveCrawlSettings` in `src/stream-pipeline.ts`):
- * `minTokens` output tokens must be observed since commit, over the WHOLE stream, before any
- * judgement runs at all; then a window is judged only once it is FULL (elapsed since commit at
- * least `windowMs`); `tokensInWindow` counts only tokens sampled in the trailing `windowMs`, and a
- * full window holding zero tokens yields no opinion (silence is `withStallWatchdog`'s job).
- * Otherwise the rate is `windowMs / tokensInWindow`, and the stream is CRAWLING — aborted — when
- * that rate exceeds `msPerToken`.
- *
- * The thresholds live in `src/stream-pipeline.ts` beside the measurement that calibrated
- * `msPerToken`.
+ * `routing.crawl`: abort a committed stream whose sustained per-token rate over a full trailing
+ * window is below the configured threshold after enough output has been observed.
  */
 export interface CrawlWatchdogConfig {
   /** Default true. false disables the crawl watchdog entirely. */
@@ -719,18 +512,11 @@ export interface LadderRung {
    * substituted here — env values are operator-authored routing, not task content.
    */
   env?: Record<string, string | null>;
-  /**
-   * cli rungs: the most jobs this MCP server process will run against THIS rung at once. A
-   * dispatch walk whose turn reaches a rung already at this many spawned processes SKIPS it for
-   * that walk rather than starting a competing one — see `mcp/lane-runner.ts` `LaneJobStore.inFlight`
-   * and `mcp/server.ts`'s walk. Absent means unbounded, which is the byte-for-byte pre-existing
-   * behaviour: nothing here changes for an operator who never sets it.
-   *
-   * ⚠ The ADMISSION count remains per MCP SERVER PROCESS by design, even though D1 moves physical
-   * process ownership to the daemon. The originating MCP job store counts its own/recovered jobs;
-   * another simultaneously-live MCP process is not folded into that count. Two host sessions can
-   * therefore still exceed this figure together: this is a per-host cap, not a machine-wide semaphore.
+    /**
+   * Per-MCP-process concurrent-job cap for this CLI rung. A full rung is skipped before spawn;
+   * absent means unbounded. Daemon process ownership does not make this a machine-wide semaphore.
    */
+
   maxConcurrent?: number;
   /**
    * Legacy compatibility key. Parsed values warn and have NO routing effect; dispatch derives lane
@@ -761,42 +547,20 @@ export interface ResolvedTarget {
   timeoutMs: number;
   /** Carried from the provider: inter-byte stall watchdog for streamed responses. */
   stallTimeoutMs?: number;
-  /**
-   * RESOLVED time-to-first-byte deadline for a non-streamed attempt (`resolveFirstByteTimeoutMs`)
-   * — an explicit `ProviderConfig.firstByteTimeoutMs`, or `stallTimeoutMs` as the default, or
-   * absent when neither is set. Resolved here so the attempt runner is handed a number and never
-   * re-derives a default from two provider fields. Absent (a hand-built target) means no
-   * first-byte deadline, the pre-2026-09-09 behaviour byte for byte.
-   */
+    /** Resolved non-streamed time-to-first-byte deadline; absent means no first-byte deadline. */
+
   firstByteTimeoutMs?: number;
-  /**
-   * RESOLVED outbound tool-call-id shape (`resolveToolCallIdMode`) — an explicit
-   * `compat.toolCallIds` or the labelled base-host default. Resolved here so the request mapper
-   * is handed a mode and never a provider identity to re-derive one from. Absent (a hand-built
-   * target) reads as `"preserve"`, which is the pre-2026-08-23 behaviour byte for byte.
-   */
+    /** Resolved outbound tool-call-id mode; absent targets default to `preserve`. */
+
   toolCallIds?: ToolCallIdMode;
-  /**
-   * RESOLVED thought-signature mode (`resolveThoughtSignatureMode`) — an explicit
-   * `compat.thoughtSignature` or the labelled base-host default. Resolved here for the same reason
-   * as `toolCallIds`: the request mapper is handed a mode, never a provider identity to sniff one
-   * from. Absent (a hand-built target) reads as `"none"` — the pre-2026-08-23 bytes exactly.
-   */
+    /** Resolved thought-signature mode; absent targets default to `none`. */
+
   thoughtSignature?: ThoughtSignatureMode;
-  /**
-   * RESOLVED wire mode (`ProviderConfig.wire`, absent ⇒ `"chat"`) — carried onto the target at
-   * resolution time, exactly like `toolCallIds`/`thoughtSignature`, so `src/backend.ts` is handed
-   * a mode and never re-derives one from provider identity. Absent (a hand-built target) reads as
-   * `"chat"`, the pre-2026-09-09 behaviour byte for byte.
-   */
+    /** Resolved upstream OpenAI wire mode; absent targets default to `chat`. */
+
   wire?: ProviderWireMode;
-  /**
-   * RESOLVED reasoning-mapping mode (`resolveReasoningMode`) — an explicit `compat.reasoning` or
-   * the labelled base-host default (`api.deepseek.com` ⇒ `"deepseek"`). Resolved here for the same
-   * reason as `toolCallIds`/`thoughtSignature`: the request mapper is handed a mode, never a
-   * provider identity to sniff one from. Absent (a hand-built target) reads as `"none"` — the
-   * pre-2026-09-10 bytes exactly.
-   */
+    /** Resolved reasoning-mapping mode; absent targets default to `none`. */
+
   reasoning?: ReasoningMode;
   /**
    * The routed POOL's effort band, when the request was resolved through a single dynamic pool
@@ -850,13 +614,9 @@ export interface Config {
    *  Only consumer is the runtime offload toggle, which persists back to the same file. */
   sourcePath?: string;
   /**
-   * The config file's mtime (ms since epoch) at the moment `loadConfig` read it — paired with
-   * `sourcePath` for the config-staleness notice (`configStaleness()` below). Set by `loadConfig`
-   * as a NON-ENUMERABLE property (see there) so it never appears in a `JSON.stringify` of the
-   * whole config, a `toEqual` comparison of a loaded `Config`, or `Object.keys(cfg)`; absent for
-   * a hand-built test config with no backing file. The relay does not hot-reload — this field
-   * exists only to let the relay and the CLI SAY so, never to trigger a reload.
-   */
+ * Config-file mtime at the last successful load/reload, paired with `sourcePath` for staleness
+ * reporting. Non-enumerable and absent for hand-built configs.
+ */
   sourceMtimeMs?: number;
   /**
    * Non-fatal load-time problems (a provider disabled for an unset `${ENV}`, a pool member
@@ -879,14 +639,9 @@ export interface LaneProbeSettings {
 export interface DispatchWalkSettings {
   enabled: boolean;
   /**
-   * How long a lane may show NO activity before the walk stops it and starts the next one. Default
-   * 300000 (5 minutes). Activity is a request the relay daemon serves with the lane's tag, the lane's
-   * own output, owned process-tree CPU, or a change in its git working tree (`mcp/server.ts` `latestActivity`).
-   *
-   * ⚠ Owner decision 2026-09-17: a lane is stopped only when it is IDLE, never because it ran longer
-   * than its past runs. The five minutes covers a lane that runs a long command (a test suite) and
-   * sends no model traffic meanwhile. The last lane in a walk is never stopped.
-   */
+ * Maximum observed inactivity before a walk may stop a non-final lane. Activity includes relay
+ * traffic, lane output, owned-process CPU, or working-tree change. The final lane is never idle-stopped.
+ */
   idleMs: number;
   /**
    * Legacy pre-v0.84 attempt-budget floor. Retained and validated so existing configs keep loading,
@@ -914,11 +669,9 @@ export interface DispatchWalkSettings {
   /** How long a lane the walk abandoned is ordered behind undemoted lanes. */
   demoteMs: number;
   /**
-   * Recent-versus-earlier outlier demotion (backlog item 9): demote a lane whose recent runs
-   * are an outlier against its OWN earlier history, on a threshold calibrated from that
-   * history (`scripts/calibrate-lane-outlier.mjs`, defaults in `lane-affinity.ts`).
-   * Default ON; `false` makes the rule inert while rows still carry their timestamps.
-   */
+ * Recent-versus-earlier own-history outlier demotion. Default on; `false` disables the reordering
+ * term while retaining recorded history.
+ */
   outlier: false | DispatchWalkOutlierSettings;
 }
 
@@ -971,27 +724,15 @@ export interface McpSettings {
 }
 
 /**
- * Default `routing.mcp.blockingWaitMs` — 25 minutes.
- *
- * Measured and documented 2026-09-17 (`docs/history/mcp-host-timeouts-2026-09-17.md`): Claude Code's
- * wall-clock tool limit (`MCP_TOOL_TIMEOUT`) defaults to about 28 hours, and a 240 s call succeeded
- * headless with and without progress. Its stdio idle timeout is 30 minutes, and the documentation
- * says a progress notification resets it. The default stays under 30 minutes so the call survives
- * even if that reset does not happen. A lane still running at the cap degrades to polling.
+ * Default long blocking wait for hosts proven to tolerate it and supplying progress: 25 minutes,
+ * below the 30-minute stdio idle ceiling. Other hosts use their shorter wait policy.
  */
+
 export const DEFAULT_MCP_BLOCKING_WAIT_MS = 1_500_000;
 
 /**
- * Default `routing.mcp.maxWaitMs` — the longest one `dispatch` tool call blocks before handing
- * back a job id to poll.
- *
- * It must end before the SHORTEST host limit, because above a host's limit the host fails the call
- * AND loses the job handle. Two limits are measured on this machine: Claude Code fails an MCP call
- * somewhere between 45 s and 100 s, and Codex's code-mode `exec` tool yields its script at 31.0 s
- * with empty output ("Script running with cell ID N / Wall time 31.0 seconds"). The 2026-09-10
- * transcript sweep counted 29 of 266 first Codex dispatch calls that lost their job id that way
- * while this default was 40 s (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §8). 25 s sits under
- * both. The tool description names the config key rather than this figure, so an operator override
- * never leaves the text stale.
+ * Default ordinary MCP blocking wait: 25 seconds, below the shortest measured host tool-call
+ * ceiling so a slow lane returns a pollable job id before the host abandons the call.
  */
+
 export const DEFAULT_MCP_MAX_WAIT_MS = 25_000;

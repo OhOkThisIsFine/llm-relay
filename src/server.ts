@@ -425,23 +425,8 @@ function pickBool(obj: unknown, key: string): boolean {
 }
 
 /**
- * The context ceiling this relay may hold a deployment to, and WHICH rung stated it.
- *
- * Two rungs, most-authoritative first — the `contextWindowResolver` order, minus its snapshot rung:
- *
- * 1. `observed` — a `context-limit` fact recorded when THIS deployment stated its own maximum while
- *    refusing an over-length request (`context-limits.ts`, deployment scope, 30-day TTL). It is
- *    first-party evidence about the exact deployment, which a catalogue figure can contradict by
- *    being generic or stale.
- * 2. `published` — the serving provider's own `contextLength` from the catalogue, read cache-only.
- *
- * Null when neither rung answers, and null must stay "no guardrail": the request goes upstream and
- * the backend returns its own authoritative error. ⚠ There is deliberately no invented third rung —
- * a 400 built from a number nobody stated is worse than a true upstream error.
- *
- * ⚠ The BASIS travels with the number because the refusal body names it. Reporting a learned
- * measurement as something the provider "publishes" is the one thing the provenance invariant
- * forbids, and the body said exactly that for every rung until 2026-09-01.
+ * Context ceiling for one deployment, with provenance. Observed first-party limits outrank
+ * provider-published catalog values; no evidence means no relay-side ceiling.
  */
 export function contextCeilingFor(
   target: ResolvedTarget,
@@ -499,7 +484,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
     reqBuf = await readBody(req, cfg.maxBodyBytes ?? DEFAULT_MAX_BODY_BYTES);
   } catch (e) {
     const msg = (e as Error).message;
-    // Classified by the code `readBody` set, never by its message (contract review DR-005).
+    // Classify by `readBody`'s code, never by matching error text.
     const status = bodyReadStatus(e);
     if (isCallerVisibleAccountingPath(req.method, pathname)) {
       recordEarlyTerminalAccounting(h.accountingRecorder, started, requestClient);
@@ -666,8 +651,7 @@ async function handle(req: IncomingMessage, res: ServerResponse, cfg: Config, h:
           routingNow,
           h.quotaDemotion,
           h.costClassOf,
-          // `latencyDemotion` intentionally not threaded here — a pre-existing gap at this call
-          // site, unchanged by this packet.
+          // Sticky-pin admission currently does not apply latency demotion at this call site.
           undefined,
           h.probation,
           h.pacing,
@@ -819,11 +803,8 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       : deps.laneExecutionBroker ??
         new LaneExecutionBroker(createConfiguredLaneExecutionLauncher(cfg, { catalog }));
   const laneCadence = process.env.VITEST ? null : new LaneCadence(cfg);
-  // The breaker is built BEFORE the ping loop because the loop holds a narrow port onto it
-  // (`rateLimitRecovery`, 2026-09-15): a probe that answers 200 ends a 429-sourced cooldown
-  // early, and the loop re-probes the cells cooling on the relay's own guessed rungs. The port is
-  // the breaker itself — `CircuitBreaker` satisfies `RateLimitRecoveryPort` structurally — so
-  // there is no adapter to drift. An injected `deps.pingLoop` (a test's stub) keeps its own wiring.
+  // The ping loop reads/writes breaker recovery state, so construct the breaker first and pass it
+  // through the narrow recovery port. Injected ping-loop stubs keep their own wiring.
   const breaker = deps.breaker ?? new CircuitBreaker();
   const pingLoop =
     deps.pingLoop ??
@@ -834,9 +815,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   if (!process.env.VITEST) installBreakerPersistence(breaker);
   if (!process.env.VITEST) installDispatchExhaustionPersistence(cfg);
   if (!process.env.VITEST) installDispatchLaneStatsPersistence(cfg);
-  // Lane pins and demotions survive a restart for the same reason cooldowns do: the daemon is the
-  // ONE writer (the MCP child reports, the daemon records), and a preference re-learned from
-  // scratch on every restart would send every walk back to the lane it just abandoned.
+  // The daemon owns lane-affinity persistence; MCP children only report outcomes.
   if (!process.env.VITEST) installLaneAffinityPersistence(cfg);
   const credentialLru = new CredentialLru();
   const modelCallRecorder: ModelCallRecorder | undefined = deps.modelCallRecorder ?? (process.env.VITEST ? undefined : recordModelCall);
@@ -875,7 +854,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   });
   const latencyDemotion = createLatencyDemotionFn({
     readPings: (provider, model) => pingLoop.getModelPings(provider, model),
-    // D2: read through the live Config identity so a committed reload changes new requests.
+    // Read through the live Config identity so reloads affect new requests.
     get settings() {
       return cfg.routing.latency;
     },
@@ -890,20 +869,9 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
     }
   };
   /**
-   * A 404 stating that a model does not exist is evidence the provider's ROSTER moved, so re-fetch
-   * it rather than waiting out the TTL (`ModelCatalog.noteProviderStale`).
-   *
-   * The containment lives here, where the catalog is: the model must be one the relay CURRENTLY
-   * LISTS for that provider. A 404 for a model the catalog never listed (a caller naming something
-   * that never existed, a typed id, another provider's SKU) contradicts no roster and there is
-   * nothing to refresh — re-fetching on it would let a single client drive a provider's `/models`
-   * endpoint with requests that are simply wrong. `cachedModels` is synchronous and cache-only, so
-   * this costs no network I/O and never blocks the failing request it is riding on.
-   *
-   * The provider CONFIG is read through the same map `resolveTargets` used, and a provider that
-   * vanished from it resolves to nothing — a refresh for it would be a fetch the config no longer
-   * describes, so it is skipped rather than attempted with a synthesized target.
-   */
+ * Mark a provider catalog stale only when a failing model is currently listed for that provider.
+ * This is a cache-only hint; unknown/removed providers or unlisted model ids trigger no refresh.
+ */
   const catalogStale = (attempt: ResolvedAttempt): void => {
     try {
       const t = attempt.target;
@@ -917,28 +885,22 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       // observer on this path.
     }
   };
-  // routing.probation (owner direction 2026-09-09): an untested FREE deployment leads its pool
-  // so the relay gathers data on it. `readRequestSamples` is `countRequestSamples` from
-  // `ping/probe-cache.ts` bound with no explicit path — the real, default probe cache, same
-  // singleton `latencyDemotion` above reads through `pingLoop`. Tests inject their own stub
-  // through `ProbationDeps.readRequestSamples` rather than this real seam.
+  // Probation uses the default request-sample cache; tests inject a separate reader.
   const probationDeps: ProbationDeps = {
     readRequestSamples: countRequestSamples,
-    // D2: the evaluator reads this property on every call; do not snapshot reloadable policy.
+    // Read policy on every call so reloads take effect without rebuilding the evaluator.
     get settings() {
       return cfg.routing.probation;
     },
     costClassOf,
   };
   const probation: ProbationFn = createProbationFn(probationDeps);
-  // routing.pacing (owner direction 2026-09-10): hold this relay's own attempt rate under a
-  // ceiling the deployment stated. Reads the breaker's per-cell attempt-start log — the ONE
-  // dataset every egress on both fronts feeds through `beginHealthAttempt` — so every client on
-  // the machine that routes through the relay is counted against the same window.
+  // Pacing uses the breaker's shared attempt-start log, so both request fronts count against the
+  // same deployment window.
   const pacing: PacingFn = createPacingFn({
     cfg,
     breaker,
-    // D2: pacing policy changes with the same in-place Config commit as its configured limits.
+    // Read pacing policy from the live config so reloads apply immediately.
     get settings() {
       return cfg.routing.pacing;
     },

@@ -1,38 +1,8 @@
 /**
- * The read-only dispatch boundary — a MECHANISM, not an instruction.
- *
- * WHY THIS EXISTS. Three measured cases, all of which a prompt failed to prevent:
- *
- * - 2026-09-04: a prompt said "do NOT edit any file"; the lane created a scratch parser in the
- *   caller's checkout before it timed out, caught only by `git status` afterwards.
- * - 2026-09-05: a lane told "do not edit any file; output a unified diff" edited a spec file and
- *   then REVERTED it in both worktree and index — after the orchestrating session had staged its
- *   own edit to the same file, so a commit landed with only its ledger half. A lane in the live
- *   checkout can silently undo STAGED work, not merely add scratch files.
- * - 2026-09-09: an independent READ-ONLY review returned after 1,151 s reporting a commit and push
- *   of nine of the caller's in-progress files.
- *
- * ⚠ So this module refuses rather than instructs. A read-only agent dispatch whose working
- * directory would sit inside the caller's tree is REFUSED up front, naming the two things the
- * operator can do instead: run it against a separate checkout, or use answer mode — which has no
- * filesystem access at all, because it posts straight to the relay and spawns no harness.
- *
- * ⚠ POLICY DECISION, STATED (2026-09-10, needs-owner item) — and EXTENDED 2026-09-15. The two
- * candidates were a separate checkout and a read-only tool set. The 2026-09-10 choice was the
- * checkout alone, on the argument that the tool set is chosen by the lane. That was measured
- * insufficient five days later: a review lane run with `readOnly: true` in a SEPARATE worktree
- * still made "three scratch edits to source files" to re-measure something, restoring each from a
- * backup — clean by luck, enforced by nothing (C:\Code\docs\backlog.md, 2026-09-15). So `readOnly`
- * now binds BOTH: the working directory (`readOnlyVerdict`, unchanged) AND the lane's tool set
- * (`readOnlyInvoke`), by rewriting the invocation the relay is about to spawn. The relay authors
- * that command line — it substitutes `{task}` and `{spec}` into the template already — so it can
- * also state the permission flags the lane's own CLI documents for read-only use.
- *
- * ⚠ Only where the lane's CLI DOCUMENTS such a binding. A lane kind with no command-line way to
- * restrict its tools (OpenCode sets permissions per agent in its own config; AGY's permission
- * flags are unverified here) is REFUSED for a read-only dispatch, naming the gap — never run
- * unbound under a flag that claims protection. That is the closed-vocabulary rule: an unhandled
- * lane kind falls to the WEAKER claim (cannot bind ⇒ do not run), never the stronger one.
+ * Read-only dispatch enforcement. Prompt instructions are insufficient: agent mode is permitted only
+ * when the working directory is outside the caller's protected tree and the selected harness has a
+ * verified read-only tool binding. Answer mode spawns no harness and needs no filesystem binding.
+ * Unknown harnesses fail closed rather than running with unrestricted tools.
  */
 import { resolve as resolvePath } from "node:path";
 import { laneOfRung } from "../lane-manifest.js";
@@ -52,16 +22,9 @@ export interface ReadOnlyRequest {
 export type ReadOnlyVerdict = { ok: true; cwd: string } | { ok: false; refusal: string };
 
 /**
- * Decide whether a read-only dispatch may proceed, and say why not when it may not.
- *
- * Containment is tested on RESOLVED paths with a separator boundary, never a bare `startsWith`:
- * `C:/caller/tree-other` shares a prefix with `C:/caller/tree` and is not inside it, and a literal
- * `..` segment resolves at the OS level before the comparison — the `checkCwd` defect closed
- * 2026-09-03 (docs/history/audit-findings-2026-09-03.md finding 1 / DR-002), applied here in the direction
- * where getting it wrong would WRONGLY PERMIT a mutation.
- *
- * Answer mode is always allowed: `startLane` skips the cwd/spawn path entirely for a `relay` rung
- * in answer mode, so there is no process and no working directory to confine.
+ * Decide whether a read-only dispatch may use this cwd. Containment uses resolved paths plus a
+ * separator boundary, so shared prefixes and `..` segments cannot bypass the protected tree.
+ * Answer mode is always allowed because it spawns no filesystem-capable harness.
  */
 export function readOnlyVerdict(req: ReadOnlyRequest): ReadOnlyVerdict {
   if (!req.readOnly) return { ok: true, cwd: resolveReadOnlyCwd(req.cwd) };

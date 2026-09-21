@@ -6,16 +6,16 @@
 
 ## Goal
 
-Turn the large post-v0.85.0 `main` delta into a trustworthy released checkpoint, then resume feature
-development from a clean baseline.
+Finish the remaining live evidence gates, then implement active hard-cap continuation one verified
+harness at a time without weakening process ownership, routing, or telemetry semantics.
 
-The ordering is intentional:
+Phases 1–3 below are complete and retained as evidence. Active sequencing is:
 
-1. correctness evidence before new architecture;
-2. repository enforcement before relying on CI as a merge gate;
-3. a release checkpoint before another large subsystem change;
-4. external/evidence-blocked work separated from source work;
-5. active hard-cap continuation implemented incrementally, one verified harness at a time.
+1. close external/operator evidence when inputs are available;
+2. verify at least one harness with both exact-resume and same-cwd isolation measurements;
+3. add behavior-neutral continuation state;
+4. implement one verified harness end to end;
+5. expand routing continuity, telemetry, and additional harnesses incrementally.
 
 ## Phase 1 — persistence-concurrency uncertainty — completed 2026-09-21
 
@@ -164,9 +164,9 @@ Implement it as separate packets.
 **First-party survey and repeatable measurement tooling complete:** see
 [`active-hard-cap-harness-survey-2026-09-21.md`](active-hard-cap-harness-survey-2026-09-21.md).
 Manual probes now exist for AGY, Claude, Codex and OpenCode and share one shell-free process/NDJSON
-helper. The remaining gate is live evidence: no harness is implementation-ready until an exact-ID
-interruption/resume probe succeeds. Phase 5.2 remains intentionally blocked while quota/provider
-capacity prevents that measurement.
+helper. The remaining gate is live evidence: no harness is implementation-ready until both its
+exact-ID interruption/resume probe and same-cwd isolation probe succeed. Phase 5.2 remains
+intentionally blocked while quota/provider capacity prevents those measurements.
 
 For Claude, Codex, AGY and OpenCode, measure:
 
@@ -235,7 +235,7 @@ tested. Unsupported harnesses keep the current timeout semantics.
 | 2 | Required CI checks on `main` | repository admin | **complete** |
 | 3 | Release-readiness audit and release | verification/release | **complete — v0.86.0 published** |
 | 4 | M1 and live/vendor/operator blockers | evidence/operations | close as inputs become available |
-| 5 | Continuation harness survey + probe tooling | design/evidence | **tooling complete; live exact-resume result pending** |
+| 5 | Continuation harness survey + probe tooling | design/evidence | **tooling complete; live exact-resume + isolation result pending** |
 | 6 | Continuation substrate | source | no behavior change, gate green |
 | 7 | First harness continuation | source | active rollover proved end to end |
 | 8 | Routing continuity + telemetry | source | logical-attempt semantics preserved |

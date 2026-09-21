@@ -6,14 +6,7 @@ import { isRecord } from "./json-shape.js";
 import { estimateTokensFromCharacters } from "./metadata.js";
 import { BufferedSseFrames, parseSseEvent } from "./sse-frames.js";
 
-/**
- * The code `readBody` sets when it refused a body for exceeding the cap. Owned HERE, by the
- * thrower, since 2026-09-04 (contract review DR-005): `dashboard-routes.ts` re-exports it for its
- * own classifier, and `server.ts` classifies 413-vs-400 through `bodyReadStatus` below. Both
- * consumers read this TAG. Until this date the data plane still regex-matched the MESSAGE
- * ("too large") — the relay inferring its own intent from prose it had written itself, the
- * inference the dashboard route had already stopped making.
- */
+/** Stable error code used by all body readers to distinguish size refusal from other read failures. */
 export const BODY_TOO_LARGE_CODE = "ERR_DASHBOARD_BODY_TOO_LARGE";
 
 /** 413 when `readBody` refused the body for size; 400 for any other body-read failure. */
@@ -96,8 +89,7 @@ export function readBody(req: IncomingMessage, maxBytes = DEFAULT_MAX_BODY_BYTES
         cleanup();
         // Drain without retaining the rest so the client can receive the explicit 413 response.
         req.resume();
-        // Tagged, not described: both consumers classify from this CODE — the dashboard route
-        // 413-vs-500, the data plane 413-vs-400 via `bodyReadStatus` — never from the message.
+        // Consumers classify by this code, never by parsing the error message.
         reject(Object.assign(new Error("request body too large"), { code: BODY_TOO_LARGE_CODE }));
         return;
       }
@@ -163,51 +155,16 @@ export function withStallWatchdog(response: Response, controller: AbortControlle
 }
 
 /**
- * Default crawl-abort threshold: ms per output token, sustained over a full trailing window, above
- * which a COMMITTED stream is judged CRAWLING rather than merely producing a long answer.
- *
- * Calibrated 2026-09-09, on the `latency-demotion.ts` precedent: 4 x `DEFAULT_LATENCY_MS_PER_TOKEN`
- * (250 ms/token, itself measured over 68 real requests on 2026-08-30 — see that file's own
- * comment). A crawl abort hands the client a failure it must retry — measured in
- * `docs/history/post-commit-stall-measurement-2026-09-09.md`: Claude Code retries once, downgraded to a
- * NON-STREAMING request; Codex retries up to five times, staying streaming, in all four measured
- * cells — so the bar must sit far above the demotion threshold, or a deployment merely slow enough
- * to be latency-demoted would also be aborted mid-response. 250 ms/token is itself ~3.5x the
- * healthy band measured that day, so 1000 ms/token sits well clear of ordinary slow-but-working
- * traffic. A tunable default, not a provider fact — the provenance invariant permits this.
- * Re-calibrate by reading `~/.llm-relay/usage/recent.json` the same way `latency-demotion.ts`
- * describes; there is no dedicated crawl-abort log field to read back yet (see the accepted gaps
- * in `docs/backlog.md`'s "Build the post-commit CRAWL abort" entry once it is amended).
+ * Default sustained crawl threshold for a committed stream. It is deliberately much slower than
+ * the latency-demotion threshold because aborting a stream is stronger than merely reordering it.
  */
 export const DEFAULT_CRAWL_MS_PER_TOKEN = 1000;
 /**
- * Width of the trailing window the crawl rate is measured over, in ms — and, since the rate is
- * `windowMs / tokensInWindow` (see `withCrawlWatchdog`), also the numerator of every rate this
- * watchdog ever computes.
- *
- * Corrected 2026-09-09 (fixing a same-day defect the packet that introduced this watchdog shipped
- * uncaught): the ORIGINAL pairing of `windowMs: 20_000` with `minTokens: 50` could never fire.
- * That version measured `spanMs = min(elapsed, windowMs)` — so `spanMs` never exceeded 20 000 —
- * and required `tokensInWindow >= minTokens` (50) before judging `rate = spanMs / tokensInWindow`.
- * The worst case allowed was 20 000 ms / 50 tokens = 400 ms/token, which can never clear a 1000
- * ms/token threshold: the three defaults were mutually inconsistent by construction, and the
- * measured scenario this watchdog exists for (60 tokens over 90 s, one every 1.5 s) could not trip
- * it either. The rule is now: judge only once a FULL window has elapsed since commit
- * (`elapsed >= windowMs`), then take `tokensInWindow` as the tokens sampled in the trailing
- * `windowMs` and compute `rate = windowMs / tokensInWindow` (a fixed numerator, not a growing
- * `spanMs`) — so with `windowMs: 30_000` and `msPerToken: 1000`, fewer than 30 tokens landing in
- * any trailing 30 s window trips the abort, which the 90 s/60-token scenario clears easily (one
- * token per 1.5 s is roughly 20 tokens per 30 s window).
+ * Trailing window width for crawl rate. The watchdog judges only full windows and computes
+ * `windowMs / tokensInWindow`; zero-token windows are left to the stall watchdog.
  */
 export const DEFAULT_CRAWL_WINDOW_MS = 30_000;
-/**
- * Minimum output tokens that must be observed SINCE COMMIT — across the whole stream, not just the
- * trailing window — before ANY judgement runs at all: evidence the stream is producing an answer
- * in the first place, distinct from `tokensInWindow` below. A window judged before this gate clears
- * would be able to abort a stream that has barely started, on the strength of a single early burst
- * falling silent — exactly the case the SEPARATE "full window holding zero tokens" rule below
- * already declines to judge, stated as its own gate so the two can be tested apart.
- */
+/** Minimum total output tokens observed since commit before crawl-rate judgments may begin. */
 export const DEFAULT_CRAWL_MIN_TOKENS = 20;
 
 export interface CrawlWatchdogSettings {
@@ -218,18 +175,8 @@ export interface CrawlWatchdogSettings {
 }
 
 /**
- * Resolve `routing.crawl` into a total settings object. Absent, `{}`, or any missing key means
- * the tunable default for that key — the `resolveHedgeSettings`/`resolveLatencyDemotion`
- * precedent.
- *
- * The rule `withCrawlWatchdog` enforces, in words: `minTokens` (default 20) is the minimum number
- * of output tokens observed since commit — over the WHOLE stream — before any judgement runs at
- * all, evidence the stream is producing an answer. A window is judged only once it is FULL —
- * elapsed time since commit at least `windowMs` (default 30 000). `tokensInWindow` counts only the
- * tokens whose sample time falls inside the trailing `windowMs`; a full window holding zero tokens
- * yields no opinion at all (silence is `withStallWatchdog`'s job, and this watchdog must never
- * pre-empt it). Otherwise `rate = windowMs / tokensInWindow`, and the stream is CRAWLING — the
- * fetch is aborted — when `rate > msPerToken` (default 1000).
+ * Resolve `routing.crawl` into total settings. A full trailing window is judged only after the
+ * minimum total output-token gate; non-empty windows exceeding `msPerToken` are aborted.
  */
 export function resolveCrawlSettings(raw: CrawlWatchdogConfig | undefined): CrawlWatchdogSettings {
   return {

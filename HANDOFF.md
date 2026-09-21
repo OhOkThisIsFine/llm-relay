@@ -4,25 +4,20 @@ Entry point for any agent picking up llm-relay. Read this before `CLAUDE.md`.
 
 ## 0. Current state — 2026-09-21
 
-The repository is in a consolidation phase after a large post-v0.85.0 development run.
+The repository is on the published v0.86.0 baseline and is waiting on live continuation evidence.
 
 - Published package version: **0.86.0**.
-- `main` contains the architecture published in **v0.86.0**. The release passed protected CI on
-  the final source head and publish run 167 passed ancestry/version checks, clean packed-artifact
-  install smoke, `npm run check`, and `npm publish`.
-- Current `main` CI is green:
-  - 4,490 core tests passed, 4 skipped;
+- `main` contains the architecture published in **v0.86.0**.
+- Current `main` CI (run 779) is green:
+  - 4,510 core tests passed, 4 skipped;
   - 46 dashboard tests passed;
-  - 51 targeted Windows process-boundary/concurrency tests passed;
+  - 57 targeted Windows process-boundary/concurrency tests passed;
   - build, typecheck, package checks and packed-dashboard smoke passed.
 - D1 restart-safe daemon-owned lane execution is implemented.
 - D2 transactional config hot reload is implemented.
 - Public dispatch/liveness state is explicit rather than inferred from circumstantial clues.
-- Multi-process journal/archive mutations use cross-process transactional locking. The 2026-09-21
-  Windows row-loss investigation made transactions fail closed on unreadable existing JSON, stopped
-  unrelated journal writes from garbage-collecting foreign rows, and the release gate subsequently
-  exposed a transient Windows `rename(tmp, target)` `EPERM`; the v0.86.0 candidate retries only
-  transient Windows replacement errors for a bounded ~1 s while retaining the lock and temp file.
+- Multi-process journal/archive mutations are transactionally locked and tolerate bounded transient
+  Windows replacement failures without weakening atomic writes.
 - Lane capability is derived from synced model evidence/pool bands; the legacy hand-set capability
   value has no routing authority.
 - Repeated 402/5xx failures use bounded recovery escalation and remain eligible for failover.
@@ -32,27 +27,13 @@ The repository is in a consolidation phase after a large post-v0.85.0 developmen
 
 ### Immediate next
 
-**v0.86.0 is published.** Phase 3 is complete. The first-party hard-cap continuation survey
-and repeatable probe tooling are complete for AGY, Claude, Codex and OpenCode. No harness is yet
-verified resumable: the live probes require available harness/provider quota. Do not add Phase 5.2
-continuation substrate until at least one exact-ID interruption/resume probe succeeds. When capacity
-is available, build once with `npm run build:server` and run the corresponding
-`scripts/measure-*-continuation.mjs`. Evidence/vendor/operator blockers remain parallel work.
+All quota-independent continuation preparation is complete: the first-party survey, four exact-ID
+interruption/resume probes, and same-cwd two-job isolation probe are in `main`. Live verification
+is currently blocked by harness/provider capacity. Do not begin Phase 5.2 until one harness passes
+both its single-job probe and `scripts/measure-continuation-isolation.mjs <harness>`.
 
 Audit evidence:
 [`docs/history/release-readiness-audit-2026-09-21.md`](docs/history/release-readiness-audit-2026-09-21.md).
-
-Persistence and repository enforcement are no longer blockers:
-- the concurrency investigation found three correctness holes: unrelated journal writes filtered
-  foreign rows through liveness; transactional reads could silently treat an existing
-  unreadable/invalid JSON file as empty; and a lock contender propagated a stale rename error when
-  the incumbent released the lock between the failed rename and the contender's path inspection;
-- the lock-release race now has a deterministic regression, and the real four-process
-  journal+archive regression runs five independent rounds per CI execution;
-- the regression fixture surfaces per-worker journal/archive commit failures instead of hiding them
-  until the final assertion;
-- repository ruleset `Protect main` is active on the default branch and requires both `check` and
-  `windows-process-boundary`, with no bypass actors.
 
 Work in this order:
 

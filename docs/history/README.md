@@ -1,11 +1,15 @@
 # Historical records
 
-**These files are evidence, not documentation. Do not read them as instructions.**
+Most files here are dated evidence, not live instructions. A statement in an old record can be
+wrong today and may be superseded deliberately.
 
-Each file here records what was true on the date in its name: a design decision and the
-measurements behind it, an audit and its findings, or a lap closeout. The project moved on
-afterwards. A statement in one of these files can be wrong today, and several are contradicted
-on purpose by a later record.
+Two dated files are current working records and say so in their headers:
+
+- [`development-plan-2026-09-21.md`](development-plan-2026-09-21.md) — active development sequence;
+- [`active-hard-cap-harness-survey-2026-09-21.md`](active-hard-cap-harness-survey-2026-09-21.md) —
+  current continuation capability/probe gate.
+
+`HANDOFF.md` and `docs/backlog.md` remain authoritative for current state and unmet properties.
 
 ## Where to read instead
 
@@ -31,9 +35,10 @@ Two reasons.
 
 ## How to use one
 
-1. Read the date in the file name. Treat every claim as a claim about that date.
+1. Check the file header: an active working record says so explicitly; otherwise treat claims as
+   claims about the date in the filename.
 2. Check the claim against the source before you act on it.
-3. If the record and the current code disagree, the code wins. Say so in your change.
+3. If a historical record and current code disagree, the code wins. Say so in your change.
 
 ## Naming
 
