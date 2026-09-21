@@ -20,7 +20,7 @@ manual generated-output attributions.
 
 | Asset source | Attribution | License |
 | --- | --- | --- |
-| Tailwind Preflight, components and utilities emitted from `dashboard/src/styles.css` | `tailwindcss@3.4.19`, Copyright (c) Tailwind Labs, Inc. | MIT |
+| Tailwind Preflight, components and utilities emitted from `dashboard/src/styles.css` | `tailwindcss@4.3.3`, Copyright (c) Tailwind Labs, Inc. | MIT |
 
 ## Generated virtual-runtime helpers
 
