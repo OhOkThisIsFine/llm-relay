@@ -1811,6 +1811,181 @@ export class McpDispatchServer {
     }
   }
 
+  /** Reconcile every restart artifact without delaying MCP initialize/tool discovery. */
+  private async restoreRestartedJobs(): Promise<void> {
+    await Promise.all([
+      this.restoreKilledTreeDeltas(),
+      this.restoreBrokerOrphans(),
+    ]);
+  }
+
+  /**
+   * Reconcile daemon-backed rows this MCP process atomically claimed from the running journal.
+   * A row is materialized as RUNNING first, so transport/auth failure remains an honest
+   * "recovery unavailable" state rather than a fabricated death. A reachable daemon 404 is the
+   * only absence that becomes killed.
+   */
+  private async restoreBrokerOrphans(): Promise<void> {
+    const rows = this.jobs.takeBrokerOrphans();
+    await Promise.all(rows.map(async (row) => {
+      const job = this.jobs.adoptBrokerRunning(row);
+      if (job === undefined) return;
+
+      if (row.startingTree !== undefined) {
+        const before: TreeSnapshot = {
+          prefix: row.startingTree.prefix,
+          entries: new Map(row.startingTree.entries),
+        };
+        const current = await this.readTree(row.cwd);
+        this.trees.set(row.jobId, {
+          cwd: row.cwd,
+          before,
+          scope: row.startingTree.scope,
+          ...(current === null ? {} : { activityLastSeen: current }),
+        });
+      }
+
+      await this.refreshBrokerJob(row.jobId);
+    }));
+  }
+
+  /** Refresh every recovered daemon execution before rendering the machine-wide recent-job list. */
+  private async refreshAllBrokerJobs(): Promise<void> {
+    const pending = this.jobs
+      .list()
+      .filter((job) => job.status === "running" && this.jobs.brokerExecution(job.id) !== undefined)
+      .map((job) => this.refreshBrokerJob(job.id));
+    await Promise.all(pending);
+  }
+
+  /**
+   * Refresh one daemon-owned job. Returns true when it was broker-backed, even if the broker is
+   * temporarily unreachable. Never converts transport failure or malformed success JSON into death.
+   */
+  private async refreshBrokerJob(jobId: string): Promise<boolean> {
+    const executionId = this.jobs.brokerExecution(jobId);
+    if (executionId === undefined) return false;
+
+    const client = this.deps.laneExecutionClient;
+    if (client === undefined) {
+      this.noteBrokerRecoveryUnavailable(jobId, "broker-client-unavailable");
+      return true;
+    }
+
+    const result = await client.request({ action: "status", executionId });
+    if (!result.ok) {
+      if (result.kind === "rejected" && result.status === 404) {
+        const killed = this.jobs.markBrokerKilled(
+          jobId,
+          "the relay daemon is reachable but no longer knows this recovered lane execution; " +
+            "the execution ended outside the retained broker window or the daemon restarted",
+        );
+        if (killed) {
+          this.brokerCpu.delete(jobId);
+          await this.recordTreeDelta(jobId);
+        }
+      } else {
+        this.noteBrokerRecoveryUnavailable(
+          jobId,
+          result.kind === "invalid-response" ? "broker-response-invalid" : "broker-unavailable",
+        );
+      }
+      return true;
+    }
+
+    const snapshot = result.execution;
+    if (!this.jobs.applyBrokerSnapshot(jobId, snapshot)) {
+      this.noteBrokerRecoveryUnavailable(jobId, "broker-response-mismatch");
+      return true;
+    }
+
+    if (snapshot.status === "running") {
+      await this.noteRecoveredBrokerLiveness(jobId, snapshot);
+    } else {
+      this.brokerCpu.delete(jobId);
+      await this.recordTreeDelta(jobId);
+    }
+    return true;
+  }
+
+  /** A broker outage is uncertainty, not evidence that the lane stopped. */
+  private noteBrokerRecoveryUnavailable(jobId: string, source: string): void {
+    const job = this.jobs.get(jobId);
+    if (job === undefined || job.status !== "running") return;
+    this.jobs.noteLiveness(jobId, {
+      activity: "unmonitored",
+      verdict: "no-idle-stop",
+      checkedAt: this.now(),
+      idleBaselineAt: job.activity?.attemptStartedAt ?? job.startedAt,
+      lastActivityAt: job.liveness?.lastActivityAt ?? null,
+      source,
+      idleMs: null,
+    });
+  }
+
+  /**
+   * Publish liveness for a recovered daemon execution. This process is only an observer/collector:
+   * it never idle-stops or advances the old walk, hence the no-idle-stop verdict.
+   */
+  private async noteRecoveredBrokerLiveness(
+    jobId: string,
+    snapshot: LaneExecutionSnapshot,
+  ): Promise<void> {
+    const now = this.now();
+    const seen: Array<{ at: number | null | undefined; source: string }> = [
+      { at: snapshot.lastOutputAt, source: "lane-output" },
+      snapshot.relayInFlight !== undefined && snapshot.relayInFlight > 0
+        ? { at: now, source: "relay-in-flight" }
+        : { at: snapshot.relayLastActivityAt, source: "relay-traffic" },
+    ];
+
+    if (snapshot.cpuMs !== undefined) {
+      const previous = this.brokerCpu.get(jobId);
+      this.brokerCpu.set(jobId, snapshot.cpuMs);
+      if (previous !== undefined && snapshot.cpuMs - previous >= PROCESS_CPU_ACTIVITY_MS) {
+        seen.push({ at: now, source: "process-cpu" });
+      }
+    }
+
+    const tree = this.trees.get(jobId);
+    const reading = tree === undefined ? null : await this.readTree(tree.cwd);
+    if (tree !== undefined && reading !== null) {
+      const previous = tree.activityLastSeen;
+      tree.activityLastSeen = reading;
+      if (previous !== undefined) {
+        seen.push(
+          sameTree(previous, reading)
+            ? { at: newestChangeMs(tree.cwd, reading), source: "file-change" }
+            : { at: now, source: "working-tree" },
+        );
+      }
+    }
+
+    const previous = this.jobs.get(jobId)?.liveness;
+    if (previous?.lastActivityAt !== null && previous?.lastActivityAt !== undefined) {
+      seen.push({ at: previous.lastActivityAt, source: previous.source });
+    }
+    const latest = newestActivity(seen);
+    const activity =
+      snapshot.relayInFlight !== undefined && snapshot.relayInFlight > 0
+        ? "active"
+        : latest === null
+          ? "unmonitored"
+          : now - latest.at < IDLE_POLL_MS
+            ? "active"
+            : "quiet";
+
+    this.jobs.noteLiveness(jobId, {
+      activity,
+      verdict: "no-idle-stop",
+      checkedAt: now,
+      idleBaselineAt: snapshot.startedAt,
+      lastActivityAt: latest?.at ?? null,
+      source: latest?.source ?? "recovered-broker",
+      idleMs: null,
+    });
+  }
+
   /**
    * Complete a killed job's tree report by comparing its journaled start with the tree as it exists
    * when this restarted server adopts the job. This can include edits made after the old process
