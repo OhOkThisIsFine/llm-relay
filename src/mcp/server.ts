@@ -887,6 +887,8 @@ interface WalkOptions {
   scope: readonly string[] | undefined;
   /** Ladder tier the lanes came from, for quota reports and the daemon's routing memory. */
   tier: string | undefined;
+  /** Host-routing verdict used to build this view; broker resolution must use the same verdict. */
+  host: DispatchView["host"];
   /** The lane's OWN ceiling, unchanged by this feature. */
   timeoutMs: number;
   /** How long a lane may show no activity before the walk stops it; null when the walk is off. */
@@ -1547,6 +1549,7 @@ export class McpDispatchServer {
       readOnly: args["readOnly"] === true,
       scope: readStringArray(args, "scope"),
       tier: view.tier ?? undefined,
+      host: view.host,
       timeoutMs: readNumber(args, "timeoutMs") ?? DEFAULT_LANE_TIMEOUT_MS,
       idleMs: walk !== null ? walk.idleMs : null,
       system: readString(args, "system"),
