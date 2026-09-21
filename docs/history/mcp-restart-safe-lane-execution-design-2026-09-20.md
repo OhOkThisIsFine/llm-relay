@@ -1,6 +1,6 @@
 # MCP restart-safe lane execution — design (2026-09-20)
 
-**Status:** design complete; implementation not yet shipped.
+**Status:** implemented end to end on 2026-09-20; destructive Windows parent-death and replacement-cancel coverage is part of the targeted process-boundary CI gate.
 
 ## Goal
 
