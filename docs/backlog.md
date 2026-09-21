@@ -10,13 +10,14 @@
 ## Open
 
 - **Active hard-cap continuation is designed but not implemented.**
-  Today an active lane that reaches its absolute runtime ceiling is terminated even when first-party
-  liveness evidence says it is still working. The approved design is in
+  Survey and measurement tooling are complete for AGY, Claude, Codex and OpenCode, but no harness is
+  yet verified resumable by both the exact-ID interruption/resume probe and the same-cwd isolation
+  probe. Runtime implementation remains gated on that live evidence. The approved design is in
   [`history/active-hard-cap-lane-continuation-plan-2026-09-20.md`](history/active-hard-cap-lane-continuation-plan-2026-09-20.md).
-  **Property:** where a harness exposes an exact resumable session identity, an active hard-cap event
-  rolls the same logical attempt into a new process incarnation without overlap, without consuming
-  another walk rung, and without counting the rollover as lane-failure evidence. Unsupported or
-  inactive lanes retain ordinary timeout behavior.
+  **Property:** where a verified harness exposes an exact resumable session identity, an active
+  hard-cap event rolls the same logical attempt into a new process incarnation without overlap,
+  without consuming another walk rung, and without counting the rollover as lane-failure evidence.
+  Unsupported or inactive lanes retain ordinary timeout behavior.
 
 - **AGY answer-envelope unwrapping needs first-party evidence before implementation (M1).**
   The repository still has no raw archived successful AGY envelope from which to freeze the exact
