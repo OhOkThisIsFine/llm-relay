@@ -11,6 +11,7 @@
 import { createHash } from "node:crypto";
 
 export const LANE_EXECUTION_SCHEMA = "mcp.lane-execution.v1" as const;
+export const UNKNOWN_LANE_EXECUTION_MESSAGE = "unknown lane execution id" as const;
 export const MAX_BROKER_TERMINAL_EXECUTIONS = 100;
 // The HTTP server already caps the entire request body at 36 MiB by default. Keep only enough
 // headroom here to reject a pathological programmatic call without imposing the old 4 KiB packet
@@ -585,12 +586,12 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
     const stored = this.executions.get(executionId);
     return stored
       ? { ok: true, execution: await this.snapshot(stored) }
-      : { ok: false, status: 404, message: "unknown lane execution id" };
+      : { ok: false, status: 404, message: UNKNOWN_LANE_EXECUTION_MESSAGE };
   }
 
   private async cancel(executionId: string): Promise<LaneExecutionBrokerResult> {
     const stored = this.executions.get(executionId);
-    if (!stored) return { ok: false, status: 404, message: "unknown lane execution id" };
+    if (!stored) return { ok: false, status: 404, message: UNKNOWN_LANE_EXECUTION_MESSAGE };
     if (stored.status === "running") {
       stored.cancelRequested = true;
       stored.status = "cancelled";
