@@ -2,6 +2,55 @@ import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileS
 import { dirname } from "node:path";
 import { withFileLockSync, type FileLockOptions } from "./file-lock.js";
 
+const WINDOWS_RENAME_RETRY_DELAYS_MS = [10, 20, 40, 80, 160, 250, 250, 250] as const;
+const renameSleeper = new Int32Array(new SharedArrayBuffer(4));
+
+function sleepSync(ms: number): void {
+  Atomics.wait(renameSleeper, 0, 0, ms);
+}
+
+function errorCode(err: unknown): string | undefined {
+  return typeof err === "object" && err !== null && "code" in err && typeof err.code === "string"
+    ? err.code
+    : undefined;
+}
+
+/**
+ * Windows can transiently reject an otherwise-valid replace rename while another short-lived
+ * reader (including AV/indexing software) has the destination open. Keep retrying the SAME temp
+ * file for about one second; never unlink the destination, because that would create a visibility
+ * gap and weaken the atomic-write contract.
+ *
+ * The injected dependencies are a deterministic test seam. Production callers omit them.
+ */
+export function replaceFileWithRetrySync(
+  sourcePath: string,
+  targetPath: string,
+  deps: {
+    readonly platform?: NodeJS.Platform | undefined;
+    readonly rename?: typeof renameSync | undefined;
+    readonly sleep?: ((ms: number) => void) | undefined;
+  } = {},
+): void {
+  const platform = deps.platform ?? process.platform;
+  const rename = deps.rename ?? renameSync;
+  const sleep = deps.sleep ?? sleepSync;
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      rename(sourcePath, targetPath);
+      return;
+    } catch (err) {
+      const code = errorCode(err);
+      const transientWindowsRename =
+        platform === "win32" && (code === "EPERM" || code === "EACCES" || code === "EBUSY");
+      const delay = WINDOWS_RENAME_RETRY_DELAYS_MS[attempt];
+      if (!transientWindowsRename || delay === undefined) throw err;
+      sleep(delay);
+    }
+  }
+}
+
 /**
  * Options for atomic JSON serialization and file writes.
  */
@@ -42,7 +91,7 @@ export function atomicWriteJsonSync(targetPath: string, data: unknown, options: 
     tmpPath = tempPathFor(targetPath);
     const json = JSON.stringify(data, null, space) + "\n";
     writeFileSync(tmpPath, json, { encoding: "utf8", mode: options.mode });
-    renameSync(tmpPath, targetPath);
+    replaceFileWithRetrySync(tmpPath, targetPath);
     tmpPath = null;
     return true;
   } catch (err) {

@@ -12,7 +12,7 @@ tag-triggered packed-artifact smoke.
 | Daemon-owned MCP execution (D1) | `test/mcp-broker-process-boundary.test.ts` kills only the originating MCP process, proves the daemon-owned lane survives, collects the same result from a replacement MCP process, and proves replacement cancellation terminates the owned lane tree. | Release-ready |
 | Config hot reload (D2) | `test/config-reload-process.test.ts` keeps one daemon PID across a reload-safe routing change, then rejects a restart-only provider-base change and proves the previously accepted live config remains intact. | Release-ready |
 | Public dispatch/liveness contract | `test/mcp-restart-report.test.ts` exposes authoritative `walk-verdict` state across restart; broker transport loss remains `running`/unavailable rather than being guessed dead. | Release-ready |
-| Cross-process MCP persistence | PR #64 preserves foreign rows, fails closed on unreadable transactional JSON, retries the released-lock contention race, and repeats the real four-process journal/archive regression five rounds per Windows CI run. | Release-ready |
+| Cross-process MCP persistence | PR #64 preserves foreign rows, fails closed on unreadable transactional JSON, and retries the released-lock contention race. Release-gate run 758 then exposed a separate Windows atomic-commit failure: `rename(tmp, target)` can transiently return `EPERM` even while the transaction lock is correctly held. The release candidate now retries only `EPERM`/`EACCES`/`EBUSY` replacement renames on Windows, for a bounded ~1 s schedule, while retaining the same temp file and lock. | Re-verify on Windows |
 | Capability routing | `test/dispatch.test.ts` derives capability from synced model evidence or pool bands; unknown evidence remains unknown and legacy manual capability has no routing authority. | Release-ready |
 | Failure escalation/failover | Circuit-breaker and pool-failover regressions keep repeated 402/5xx escalation bounded and treat demotion as ordering evidence, never eviction. Multi-candidate tests prove failover remains available. | Release-ready |
 | Toolchain/dashboard/package checks | D5 upgrades are complete. `npm run gate` builds first, then runs server/test typechecks, the core suite, dashboard checks and package checks. | Release-ready |
@@ -26,6 +26,23 @@ PR #64 final head `87485aa` ran CI **754** successfully:
 - `windows-process-boundary`: success.
 
 The default-branch ruleset requires both checks and has no bypass actors.
+
+### Release-gate follow-up
+
+A later docs-only PR (#66) made the repeated Windows regression fire again in CI run **758**. The
+failure was not another unlocked read/merge/rewrite race: the worker had entered the serialized
+transaction and failed at the final atomic replacement:
+
+```
+EPERM: operation not permitted, rename '<mcp-jobs>.tmp' -> 'mcp-jobs.json'
+```
+
+This is a documented Windows/Node failure mode when a short-lived external reader holds the target
+file. The repair retries only transient Windows replacement errors (`EPERM`, `EACCES`, `EBUSY`)
+for a bounded ~1 second while retaining both the transaction lock and the same temp file. It never
+unlinks the destination first, so readers continue to see either the old complete JSON or the new
+complete JSON. Unit tests pin transient recovery, fail-fast boundaries, and retry exhaustion; the
+real four-process Windows regression remains the end-to-end proof.
 
 ## Documentation reconciliation
 

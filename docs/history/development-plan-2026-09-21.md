@@ -87,6 +87,12 @@ complete; see [`release-readiness-audit-2026-09-21.md`](release-readiness-audit-
 The phase remains open until v0.86.0 is published. The tag-triggered publish workflow performs the
 clean packed-artifact install smoke immediately before `npm publish`.
 
+**Release-gate follow-up:** Windows CI run 758 exposed a transient `EPERM` at the final atomic
+`rename(tmp, target)` after the transaction lock had already serialized the writer. The candidate
+now retries only transient Windows replacement errors for a bounded ~1 s without releasing the lock
+or unlinking the destination. Phase 3 cannot advance to tagging until both protected checks pass
+with that repair.
+
 The published package is v0.85.0, while `main` contains a large subsequent body of work including
 restart-safe daemon ownership, config hot reload, liveness/status changes, persistence changes,
 capability derivation and the D5 toolchain upgrades.
