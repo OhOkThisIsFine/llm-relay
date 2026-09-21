@@ -26,7 +26,13 @@ import { randomBytes } from "node:crypto";
 import { existsSync, statSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import { resolveWindowsNpmShim, type WindowsNpmShimDeps, type WindowsNpmShimResolution } from "./windows-npm-shim.js";
-import { nullJobJournal, type JobJournal, type JournalStartingTree } from "./job-journal.js";
+import {
+  nullJobJournal,
+  type JobJournal,
+  type JournalRow,
+  type JournalStartingTree,
+} from "./job-journal.js";
+import type { LaneExecutionSnapshot } from "../lane-execution-broker.js";
 import { nullJobArchive, type JobArchive } from "./job-archive.js";
 import type { TreeSnapshot } from "./tree-delta.js";
 import { classifyLaneProbeOutput, type LaneProbeSpawnResult } from "../lane-quota-probe.js";
@@ -1188,8 +1194,12 @@ export class LaneJobStore {
 
   private readonly journal: JobJournal;
   private readonly archive: JobArchive;
-  /** Starting trees carried off orphan rows before the journal drops them on its next write. */
+  /** Starting trees carried off ordinary killed rows before the journal drops them on its next write. */
   private readonly adoptedStartingTrees = new Map<string, { cwd: string; startingTree: JournalStartingTree }>();
+  /** Dead-MCP rows whose actual process owner is the daemon, atomically claimed for reconciliation. */
+  private readonly brokerOrphans = new Map<string, JournalRow>();
+  /** Running/recovered jobs whose process tree is owned by the daemon rather than this MCP process. */
+  private readonly brokerExecutions = new Map<string, string>();
   private readonly nextJobId: () => string;
 
   constructor(
@@ -1237,6 +1247,16 @@ export class LaneJobStore {
   private adoptOrphans(): void {
     for (const row of this.journal.orphans()) {
       if (this.jobs.has(row.jobId)) continue;
+
+      // A daemon-backed execution may still be running even though the MCP owner pid is gone.
+      // Claim it atomically so at most one replacement MCP process becomes its collector; never
+      // infer death from the host process boundary that D1 exists to survive.
+      if (row.brokerExecution !== undefined) {
+        const claimed = this.journal.claimBrokerOrphan?.(row.jobId);
+        if (claimed !== undefined) this.brokerOrphans.set(row.jobId, claimed);
+        continue;
+      }
+
       const killed: LaneJob = {
         id: row.jobId,
         status: "killed",
@@ -1465,6 +1485,126 @@ export class LaneJobStore {
     const job = this.jobs.get(id);
     if (!job || job.status !== "running") return;
     this.journal.noteStartingTree?.(id, tree, scope);
+  }
+
+  /**
+   * Return, once, daemon-backed orphan rows this process atomically claimed. The server owns the
+   * broker client, so reconciliation is asynchronous and deliberately outside this synchronous store.
+   */
+  takeBrokerOrphans(): JournalRow[] {
+    const rows = [...this.brokerOrphans.values()].map((row) => ({ ...row }));
+    this.brokerOrphans.clear();
+    return rows;
+  }
+
+  /** Broker execution id for a job this process is collecting, if any. */
+  brokerExecution(id: string): string | undefined {
+    return this.brokerExecutions.get(id);
+  }
+
+  /**
+   * Materialize a claimed broker row as a running job while the daemon is queried/retried.
+   * The daemon, not this process, owns its process tree; no local kill handle is registered.
+   */
+  adoptBrokerRunning(row: JournalRow, snapshot?: LaneExecutionSnapshot): LaneJob | undefined {
+    if (row.brokerExecution === undefined) return undefined;
+    const existing = this.jobs.get(row.jobId);
+    if (existing !== undefined) return existing;
+    const job: LaneJob = {
+      id: row.jobId,
+      status: "running",
+      laneId: row.laneId,
+      spec: row.spec,
+      startedAt: row.startedAt,
+      endedAt: undefined,
+      exitCode: null,
+      stdout: "",
+      stderr: "",
+      timedOut: false,
+      cwd: row.cwd,
+      error: undefined,
+      attempts: [],
+      restored: true,
+      ...(row.label === undefined ? {} : { label: row.label }),
+    };
+    this.jobs.set(job.id, job);
+    this.brokerExecutions.set(job.id, row.brokerExecution.executionId);
+    if (snapshot !== undefined) this.applyBrokerSnapshot(job.id, snapshot);
+    return job;
+  }
+
+  /**
+   * Apply one identity-checked daemon snapshot to an adopted broker job.
+   * Returns false on mismatch/inconsistent terminal data; callers then retain the row and retry
+   * rather than turn malformed transport data into a death claim.
+   */
+  applyBrokerSnapshot(id: string, snapshot: LaneExecutionSnapshot): boolean {
+    const job = this.jobs.get(id);
+    const executionId = this.brokerExecutions.get(id);
+    if (
+      job === undefined ||
+      executionId === undefined ||
+      snapshot.executionId !== executionId ||
+      snapshot.jobId !== id ||
+      snapshot.laneId !== job.laneId
+    ) {
+      return false;
+    }
+
+    if (snapshot.launchNotes !== undefined) job.launch = [...snapshot.launchNotes];
+    job.activity = {
+      attemptStartedAt: snapshot.startedAt,
+      lastOutputAt: snapshot.lastOutputAt,
+      stdoutBytes: snapshot.stdoutBytes,
+      stderrBytes: snapshot.stderrBytes,
+    };
+
+    if (snapshot.status === "running") return true;
+
+    if (snapshot.status === "completed") {
+      if (snapshot.code !== 0 || snapshot.timedOut !== false) return false;
+      job.status = "completed";
+    } else if (snapshot.status === "failed") {
+      if (snapshot.timedOut !== false || snapshot.code === 0) return false;
+      job.status = "failed";
+    } else if (snapshot.status === "timed_out") {
+      if (snapshot.timedOut !== true) return false;
+      job.status = "timed_out";
+      job.error = "the daemon-owned lane exceeded its configured timeout and was stopped before it finished";
+    } else if (snapshot.status === "cancelled") {
+      job.status = "cancelled";
+    } else {
+      const _never: never = snapshot.status;
+      return _never;
+    }
+
+    if (snapshot.code !== undefined) job.exitCode = snapshot.code;
+    if (snapshot.stdout !== undefined) job.stdout = snapshot.stdout;
+    if (snapshot.stderr !== undefined) job.stderr = snapshot.stderr;
+    if (snapshot.timedOut !== undefined) job.timedOut = snapshot.timedOut;
+    job.endedAt = snapshot.endedAt ?? Date.now();
+    delete job.activity;
+    delete job.liveness;
+    this.brokerExecutions.delete(id);
+
+    // The daemon already owns/settled the process tree. Do NOT call reap(): that would manufacture
+    // a local process report and, once the live broker path exists, could attempt the wrong owner.
+    if (this.archive.record(job)) this.journal.clear(id);
+    return true;
+  }
+
+  /** Definitive reachable-daemon 404: the broker no longer knows the execution. */
+  markBrokerKilled(id: string, message: string): boolean {
+    const job = this.jobs.get(id);
+    if (job === undefined || !this.brokerExecutions.has(id) || job.status !== "running") return false;
+    job.status = "killed";
+    job.endedAt = Date.now();
+    job.error = message;
+    delete job.activity;
+    delete job.liveness;
+    this.brokerExecutions.delete(id);
+    if (this.archive.record(job)) this.journal.clear(id);
+    return true;
   }
 
   /**
@@ -1699,6 +1839,9 @@ export class LaneJobStore {
     const job = this.jobs.get(id);
     if (!job) return false;
     if (job.status !== "running") return false;
+    // Daemon-owned jobs are cancelled through the broker client. Marking them locally first would
+    // clear the durable row before the actual process owner acknowledged cancellation.
+    if (this.brokerExecutions.has(id)) return false;
     job.status = "cancelled";
     job.endedAt = Date.now();
     this.reap(id);
@@ -1707,6 +1850,9 @@ export class LaneJobStore {
 
   cancelAll(): void {
     for (const id of [...this.jobs.values()].filter((j) => j.status === "running").map((j) => j.id)) {
+      // Host/MCP shutdown is exactly the boundary D1 survives. Explicit dispatch_cancel goes
+      // through the daemon; shutdown must leave daemon-owned work alone.
+      if (this.brokerExecutions.has(id)) continue;
       this.cancel(id);
     }
   }
