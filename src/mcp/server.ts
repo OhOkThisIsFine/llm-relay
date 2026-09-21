@@ -1490,7 +1490,15 @@ export class McpDispatchServer {
           true,
         );
       }
-      const result = await client.request({ action: "cancel", executionId });
+      let result: Awaited<ReturnType<LaneExecutionClient["request"]>>;
+      try {
+        result = await client.request({ action: "cancel", executionId });
+      } catch {
+        return textResult(
+          `could not cancel ${jobId}: the daemon execution client failed; the job was left running`,
+          true,
+        );
+      }
       if (!result.ok) {
         if (result.kind === "rejected" && result.status === 404) {
           this.jobs.markBrokerKilled(
@@ -1922,7 +1930,13 @@ export class McpDispatchServer {
       return true;
     }
 
-    const result = await client.request({ action: "status", executionId });
+    let result: Awaited<ReturnType<LaneExecutionClient["request"]>>;
+    try {
+      result = await client.request({ action: "status", executionId });
+    } catch {
+      this.noteBrokerRecoveryUnavailable(jobId, "broker-client-threw");
+      return true;
+    }
     if (!result.ok) {
       if (result.kind === "rejected" && result.status === 404) {
         const killed = this.jobs.markBrokerKilled(
