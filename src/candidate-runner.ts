@@ -215,19 +215,11 @@ export interface CandidateRunnerHandlers {
    * site that omits it silently disables the band there.
    */
   probation?: ProbationFn | null;
-  /**
-   * Evidence that a provider's own roster has moved: a 404 stating that a model THIS RELAY LISTS
-   * does not exist. The request path wires it to `ModelCatalog.noteProviderStale`, which re-fetches
-   * that provider's `/models` behind a per-provider cooldown.
-   *
-   * Optional, like `probation` and for the same reason — hand-built handler literals in tests keep
-   * compiling — and absent reads as "no trigger", which is the pre-existing behaviour: the catalog
-   * waits for its TTL. `createProxy` always sets it.
-   *
-   * ⚠ The handler is handed the attempt, not a provider name, so the containment the trigger needs
-   * — "on a model the catalog currently lists" — is decided where the catalog is, and not by a
-   * caller that would have to re-derive it.
+    /**
+   * Optional signal that a listed model's 404 may mean the provider roster moved. The catalog owns
+   * the containment check and refresh policy; absence means normal TTL refresh only.
    */
+
   catalogStale?: ((attempt: ResolvedAttempt) => void) | null;
 }
 
@@ -273,13 +265,8 @@ export function responseHeadersForTarget(
   ctx: ServedAnnouncementContext,
 ): Record<string, string | string[]> {
   const responseHeaders: Record<string, string | string[]> = filterResponseHeaders(backendRes.headers);
-  // The winner below 400, every deployment tried at or above it. The header's own declaration is
-  // the contract — "when every candidate fails it carries the list that was tried instead, so an
-  // exhausted pool is self-describing" — and `docs/reference.md` states it to users. The Anthropic
-  // front used to omit it entirely on a terminal error while the OpenAI front supplied it, so the
-  // same documented behaviour was delivered by one path and not the other.
-  // ⚠ Not the transport-exit omission at the `handle` catch, which is a RECORDED deliberate
-  // residue: a transport exhaustion has no HTTP response to describe.
+  // Successful responses name the winner; terminal HTTP failures name every tried deployment.
+  // Transport failures have no HTTP response and therefore no response header to annotate.
   responseHeaders[SERVED_BY_HEADER] = backendRes.status < 400 || !ctx.tried?.length
     ? specOfTarget(ctx.target)
     : ctx.tried.join(", ");
@@ -419,13 +406,8 @@ export function degradedLabel(pool: string | null, degraded: Set<string> | null,
   return degraded.has(spec) ? `${spec} (below ${pool})` : null;
 }
 
-/**
- * Minimum SERVED-REQUEST samples before a free deployment counts as measured.
- *
- * Five is the smallest count for which a sample window is not simply "the last couple of
- * requests" — the same standing rule that keeps `latency-demotion.ts` from acting on one
- * request's latency.
- */
+/** Minimum served-request samples before a free deployment leaves probation. */
+
 export const DEFAULT_PROBATION_MIN_SAMPLES = 5;
 
 /** One probation verdict — the smallest honest statement of "why this cell leads the walk". */
@@ -1058,12 +1040,8 @@ export function attemptWon(settled: Settled<Response>): boolean {
   return probe === undefined || probe.kind === "ready";
 }
 
-/**
- * ⚠ **Carries the input-token count only when `basis` is `"input-size"`** — the case the flat
- * `floor` label used to cover alone. A `per-token`/`absolute` decision keeps its bare basis: the
- * DEPLOYMENT's own evidence set that bar, not the request's size, and stating a token count beside
- * it would claim size decided a number the deployment actually did.
- */
+/** Include input-token count only when request size actually determined the hedge delay. */
+
 export function hedgedLabel(
   primary: AttemptRun,
   hedge: AttemptRun,
@@ -1426,9 +1404,10 @@ interface StatusVerdict {
 }
 
 /**
- * Explicit HTTP-status policy shared by outcome classification and eligibility-fact parsing. Range
- * rules for generic success/5xx statuses remain in `statusVerdict`.
+ * Explicit status-policy table shared by outcome classification and eligibility interpretation.
+ * Range rules (<400 and >=500) remain in `statusVerdict`; membership here is deliberate policy.
  */
+
 export const STATUS_VERDICT_TABLE: Readonly<Record<number, StatusVerdict>> = Object.freeze({
   400: { outcome: "retriable", carriesEligibilityFact: true },
   401: { outcome: "credential", carriesEligibilityFact: true },
@@ -1989,9 +1968,10 @@ export function observeAttemptHeaders(
 }
 
 /**
- * Provenances authored by the relay rather than the provider. These must not be charged to provider
- * health/accounting. Exhaustive over `OutcomeProvenance`.
+ * Provenances authored by the relay itself. These do not count as provider failures. The total
+ * table forces every new provenance to be classified explicitly.
  */
+
 const RELAY_AUTHORED_PROVENANCE = {
   "upstream": false,
   "invalid-upstream-envelope": false,
@@ -2040,7 +2020,8 @@ export function completeAttemptSuccess(
   status: number,
 ): void {
   if (attempt.completed) return;
-  // Retract cost-class-scoped conditions only when the success is known to be in the same class.
+  // A success retracts only conditions that apply to the same cost class. Unknown cost cannot
+  // disprove a class-filtered fact.
   const costClass = h.costClassOf?.(attempt.resolvedAttempt);
   const completedAt = Date.now();
   const result = h.breaker.completeAttempt(attempt.handle, {
