@@ -521,7 +521,7 @@ describe("MCP server restart", () => {
     }
   });
 
-  it("persists a daemon broker execution reference across a running row repoint", () => {
+  it("clears the previous attempt's broker execution when a running walk repoints the row", () => {
     const { path, cleanup } = tempJournalPath();
     try {
       const journal = createJobJournal(path);
@@ -536,7 +536,8 @@ describe("MCP server restart", () => {
         kind: "daemon-v1",
         executionId: "exec-00112233445566778899aabbccddeeff",
       });
-      // The walk moving to another lane must not erase the job-wide recovery reference.
+      // The execution belongs to lane A's ATTEMPT. A lane transition must clear it so a crash
+      // before lane B starts cannot attach lane A's terminal process/result to lane B.
       journal.note({
         jobId: "job-broker-reference",
         laneId: "lane-b",
@@ -549,10 +550,7 @@ describe("MCP server restart", () => {
         (candidate) => candidate.jobId === "job-broker-reference",
       );
       expect(row?.laneId).toBe("lane-b");
-      expect(row?.brokerExecution).toEqual({
-        kind: "daemon-v1",
-        executionId: "exec-00112233445566778899aabbccddeeff",
-      });
+      expect(row?.brokerExecution).toBeUndefined();
     } finally {
       cleanup();
     }
