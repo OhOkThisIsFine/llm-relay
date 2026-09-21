@@ -3,6 +3,7 @@ import {
   LANE_EXECUTION_SCHEMA,
   LaneExecutionBroker,
   parseLaneExecutionBrokerRequest,
+  type LaneExecutionActivity,
   type LaneExecutionLaunchHandle,
   type LaneExecutionRunResult,
   type LaneExecutionStartRequest,
