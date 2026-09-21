@@ -141,9 +141,15 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 - **The unnamed D5 remainder is now known.** The exact pre-D5 manifest's registry report shows the
   remaining independent major laps are `@types/node` 22→26 and `lucide-react` 0.x→1.x.
   plugin-react 4→6 was already consumed as Vite 8's required adapter in D5-b.
-- **Immediate next in D5.** Upgrade `@types/node` 22→26 alone, then lucide-react 0.x→1.x.
-  M1 remains blocked on a first-party AGY success envelope. Separately open: repository CI
-  enforcement, Route B's vendor blocker, and the owner-driven Codex/Code-tab checks.
+- **D5-g deliberately keeps Node types on major 22.** `@types/node` 26 was reviewed
+  and rejected while the package still supports Node >=22: compiling against Node-26 declarations
+  would widen the accepted API beyond the runtime floor. The matching line was refreshed instead
+  from 22.20.1 to 22.20.4. Native TS7 build/typechecks, Linux, Windows and package smoke all pass;
+  package measurement is 1,208,871 packed bytes, 5,970,011 unpacked bytes, and 460 entries.
+- **Immediate next in D5.** Upgrade `lucide-react` 0.x→1.x, the final independent major from the
+  original dependency inventory. M1 remains blocked on a first-party AGY success envelope.
+  Separately open: repository CI enforcement, Route B's vendor blocker, and the owner-driven
+  Codex/Code-tab checks.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
