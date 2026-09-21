@@ -75,8 +75,10 @@ import {
 } from "./lane-runner.js";
 import { readOnlyInvoke, readOnlyVerdict, type LaneInvocation } from "./readonly-boundary.js";
 import { agyQuotaStatement, type AgyLogSnapshot } from "./agy-quota-log.js";
-import { nullJobJournal, type JobJournal } from "./job-journal.js";
+import { nullJobJournal, type JobJournal, type JournalRow } from "./job-journal.js";
 import { nullJobArchive, type JobArchive } from "./job-archive.js";
+import type { LaneExecutionSnapshot } from "../lane-execution-broker.js";
+import type { LaneExecutionClient } from "./lane-execution-client.js";
 import {
   RPC_INTERNAL_ERROR,
   RPC_INVALID_PARAMS,
@@ -183,6 +185,11 @@ export interface McpServerDeps {
    * job ids continue past the highest one the previous process minted (`job-archive.ts`).
    */
   archive?: JobArchive;
+  /**
+   * D1 daemon execution client. Optional until the ownership switchover; when present, broker-backed
+   * orphan rows are reconciled instead of being declared killed from the MCP owner pid alone.
+   */
+  laneExecutionClient?: LaneExecutionClient;
   /**
    * The llm-relay version INSTALLED on disk now, read fresh on each call — or null when unknown.
    * When it differs from `version` (the code this process started with), every tool reply says so:
@@ -1068,10 +1075,14 @@ export class McpDispatchServer {
   >();
   /** The activity tag (`lane-activity.ts`) of the lane each running job has started last. */
   private readonly activityTags = new Map<string, string>();
-  /** Last cumulative process-tree CPU reading for the current attempt of each job. */
+  /** Last cumulative process-tree CPU reading for the current attempt of each locally-owned job. */
   private readonly processCpu = new Map<string, number>();
-  /** Startup adoption work; only reads of restored terminal jobs wait for it. */
+  /** Last daemon-reported cumulative CPU reading for each recovered broker execution. */
+  private readonly brokerCpu = new Map<string, number>();
+  /** Full restart enrichment; status/result wait for final tree fidelity. */
   private readonly startup: Promise<void>;
+  /** Broker orphan claiming/reconciliation only; explicit cancel waits on this, never on git. */
+  private readonly brokerStartup: Promise<void>;
 
   constructor(private readonly deps: McpServerDeps) {
     this.jobs = new LaneJobStore(deps.journal ?? nullJobJournal, deps.archive ?? nullJobArchive);
@@ -1080,7 +1091,9 @@ export class McpDispatchServer {
     this.now = deps.now ?? Date.now;
     this.cwd = deps.cwd ?? (() => process.cwd());
     this.maxDepth = deps.maxDepth ?? DEFAULT_MAX_DEPTH;
-    this.startup = this.restoreKilledTreeDeltas();
+    const killedTreeStartup = this.restoreKilledTreeDeltas();
+    this.brokerStartup = this.restoreBrokerOrphans();
+    this.startup = Promise.all([killedTreeStartup, this.brokerStartup]).then(() => undefined);
   }
 
   /**
@@ -1129,9 +1142,9 @@ export class McpDispatchServer {
   }
 
   /**
-   * Kill every running child, then flush the finished-job archive. Wired to process exit so nothing
-   * is orphaned and nothing the archive still owes to disk is lost on a graceful stop (a hard kill
-   * is covered by the archive's eager terminal writes — `job-archive.ts`).
+   * Kill every LOCALLY owned running child, leave daemon-owned D1 executions running, then flush the
+   * finished-job archive. Explicit dispatch_cancel is the path that asks the daemon owner to stop a
+   * broker execution; MCP/host shutdown is the lifetime boundary D1 is designed to survive.
    */
   shutdown(): void {
     this.jobs.cancelAll();
@@ -1240,15 +1253,15 @@ export class McpDispatchServer {
       case "dispatch":
         return this.toolDispatch(args, ctx);
       case "dispatch_status":
-        // A restarted process may still be enriching killed jobs with their adoption-time tree
-        // delta. Status/result are the only surfaces that need that fidelity; never make MCP
-        // initialization, tool discovery, cancellation or a fresh dispatch wait on git.
+        // Restart reconciliation (tree delta + broker state) is deliberately off initialize/tool
+        // discovery/fresh dispatch. Job-control reads need it; the rest of MCP startup never waits.
         await this.startup;
         return this.toolStatus(args);
       case "dispatch_result":
         await this.startup;
         return this.toolResult(args);
       case "dispatch_cancel":
+        await this.brokerStartup;
         return this.toolCancel(args);
       case "dispatch_lanes":
         return this.toolLanes(args);
@@ -1311,18 +1324,23 @@ export class McpDispatchServer {
    * measured polling one finished job 2,023 times over 71 minutes (2026-09-16). So the first poll
    * that sees the job end already holds the answer; a running job keeps the short form.
    */
-  private toolStatus(args: Record<string, unknown>): unknown {
+  private async toolStatus(args: Record<string, unknown>): Promise<unknown> {
     const jobId = readString(args, "jobId");
-    if (!jobId) return textResult(this.recentJobs());
+    if (!jobId) {
+      await this.refreshAllBrokerJobs();
+      return textResult(this.recentJobs());
+    }
+    await this.refreshBrokerJob(jobId);
     const job = this.jobs.find(jobId);
     if (!job) return this.unknownJob(jobId);
     if (job.status === "running") return textResult(describeJob(job, this.now()));
     return textResult(jobAnswer(job, this.now()), isFailureStatus(job.status));
   }
 
-  private toolResult(args: Record<string, unknown>): unknown {
+  private async toolResult(args: Record<string, unknown>): Promise<unknown> {
     const jobId = readString(args, "jobId");
     if (!jobId) return textResult("dispatch_result requires jobId", true);
+    await this.refreshBrokerJob(jobId);
     const job = this.jobs.find(jobId);
     if (!job) return this.unknownJob(jobId);
     return textResult(jobAnswer(job, this.now()), isFailureStatus(job.status));
@@ -1370,11 +1388,64 @@ export class McpDispatchServer {
     );
   }
 
-  private toolCancel(args: Record<string, unknown>): unknown {
+  private async toolCancel(args: Record<string, unknown>): Promise<unknown> {
     const jobId = readString(args, "jobId");
     if (!jobId) return textResult("dispatch_cancel requires jobId", true);
+
+    await this.refreshBrokerJob(jobId);
     const job = this.jobs.find(jobId);
     if (!job) return this.unknownJob(jobId);
+    if (job.status !== "running") {
+      return textResult(`${jobId} was already ${job.status}`);
+    }
+
+    const executionId = this.jobs.brokerExecution(jobId);
+    if (executionId !== undefined) {
+      const client = this.deps.laneExecutionClient;
+      if (client === undefined) {
+        return textResult(
+          `could not cancel ${jobId}: the daemon execution client is unavailable; the job was left running`,
+          true,
+        );
+      }
+      let result: Awaited<ReturnType<LaneExecutionClient["request"]>>;
+      try {
+        result = await client.request({ action: "cancel", executionId });
+      } catch {
+        return textResult(
+          `could not cancel ${jobId}: the daemon execution client failed; the job was left running`,
+          true,
+        );
+      }
+      if (!result.ok) {
+        if (result.kind === "rejected" && result.status === 404) {
+          this.jobs.markBrokerKilled(
+            jobId,
+            "the relay daemon is reachable but no longer knows this recovered lane execution",
+          );
+          await this.recordTreeDelta(jobId);
+          return textResult(`${jobId} was already killed`, true);
+        }
+        return textResult(
+          `could not cancel ${jobId}: ${result.message}; the daemon-owned execution was left untouched`,
+          true,
+        );
+      }
+      if (!this.jobs.applyBrokerSnapshot(jobId, result.execution)) {
+        return textResult(
+          `could not confirm cancellation of ${jobId}: the daemon returned a mismatched execution snapshot`,
+          true,
+        );
+      }
+      if (result.execution.status !== "running") await this.recordTreeDelta(jobId);
+      const current = this.jobs.find(jobId);
+      return textResult(
+        current?.status === "cancelled"
+          ? `cancelled ${jobId}`
+          : `${jobId} was already ${current?.status ?? result.execution.status}`,
+      );
+    }
+
     const cancelled = this.jobs.cancel(jobId);
     if (cancelled) void this.recordTreeDelta(jobId);
     return textResult(cancelled ? `cancelled ${jobId}` : `${jobId} was already ${job.status}`);
@@ -1714,6 +1785,179 @@ export class McpDispatchServer {
       this.trees.set(jobId, { cwd: opts.cwd, before, scope: opts.scope, activityLastSeen: before });
       this.jobs.noteStartingTree(jobId, before, opts.scope);
     }
+  }
+
+  /**
+   * Reconcile daemon-backed rows this MCP process atomically claimed from the running journal.
+   * A row is materialized as RUNNING first, so transport/auth failure remains an honest
+   * "recovery unavailable" state rather than a fabricated death. A reachable daemon 404 is the
+   * only absence that becomes killed.
+   */
+  private async restoreBrokerOrphans(): Promise<void> {
+    const rows = this.jobs.takeBrokerOrphans();
+    await Promise.all(rows.map(async (row) => {
+      const job = this.jobs.adoptBrokerRunning(row);
+      if (job === undefined) return;
+
+      if (row.startingTree !== undefined) {
+        const before: TreeSnapshot = {
+          prefix: row.startingTree.prefix,
+          entries: new Map(row.startingTree.entries),
+        };
+        const current = await this.readTree(row.cwd);
+        this.trees.set(row.jobId, {
+          cwd: row.cwd,
+          before,
+          scope: row.startingTree.scope,
+          ...(current === null ? {} : { activityLastSeen: current }),
+        });
+      }
+
+      await this.refreshBrokerJob(row.jobId);
+    }));
+  }
+
+  /** Refresh every recovered daemon execution before rendering the machine-wide recent-job list. */
+  private async refreshAllBrokerJobs(): Promise<void> {
+    const pending = this.jobs
+      .list()
+      .filter((job) => job.status === "running" && this.jobs.brokerExecution(job.id) !== undefined)
+      .map((job) => this.refreshBrokerJob(job.id));
+    await Promise.all(pending);
+  }
+
+  /**
+   * Refresh one daemon-owned job. Returns true when it was broker-backed, even if the broker is
+   * temporarily unreachable. Never converts transport failure or malformed success JSON into death.
+   */
+  private async refreshBrokerJob(jobId: string): Promise<boolean> {
+    const executionId = this.jobs.brokerExecution(jobId);
+    if (executionId === undefined) return false;
+
+    const client = this.deps.laneExecutionClient;
+    if (client === undefined) {
+      this.noteBrokerRecoveryUnavailable(jobId, "broker-client-unavailable");
+      return true;
+    }
+
+    let result: Awaited<ReturnType<LaneExecutionClient["request"]>>;
+    try {
+      result = await client.request({ action: "status", executionId });
+    } catch {
+      this.noteBrokerRecoveryUnavailable(jobId, "broker-client-threw");
+      return true;
+    }
+    if (!result.ok) {
+      if (result.kind === "rejected" && result.status === 404) {
+        const killed = this.jobs.markBrokerKilled(
+          jobId,
+          "the relay daemon is reachable but no longer knows this recovered lane execution; " +
+            "the execution ended outside the retained broker window or the daemon restarted",
+        );
+        if (killed) {
+          this.brokerCpu.delete(jobId);
+          await this.recordTreeDelta(jobId);
+        }
+      } else {
+        this.noteBrokerRecoveryUnavailable(
+          jobId,
+          result.kind === "invalid-response" ? "broker-response-invalid" : "broker-unavailable",
+        );
+      }
+      return true;
+    }
+
+    const snapshot = result.execution;
+    if (!this.jobs.applyBrokerSnapshot(jobId, snapshot)) {
+      this.noteBrokerRecoveryUnavailable(jobId, "broker-response-mismatch");
+      return true;
+    }
+
+    if (snapshot.status === "running") {
+      await this.noteRecoveredBrokerLiveness(jobId, snapshot);
+    } else {
+      this.brokerCpu.delete(jobId);
+      await this.recordTreeDelta(jobId);
+    }
+    return true;
+  }
+
+  /** A broker outage is uncertainty, not evidence that the lane stopped. */
+  private noteBrokerRecoveryUnavailable(jobId: string, source: string): void {
+    const job = this.jobs.get(jobId);
+    if (job === undefined || job.status !== "running") return;
+    this.jobs.noteLiveness(jobId, {
+      activity: "unmonitored",
+      verdict: "no-idle-stop",
+      checkedAt: this.now(),
+      idleBaselineAt: job.activity?.attemptStartedAt ?? job.startedAt,
+      lastActivityAt: job.liveness?.lastActivityAt ?? null,
+      source,
+      idleMs: null,
+    });
+  }
+
+  /**
+   * Publish liveness for a recovered daemon execution. This process is only an observer/collector:
+   * it never idle-stops or advances the old walk, hence the no-idle-stop verdict.
+   */
+  private async noteRecoveredBrokerLiveness(
+    jobId: string,
+    snapshot: LaneExecutionSnapshot,
+  ): Promise<void> {
+    const now = this.now();
+    const seen: Array<{ at: number | null | undefined; source: string }> = [
+      { at: snapshot.lastOutputAt, source: "lane-output" },
+      snapshot.relayInFlight !== undefined && snapshot.relayInFlight > 0
+        ? { at: now, source: "relay-in-flight" }
+        : { at: snapshot.relayLastActivityAt, source: "relay-traffic" },
+    ];
+
+    if (snapshot.cpuMs !== undefined) {
+      const previous = this.brokerCpu.get(jobId);
+      this.brokerCpu.set(jobId, snapshot.cpuMs);
+      if (previous !== undefined && snapshot.cpuMs - previous >= PROCESS_CPU_ACTIVITY_MS) {
+        seen.push({ at: now, source: "process-cpu" });
+      }
+    }
+
+    const tree = this.trees.get(jobId);
+    const reading = tree === undefined ? null : await this.readTree(tree.cwd);
+    if (tree !== undefined && reading !== null) {
+      const previous = tree.activityLastSeen;
+      tree.activityLastSeen = reading;
+      if (previous !== undefined) {
+        seen.push(
+          sameTree(previous, reading)
+            ? { at: newestChangeMs(tree.cwd, reading), source: "file-change" }
+            : { at: now, source: "working-tree" },
+        );
+      }
+    }
+
+    const previous = this.jobs.get(jobId)?.liveness;
+    if (previous?.lastActivityAt !== null && previous?.lastActivityAt !== undefined) {
+      seen.push({ at: previous.lastActivityAt, source: previous.source });
+    }
+    const latest = newestActivity(seen);
+    const activity =
+      snapshot.relayInFlight !== undefined && snapshot.relayInFlight > 0
+        ? "active"
+        : latest === null
+          ? "unmonitored"
+          : now - latest.at < IDLE_POLL_MS
+            ? "active"
+            : "quiet";
+
+    this.jobs.noteLiveness(jobId, {
+      activity,
+      verdict: "no-idle-stop",
+      checkedAt: now,
+      idleBaselineAt: snapshot.startedAt,
+      lastActivityAt: latest?.at ?? null,
+      source: latest?.source ?? "recovered-broker",
+      idleMs: null,
+    });
   }
 
   /**
