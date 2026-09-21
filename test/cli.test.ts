@@ -1339,7 +1339,13 @@ describe("llm-relay reload — live control mutation", () => {
   const originalArgv = process.argv;
   const configAt = (listen: string) => ({
     listen,
-    providers: { anthropic: { base: "https://api.anthropic.com", kind: "anthropic" } },
+    providers: {
+      anthropic: {
+        base: "https://api.anthropic.com",
+        kind: "anthropic",
+        credentialMode: "passthrough",
+      },
+    },
     routing: { default: "anthropic", tiers: {}, benchmarkSort: false },
     repair: { maxAttempts: 2, destructiveTools: [] },
     mode: "detect",
