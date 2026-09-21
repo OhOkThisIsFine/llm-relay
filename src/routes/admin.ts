@@ -1,4 +1,5 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { ConfigReloadAttemptResult } from "../config-reload.js";
 import { AUTO_MODEL, CONFIG_STALENESS_NOTICE, unroutableOffloadClient, type Config, type OffloadScope } from "../config.js";
 import type { ModelCatalog } from "../catalog.js";
 import type { PingLoop } from "../ping/cadence.js";
@@ -186,6 +187,8 @@ export interface AdminHandlers {
   accountingRecorder: AccountingRecorder;
   /** D1 Phase 1: injected execution broker; absent means the route fails closed with 503. */
   laneExecutionBroker?: LaneExecutionBrokerPort;
+  /** D2 atomic config transaction; absent means this embed cannot reload and answers 503. */
+  reloadConfig?: () => ConfigReloadAttemptResult;
   /** Optional shutdown callback — called by POST /stop after responding 202. A bare programmatic proxy with no onStop answers 503. */
   onStop?: () => void;
   /** True the first time GET /telemetry observes the loaded config changed on disk, false on
@@ -830,6 +833,47 @@ export async function handleAdminRoutes(
       process.stderr.write(`llm-relay: ${CONFIG_STALENESS_NOTICE}\n`);
     }
     return ok(report, true);
+  }
+
+  // POST /reload — same admitted control boundary as /stop. The transaction itself is
+  // injected by createProxy so this adapter never reads a config file or decides reload policy.
+  if (req.method === "GET" && pathname === "/reload") {
+    return bad(404, `GET /reload is not a route — POST to reload the relay config`);
+  }
+  if (req.method === "POST" && pathname === "/reload") {
+    if (
+      reqJson !== undefined &&
+      (typeof reqJson !== "object" || reqJson === null || Array.isArray(reqJson))
+    ) {
+      return bad(400, `POST /reload body must be an empty JSON object`);
+    }
+    const body = (reqJson ?? {}) as Record<string, unknown>;
+    if (Object.keys(body).length > 0) {
+      return bad(400, `POST /reload does not accept any properties`);
+    }
+    const reload = h.reloadConfig;
+    if (typeof reload !== "function") {
+      return bad(503, `the relay has no config reload handler`);
+    }
+
+    const result = reload();
+    if (result.ok) {
+      return ok({
+        reloaded: true,
+        changed: result.changed,
+        warnings: result.warnings,
+      }, true);
+    }
+    if (result.status === 400) return bad(400, result.message);
+
+    // 409 is actionable: expose only the bounded config PATHS that require a restart, never values.
+    res.writeHead(409, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      error: { type: "error", message: result.message },
+      requiresRestart: result.requiresRestart,
+    }));
+    h.logger.write(baseLog(started, path, false, false, 409, "skipped", null));
+    return true;
   }
 
   // POST /stop — admitted by the same control-token boundary as /cooldowns/clear.
