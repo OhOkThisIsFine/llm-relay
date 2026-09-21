@@ -123,6 +123,7 @@ try {
     "resumed step_finish/process exit",
     resumed,
   );
+  await waitForClose(resumed, 30_000);
 
   if (toolEvent(resumed)) {
     throw new Error("OpenCode used a tool during the resume check; measurement is invalid");
@@ -131,7 +132,7 @@ try {
   const exactSessionRecovered = resumedStart.sessionID === sessionId && text.sessionID === sessionId;
   const markerRecovered = text.part.text.trim() === marker;
   const success =
-    resumed.code !== 1 &&
+    resumed.code === 0 &&
     exactSessionRecovered &&
     markerRecovered;
 
