@@ -100,6 +100,11 @@ export interface JobJournal {
   noteStartingTree?(jobId: string, tree: TreeSnapshot, scope: readonly string[] | undefined): void;
   /** Persist the daemon-owned execution reference for a running job. D1 Phase 3 consumes it. */
   noteBrokerExecution?(jobId: string, execution: JournalBrokerExecution): void;
+  /**
+   * Atomically claim a dead-owner broker row for this MCP process. Exactly one replacement process
+   * may collect a daemon execution after a host restart.
+   */
+  claimBrokerOrphan?(jobId: string): JournalRow | undefined;
   /** Remove a job that reached a terminal state, or one that never started. */
   clear(jobId: string): void;
   /** Rows present at STARTUP whose owner is gone — i.e. jobs a previous process died holding. */
@@ -118,6 +123,7 @@ export const nullJobJournal: JobJournal = {
   note: () => {},
   noteStartingTree: () => {},
   noteBrokerExecution: () => {},
+  claimBrokerOrphan: () => undefined,
   clear: () => {},
   orphans: () => [],
   foreign: () => undefined,
@@ -239,14 +245,15 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
     note(row) {
       readOnce();
       const existing = rows.get(row.jobId);
-      // note() also repoints a running walk to its next lane. The starting tree and daemon broker
-      // execution are job-wide, so a lane transition must not erase either persisted fact.
+      // note() also repoints a running walk to its next lane. The starting tree is JOB-wide,
+      // so a lane transition preserves it. A broker execution id is ATTEMPT-scoped and is
+      // deliberately NOT preserved: carrying lane A's execution under lane B's row would let a
+      // restart attach the wrong process to the new lane. The new attempt writes its own id before
+      // sending the idempotent broker start.
       const startingTree = row.startingTree ?? existing?.startingTree;
-      const brokerExecution = row.brokerExecution ?? existing?.brokerExecution;
       rows.set(row.jobId, {
         ...row,
         ...(startingTree === undefined ? {} : { startingTree }),
-        ...(brokerExecution === undefined ? {} : { brokerExecution }),
         owner: { pid, instance },
       });
       persist();
@@ -281,6 +288,42 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
       if (canonical === undefined) return;
       row.brokerExecution = canonical;
       persist();
+    },
+    claimBrokerOrphan(jobId) {
+      readOnce();
+      let claimed: JournalRow | undefined;
+      try {
+        transactionalUpdateJsonSync<JournalFile>(
+          path,
+          (diskFile) => {
+            const valid: JournalRow[] = [];
+            for (const value of diskFile?.jobs ?? []) {
+              const parsed = readJournalRow(value);
+              if (parsed !== null) valid.push(parsed);
+            }
+            const index = valid.findIndex((row) => row.jobId === jobId);
+            if (index < 0) return { version: JOB_JOURNAL_VERSION, jobs: valid };
+            const candidate = valid[index]!;
+            // Only daemon-backed rows have a surviving execution to collect. If another live MCP
+            // already claimed it, leave the row byte-semantically unchanged and return no claim.
+            if (candidate.brokerExecution === undefined || ownedElsewhere(candidate)) {
+              return { version: JOB_JOURNAL_VERSION, jobs: valid };
+            }
+            const next: JournalRow = {
+              ...candidate,
+              owner: { pid, instance },
+            };
+            valid[index] = next;
+            claimed = next;
+            return { version: JOB_JOURNAL_VERSION, jobs: valid };
+          },
+          { validator: isJournalFile, strict: true },
+        );
+      } catch {
+        return undefined;
+      }
+      if (claimed !== undefined) rows.set(jobId, claimed);
+      return claimed;
     },
     clear(jobId) {
       readOnce();
