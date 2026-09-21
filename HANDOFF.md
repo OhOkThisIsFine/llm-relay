@@ -133,12 +133,17 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   API=5.9.3 and compiler=7.0.2. Native TS7 build/declaration emit, 4,490 core tests, 46 dashboard
   tests, delegate-gate regressions, Windows process coverage, and packed smoke all pass. Package
   measurement is 1,208,872 packed bytes, 5,970,011 unpacked bytes, and 460 entries.
-- **Immediate next in D5.** Re-survey the three remaining major development dependencies from the
-  original stabilization inventory, then upgrade one per lap. The runtime Compiler API should not
-  be moved merely for version symmetry; revisit it when TypeScript's new API and this repo's peers
-  support that transition. M1 remains blocked on a first-party AGY success envelope. Separately
-  open: repository CI enforcement, Route B's vendor blocker, and the owner-driven Codex/Code-tab
-  checks.
+- **D5-f jest-dom 7 is green.** `@testing-library/jest-dom` moved from 6.9.1 to 7.0.1
+  with no matcher migration: the repo uses none of v7's removed deprecated matcher names. Its
+  Node >=22 and DOM/Vitest peers are already satisfied. Full Linux, all 46 dashboard tests,
+  Windows process coverage and packed smoke pass. Package measurement is 1,208,869 packed bytes,
+  5,970,011 unpacked bytes, and 460 entries.
+- **The unnamed D5 remainder is now known.** The exact pre-D5 manifest's registry report shows the
+  remaining independent major laps are `@types/node` 22→26 and `lucide-react` 0.x→1.x.
+  plugin-react 4→6 was already consumed as Vite 8's required adapter in D5-b.
+- **Immediate next in D5.** Upgrade `@types/node` 22→26 alone, then lucide-react 0.x→1.x.
+  M1 remains blocked on a first-party AGY success envelope. Separately open: repository CI
+  enforcement, Route B's vendor blocker, and the owner-driven Codex/Code-tab checks.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
