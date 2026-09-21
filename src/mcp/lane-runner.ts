@@ -1183,10 +1183,8 @@ export class LaneJobStore {
     return readOwnedPids(this.owned.get(id));
   }
 
-  /**
-   * Register a bare kill callback — the pre-existing seam, kept because a caller that owns no OS
-   * process (an answer-mode job's direct HTTP call, or a test double) still has something to stop.
-   */
+    /** Register a kill callback for a job that owns no explicit OS-process handle. */
+
   registerKill(id: string, kill: () => void): void {
     this.kills.set(id, kill);
     this.owned.set(id, { kill });
@@ -1700,8 +1698,10 @@ export interface CwdCheck {
 
 /**
  * Validate a caller-supplied working directory. It must exist and be a directory; when
- * `allowedRoots` is configured, resolved-path containment is enforced with separator boundaries.
+ * `allowedRoots` is configured, both sides are resolved before containment comparison so `..`
+ * segments cannot escape an allowed root.
  */
+
 
 export function checkCwd(cwd: string, allowedRoots: readonly string[] | undefined): CwdCheck {
   if (!existsSync(cwd)) return { ok: false, reason: `working directory does not exist: ${cwd}` };
