@@ -287,18 +287,10 @@ export interface DispatchOptions {
 }
 
 /**
- * Cooldown state, scoped to the `Config` it was reported against.
- *
- * It used to be one module-level `Map` shared by the whole process, keyed by `rung:<id>` /
- * `quota:<name>`. Those keys are namespaced by nothing: two `Config`s live in one process (a test
- * file, a future reload, any library caller holding more than one) collided whenever they happened
- * to name a rung or a quota bucket the same, so exhausting a lane in one silently parked an
- * unrelated lane in the other — and `clearExhausted(cfg)` with no id wiped every config's state,
- * not the caller's. Cooldowns describe *this* ladder, so they belong to it.
- *
- * A `WeakMap` because the state's whole lifetime is the config's: when the config is gone there is
- * no ladder left to cool down, and nothing should keep the entry alive.
+ * Cooldown state is scoped to each `Config`. The `WeakMap` prevents one live/reloaded config from
+ * affecting another and lets state disappear with the config object.
  */
+
 const cooldowns = new WeakMap<Config, Map<string, number>>();
 
 /** rung id or quota bucket → epoch ms at which it is eligible again, for THIS config. */
@@ -503,31 +495,11 @@ export const SPEC_TOKEN = "{spec}";
 export const CONTEXT_TOKEN = "{contextWindow}";
 
 /**
- * Published context window for a spec, in tokens, or null when it cannot be stated.
- *
- * ⚠ Null is the common answer and must stay honest. Free providers largely publish no metadata at
- * all (NIM publishes none), so a pool's members are mostly unknown — measured on this machine, 0
- * of 29 members of `pool/high` publish a context length. Guessing a window is strictly worse than
- * omitting it: the client already has a conservative default, and a number we invented would
- * override that default with fiction and overflow the real backend.
- *
- * For a POOL the MINIMUM across members that resolve is used: failover can land the request on any
- * member, so the pool's usable window is the smallest one known.
- *
- * ⚠ **An unresolvable member does NOT veto the pool.** That was the original rule and it was
- * wrong twice over. Practically, a single model with no published figure anywhere blanked three of
- * four pools on the owner's machine — `huggingface/Qwen/Qwen3-235B-A22B-Instruct-2507` alone
- * blocked `low`, `medium` and `high` while 44 of 49, 38 of 41 and 28 of 29 members resolved fine.
- * Conceptually, a pool is a ROUTING construct — a ranked candidate list — and membership of one
- * says nothing about any member's context window; treating "we have no data on one model" as "we
- * know nothing about this pool" confuses an absent measurement with a measured absence.
- *
- * The residual risk — an unmeasured member whose real ceiling is below the reported minimum — is
- * exactly what the observed rung exists to close: the first over-length rejection from that
- * deployment states its ceiling, `context-limits.ts` records it, and the next dispatch reports the
- * corrected floor. `contextWindowUnknownMembers` carries how much of the pool the number covers,
- * so the gap is visible rather than implied.
+ * Published context window for a spec, or null when no defensible value exists. Pools use the
+ * minimum across members with known values; unknown members do not veto the result and are counted
+ * separately so partial coverage stays visible.
  */
+
 export function specContextWindow(
   spec: string,
   cfg: Config,
