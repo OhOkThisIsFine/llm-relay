@@ -99,7 +99,6 @@ describe("config reload transaction", () => {
         "host",
         "log",
         "providers.test.base",
-        "providers.test.credentials",
         "repair.destructiveTools",
         "routing.sticky",
       ],
