@@ -13,6 +13,8 @@ import type { Config } from "../src/config.js";
 import { CONTROL_AUTHORIZATION_HEADER } from "../src/control-authorization.js";
 import {
   beginLaneRequest,
+  createLaneActivityTag,
+  withLaneActivityHeader,
   LANE_ACTIVITY_HEADER,
   laneActivityTag,
   MAX_LANE_ACTIVITY_TAGS,
@@ -25,6 +27,22 @@ const TOKEN = "lane-activity-control-token";
 const TAG = "0123456789abcdef0123456789abcdef";
 
 beforeEach(() => resetLaneActivity());
+
+describe("lane activity tag helpers", () => {
+  it("creates a valid opaque tag and replaces only the inherited activity header", () => {
+    const tag = createLaneActivityTag();
+    expect(laneActivityTag(tag)).toBe(tag);
+    expect(tag).toHaveLength(32);
+
+    expect(withLaneActivityHeader(undefined, tag)).toBe(`${LANE_ACTIVITY_HEADER}: ${tag}`);
+    expect(
+      withLaneActivityHeader(
+        "x-other: keep\nX-LLM-RELAY-LANE-ACTIVITY: inherited\nx-more: keep-too",
+        tag,
+      ),
+    ).toBe(`x-other: keep\nx-more: keep-too\n${LANE_ACTIVITY_HEADER}: ${tag}`);
+  });
+});
 
 describe("lane activity records", () => {
   it("accepts only a tag from the closed alphabet", () => {
