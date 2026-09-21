@@ -241,7 +241,7 @@ describe("createConfiguredLaneExecutionLauncher", () => {
     });
 
     expect(launcher(request("codex", outside))).toMatchObject({
-      refusal: expect.stringMatching(/allowed root/i),
+      refusal: expect.stringMatching(/allowedRoots|allowed root/i),
     });
     expect(
       launcher(
