@@ -2366,6 +2366,182 @@ export class McpDispatchServer {
     return { run: emptyRun(), abandoned: true };
   }
 
+  /** Broker client containment: an injected client may throw, production never should. */
+  private async brokerRequest(request: LaneExecutionStartRequest | { action: "status" | "cancel"; executionId: string }): Promise<LaneExecutionClientResult> {
+    const client = this.deps.laneExecutionClient;
+    if (client === undefined) {
+      return { ok: false, kind: "unavailable", status: null, message: "lane execution broker client is unavailable" };
+    }
+    try {
+      return await client.request(request);
+    } catch {
+      return { ok: false, kind: "unavailable", status: null, message: "lane execution broker client failed" };
+    }
+  }
+
+  private brokerSnapshotMatches(
+    snapshot: LaneExecutionSnapshot,
+    jobId: string,
+    laneId: string,
+    executionId: string,
+  ): boolean {
+    return snapshot.executionId === executionId && snapshot.jobId === jobId && snapshot.laneId === laneId;
+  }
+
+  private brokerRun(snapshot: LaneExecutionSnapshot): LaneRunResult {
+    return {
+      code: snapshot.code ?? null,
+      stdout: snapshot.stdout ?? "",
+      stderr: snapshot.stderr ?? "",
+      timedOut: snapshot.timedOut ?? snapshot.status === "timed_out",
+    };
+  }
+
+  /** Wait for a started/possibly-started daemon execution without ever duplicating it locally. */
+  private async waitBrokerLane(
+    jobId: string,
+    lane: DispatchLane,
+    invoke: NonNullable<DispatchLane["invoke"]>,
+    opts: WalkOptions,
+    startedAt: number,
+    startRequest: LaneExecutionStartRequest,
+    initial: LaneExecutionClientResult,
+  ): Promise<LaneAttemptOutcome> {
+    let response = initial;
+    let startConfirmed = initial.ok;
+
+    for (;;) {
+      if (response.ok) {
+        const snapshot = response.execution;
+        if (!this.brokerSnapshotMatches(snapshot, jobId, lane.id, startRequest.executionId)) {
+          // A malformed/mismatched 2xx is uncertainty, not permission to spawn another process.
+          await pollTimer(BROKER_STATUS_POLL_MS);
+          response = await this.brokerRequest({ action: "status", executionId: startRequest.executionId });
+          continue;
+        }
+        startConfirmed = true;
+        if (snapshot.status === "running") {
+          this.liveBrokerSnapshots.set(jobId, snapshot);
+          // Running snapshots update output/launch diagnostics only; terminal snapshots are settled
+          // by the ordinary walk below, never by the restart-only collector.
+          this.jobs.applyBrokerSnapshot(jobId, snapshot);
+          await pollTimer(BROKER_STATUS_POLL_MS);
+          response = await this.brokerRequest({ action: "status", executionId: startRequest.executionId });
+          continue;
+        }
+
+        this.liveBrokerSnapshots.delete(jobId);
+        this.brokerCpu.delete(jobId);
+        return this.settleSpawnedRun(jobId, lane, invoke, opts, startedAt, this.brokerRun(snapshot));
+      }
+
+      if (!startConfirmed) {
+        if (response.kind === "rejected" && response.status !== null) {
+          // The daemon answered the start and did not create this execution.
+          this.jobs.clearBrokerExecution(jobId);
+          return failedOutcome(response.message);
+        }
+        // Transport/invalid-response after START is ambiguous. Re-send the SAME idempotent start;
+        // never fall back locally after a start may have reached the daemon.
+        await pollTimer(BROKER_STATUS_POLL_MS);
+        response = await this.brokerRequest(startRequest);
+        continue;
+      }
+
+      if (response.kind === "rejected") {
+        this.jobs.clearBrokerExecution(jobId);
+        this.liveBrokerSnapshots.delete(jobId);
+        this.brokerCpu.delete(jobId);
+        return failedOutcome(
+          response.status === 404
+            ? "the relay daemon lost the brokered lane execution before it returned a terminal result"
+            : response.message,
+        );
+      }
+
+      // A live execution plus temporary transport/protocol uncertainty stays alive and is polled.
+      await pollTimer(BROKER_STATUS_POLL_MS);
+      response = await this.brokerRequest({ action: "status", executionId: startRequest.executionId });
+    }
+  }
+
+  /** Idempotently cancel one broker attempt before the walk advances to another rung. */
+  private async stopBrokerLane(executionId: string): Promise<void> {
+    for (;;) {
+      const response = await this.brokerRequest({ action: "cancel", executionId });
+      if (response.ok) return;
+      if (response.kind === "rejected" && (response.status === 404 || response.status === 503)) return;
+      await pollTimer(BROKER_STATUS_POLL_MS);
+    }
+  }
+
+  /**
+   * Try daemon ownership. null = no broker client (legacy/embed); {fallback} = broker unavailable
+   * BEFORE any start request, so a local spawn is safe; otherwise return the daemon-owned handle.
+   */
+  private async tryStartBrokerLane(
+    jobId: string,
+    lane: DispatchLane,
+    task: string,
+    opts: WalkOptions,
+    invoke: NonNullable<DispatchLane["invoke"]>,
+  ): Promise<StartedLaneHandle | { fallback: string } | null> {
+    if (this.deps.laneExecutionClient === undefined) return null;
+
+    let executionId = createLaneExecutionId();
+    // Preflight is intentionally a STATUS for a random id. If it cannot reach/understand a broker,
+    // no start request has been sent yet and local fallback cannot duplicate work.
+    for (let collision = 0; collision < 3; collision += 1) {
+      const probe = await this.brokerRequest({ action: "status", executionId });
+      if (!probe.ok && probe.kind === "rejected" && probe.status === 404) break;
+      if (!probe.ok) return { fallback: probe.message };
+      executionId = createLaneExecutionId();
+      if (collision === 2) return { fallback: "could not allocate a unique daemon execution id" };
+    }
+
+    const startRequest: LaneExecutionStartRequest = {
+      action: "start",
+      executionId,
+      jobId,
+      laneId: lane.id,
+      task,
+      cwd: opts.cwd,
+      timeoutMs: opts.timeoutMs,
+      depth: opts.depth,
+      ...(opts.tier === undefined ? {} : { tier: opts.tier }),
+      ...(opts.readOnly ? { readOnly: true, callerRoot: this.cwd() } : {}),
+      host: opts.host,
+    };
+
+    // WAL ordering: persist the opaque daemon execution id BEFORE sending the idempotent start.
+    this.jobs.noteBrokerExecution(jobId, executionId);
+    this.jobs.noteExecutionOwner(jobId, "relay-daemon");
+    const startedAt = this.now();
+    const initial = await this.brokerRequest(startRequest);
+
+    if (!initial.ok && initial.kind === "rejected" && initial.status !== null) {
+      // Reachable broker refused before creating an execution. A transient 503 is safe to fall back
+      // locally because the route itself says no broker owns the id; other refusals are lane failure.
+      this.jobs.clearBrokerExecution(jobId);
+      if (initial.status === 503) return { fallback: initial.message };
+      return {
+        result: Promise.resolve(failedOutcome(initial.message)),
+        kill: () => {},
+      };
+    }
+
+    let cancelPromise: Promise<void> | undefined;
+    const result = this.waitBrokerLane(jobId, lane, invoke, opts, startedAt, startRequest, initial);
+    return {
+      result,
+      brokerExecutionId: executionId,
+      kill: () => {
+        cancelPromise ??= this.stopBrokerLane(executionId);
+      },
+      waitForKill: () => cancelPromise ?? Promise.resolve(),
+    };
+  }
+
   /**
    * Start ONE lane and hand back its promise plus a kill handle. Two shapes, decided exactly as
    * `toolDispatch` used to decide them: a `relay` rung in answer mode is a direct HTTP call to
