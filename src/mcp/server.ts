@@ -1,24 +1,7 @@
 /**
- * The `llm-relay mcp` server — one dispatch verb, callable from any MCP host.
- *
- * WHAT PROBLEM THIS SOLVES. `llm-relay dispatch --next-command` answers "which lane" correctly and
- * then hands the caller a COMMAND to execute. Two things go wrong with that, and both are measured:
- *
- * 1. The answer's SHAPE depends on the host. A routed Claude Code session gets a `target:` spec to
- *    address as a subagent; a bypassed or headless one gets a `run:` command. The caller must
- *    branch on mechanism, which is exactly what the owner asked never to be necessary.
- * 2. Executing the command correctly is hard. `lane-runner.ts` lists five distinct measured ways
- *    to get it wrong, each of which cost a release or a wasted lane run.
- *
- * This server removes both. Every host makes the same call and receives an ANSWER, not a command.
- *
- * WHERE IT RUNS. As a stdio child of the HOST, launched as `llm-relay mcp`. It is NOT part of the
- * relay daemon, and it answers no HTTP. The daemon's rule that no HTTP turn may spawn a lane is
- * therefore untouched — this process is the host's own spawn mechanism wearing a protocol.
- *
- * SEAMS. Every environment dependency is injected (`buildView`, `spawn`, `now`, `cwd`), so the
- * suite exercises the whole surface without spawning a real lane or spending real quota. Same
- * discipline as `lane-quota-probe.ts` and `availability-snapshot.ts`.
+ * MCP dispatch server for host-launched stdio clients. It gives every host the same task-to-answer
+ * interface and delegates lane execution to `lane-runner.ts`. It is separate from the HTTP relay
+ * daemon; external effects are injected for tests.
  */
 import type { Config } from "../config.js";
 import { buildLaneEnv } from "../lane-launch-env.js";
@@ -163,11 +146,7 @@ export interface McpServerDeps {
   /** The platform whose environment rules the lane launcher applies; defaults to `process.platform`. */
   platform?: NodeJS.Platform;
   maxDepth?: number;
-  /**
-   * Version reported in `serverInfo`. Injected because `process.env.npm_package_version` is only
-   * set when npm launched the process, and a host launches this one directly — so reading it here
-   * reported "0.0.0" to every real client. Measured on the first live handshake.
-   */
+  /** Version reported in `serverInfo`; injected because hosts launch the binary outside npm. */
   version?: string;
   /** Reports positive lane quota evidence to the relay's exhaustion state. */
   reportExhaustion?: (report: DispatchedQuotaReport) => Promise<void> | void;
@@ -194,12 +173,7 @@ export interface McpServerDeps {
    * orphan rows are reconciled instead of being declared killed from the MCP owner pid alone.
    */
   laneExecutionClient?: LaneExecutionClient;
-  /**
-   * The llm-relay version INSTALLED on disk now, read fresh on each call — or null when unknown.
-   * When it differs from `version` (the code this process started with), every tool reply says so:
-   * the Claude desktop app keeps one MCP process alive across sessions and releases, and on
-   * 2026-09-10 two processes from before v0.78.0 were still serving old code with no sign of it.
-   */
+  /** Current installed version, used to warn when a long-lived MCP process is running older code. */
   installedVersion?: () => string | null;
   /**
    * AGY's log, read after an AGY lane ends or is stopped, so a quota death AGY stated only in its
@@ -217,17 +191,8 @@ interface ToolDefinition {
 }
 
 /**
- * The `initialize` instructions. An MCP host puts this in the model's system prompt
- * unconditionally, so it is the ONE channel here that cannot be deferred, collapsed to a bare
- * tool name, or missed because the model never went looking. The tool descriptions below say
- * WHAT each tool does; a host only reads them once the model has already decided to delegate.
- *
- * ⚠ So this text must state WHEN to delegate, not just what the tool is. It carried only the
- * "what" until 2026-08-30, and the measured consequence was that the operator had to say
- * "use llm-relay for offload" out loud — on a machine whose own CLAUDE.md already said
- * "PREFER THE MCP TOOL" in bold. Prose the model must go and find is not a trigger.
- *
- * Keep it short: every host pays for it in every session. Pinned by `test/mcp-server.test.ts`.
+ * Always-loaded MCP instructions. They must state when to delegate as well as what the tools do,
+ * and stay short because every host pays for them in every session.
  */
 export const MCP_INSTRUCTIONS =
   "Use dispatch from every MCP host — Claude, Codex, desktop, CLI, or otherwise — to hand a " +
@@ -507,15 +472,7 @@ function readRecord(params: Record<string, unknown>, key: string): Record<string
   return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
 }
 
-/**
- * `"timed_out"` and `"killed"` join `"failed"` as error results for the MCP `isError` flag — a
- * caller that only checks `isError` must not read a lane that never finished as a success.
- *
- * ⚠ A total switch closed with `const _never: never`, not an `||` chain. The union grew a member
- * this lap (`"killed"`) and the chain form would have absorbed it silently as a SUCCESS — the
- * closed-union defect CLAUDE.md records eight times, in the one function whose whole job is to keep
- * a dead lane from reading as a live answer.
- */
+/** MCP error classification. The exhaustive switch forces new job statuses to be handled explicitly. */
 function isFailureStatus(status: JobStatus): boolean {
   switch (status) {
     case "completed":
@@ -546,8 +503,7 @@ function formatTimeToAnswer(t: {
 }): string {
   const s = (ms: number | null): string => (ms === null ? "n/a" : `${Math.round(ms / 1000)}s`);
   const inMode = t.mode ? `, ${t.mode} mode` : "";
-  // "on record", not "completed": a window written before 2026-09-10 may still hold a duration of a
-  // run that did not answer (`restoreLaneStatsRows` empties only a window that PROVABLY does).
+  // Legacy restored windows may contain durations that predate completed-only sampling.
   const runs = `${t.samples} run${t.samples === 1 ? "" : "s"} on record${inMode}`;
   return `usually answers in: median ${s(t.medianMs)}, p80 ${s(t.p80Ms)} (${runs})`;
 }
@@ -564,13 +520,8 @@ function runningTimeToAnswer(job: LaneJob): string | null {
 }
 
 /**
- * A RUNNING spawned attempt's output so far: how long the lane has been silent, or how much it has
- * written and how long ago. Null for anything else — a finished job, or an answer-mode call, which
- * has no output stream and must not read as "silent".
- *
- * ⚠ The zero-output line says why silence alone proves nothing: `claude -p` buffers its whole
- * answer until exit. Without that, a caller reading "silent for 300 s" on the free pool would cancel
- * a healthy run — the false failure the backlog item names as worse than an honest slow status.
+ * Output diagnostics for a running spawned attempt. Null for terminal jobs and answer-mode calls.
+ * Silence is descriptive only; some harnesses buffer output until exit.
  */
 export function describeActivity(job: LaneJob, now: number): string | null {
   if (job.status !== "running" || job.activity === undefined) return null;
@@ -601,17 +552,7 @@ function laneEvidenceBits(lane: DispatchLane): string[] {
   return bits;
 }
 
-/**
- * Render a job for a caller.
- *
- * ⚠ The lane's own stdout is reported as the ANSWER, and the lane is NAMED beside it. This
- * repository's rule is that dispatch "never pretends a CLI answered" — a result that hid which
- * lane produced it would do exactly that, so provenance rides every response.
- */
-/**
- * Answer-mode provenance — the direct-HTTP sibling of the lane id/spec/elapsed every job already
- * carries. Empty for every agent-mode job, which never touches HTTP directly.
- */
+/** Answer-mode HTTP provenance. Agent-mode jobs have no relay headers to report. */
 function relayProvenanceLines(job: LaneJob): string[] {
   const relay = job.relay;
   if (!relay) return [];
@@ -1046,25 +987,12 @@ function laneSummary(lane: DispatchLane, inFlight: number): string {
   return bits.join(" ");
 }
 
-/**
- * MCP clients (`initialize` `clientInfo.name`) measured to survive a long tool call, so `dispatch`
- * may wait for the answer the way the host's own subagent does, up to `routing.mcp.blockingWaitMs`.
- *
- * Measured 2026-09-17 (`docs/history/mcp-host-timeouts-2026-09-17.md`): Claude Code 2.1.237 (`claude-code`)
- * completed a 240 s tool call headless, with and without progress. Two hosts are deliberately NOT
- * here: the Claude desktop chat client (`claude-ai`) cancelled at exactly 60 s, and Codex runs a
- * call inside a code-mode `exec` that yields at 31 s. An unknown client keeps `maxWaitMs`.
- */
+/** Clients verified to support the long blocking wait when they supply a progress token. */
 export const BLOCKING_WAIT_CLIENTS: readonly string[] = ["claude-code"];
 
 /**
- * MCP clients whose tool-call limit is known and above `maxWaitMs`, but which send no progress
- * token and never reset that limit. `dispatch` waits up to this figure for them, with no progress.
- *
- * `claude-ai` is the Claude Desktop app (read from its 2.110.1 bundle, 2026-09-17). It calls a local
- * server on two paths: desktop chat passes a 300 s timeout, and a Code tab session passes none, so
- * the MCP SDK default of 60 s applies. The server cannot tell the two paths apart, so the figure
- * stays 10 s under the smaller one. `blockingWaitMs: 0` turns this off too.
+ * Known host ceilings for clients without progress tokens. Values stay below the smallest verified
+ * host timeout; `blockingWaitMs: 0` disables this path.
  */
 export const HOST_WAIT_CEILING_MS: Readonly<Record<string, number>> = { "claude-ai": 50_000 };
 
@@ -1122,12 +1050,8 @@ export class McpDispatchServer {
   }
 
   /**
-   * Feed raw stdin bytes. Complete messages are handled concurrently; a partial tail is carried
-   * over. Resolves once every handler in THIS chunk has settled.
-   *
-   * ⚠ Deliberately not `async`: the split runs to completion before the first handler starts, so
-   * two calls in flight at once cannot interleave or reorder the buffer — message order is the
-   * write order whatever the caller awaits. `serve` depends on exactly that.
+   * Feed raw stdin bytes. Complete messages run concurrently; a partial tail is retained. Splitting
+   * is synchronous so concurrent handlers cannot reorder the input buffer.
    */
   ingest(chunk: string): Promise<void> {
     this.buffer += chunk;
@@ -1137,22 +1061,9 @@ export class McpDispatchServer {
   }
 
   /**
-   * Serve a stream of stdin chunks until the source ends.
-   *
-   * ⚠ Reads every chunk the moment it arrives and NEVER awaits a handler. Until 2026-09-05
-   * `cli.ts` ran `for await (chunk) { await server.ingest(chunk) }`, and `ingest` resolves only
-   * when every handler in the chunk has settled — so a `tools/call` written while another was in
-   * flight was not even READ until the first returned. Two requests were concurrent only when
-   * they landed in the same chunk; a host that issues parallel tool calls in separate writes
-   * (Claude Code does) had its second `dispatch` wait behind the first's full `waitMs`, and
-   * `dispatch_status` / `dispatch_cancel` could not reach a job while a blocking `dispatch` held
-   * the loop. Each handler now settles on its own promise; the per-job wait/poll policy
-   * (`awaitOrPoll`) is unchanged. Responses may therefore leave out of request order, which
-   * JSON-RPC permits — ids correlate.
-   *
-   * A rejected `ingest` (a response write failed — the host closed the pipe mid-answer; every
-   * handler error is already contained inside `handleLine`) is reported on stderr and never
-   * takes the loop down. Resolves after the source ends AND every handler it started has settled.
+   * Read stdin continuously without awaiting individual handlers, so status/cancel calls can reach
+   * jobs while a dispatch blocks. JSON-RPC ids permit out-of-order replies. Resolves after input ends
+   * and all started handlers settle.
    */
   async serve(source: AsyncIterable<string>): Promise<void> {
     const inFlight = new Set<Promise<void>>();
@@ -1295,13 +1206,7 @@ export class McpDispatchServer {
     }
   }
 
-  /**
-   * Append a notice to a tool reply when this process runs OLDER code than the version installed on
-   * disk. The Claude desktop app keeps one MCP process alive across sessions and releases, and on
-   * 2026-09-10 two processes from before v0.78.0 were still serving old code with nothing to say so.
-   * Only a plain one-block text reply is touched; anything else passes through unchanged. A version
-   * that cannot be read is unknown, and unknown adds nothing.
-   */
+  /** Warn plain-text replies when this long-lived process is older than the installed package. */
   private withVersionNotice(result: unknown): unknown {
     const running = this.deps.version;
     const installed = ((): string | null => {
@@ -1343,12 +1248,7 @@ export class McpDispatchServer {
     return textResult(`tier: ${view.tier ?? "default"}${rule}\n\n${lines.join("\n")}${next}`);
   }
 
-  /**
-   * ⚠ A TERMINAL job's status IS its result. A native subagent hands its answer back the moment it
-   * ends; a caller that polls `dispatch_status` and never thinks to call `dispatch_result` was
-   * measured polling one finished job 2,023 times over 71 minutes (2026-09-16). So the first poll
-   * that sees the job end already holds the answer; a running job keeps the short form.
-   */
+  /** Terminal status replies include the result; running jobs keep the short status form. */
   private async toolStatus(args: Record<string, unknown>): Promise<unknown> {
     const jobId = readString(args, "jobId");
     if (!jobId) {
@@ -1478,13 +1378,7 @@ export class McpDispatchServer {
     return textResult(cancelled ? `cancelled ${jobId}` : `${jobId} was already ${job.status}`);
   }
 
-  /**
-   * The blocking-wait cap for this call, or null when the call gets the ordinary `maxWaitMs`.
-   * Three conditions: the host is one measured to survive a long call, the call asked for progress
-   * (so the host shows the wait and, per its documentation, resets its idle timer), and the
-   * operator did not turn the blocking wait off. A host in `HOST_WAIT_CEILING_MS` instead gets its
-   * known ceiling, with no progress and no token required.
-   */
+  /** Resolve a host-specific blocking wait, or null to use the ordinary `maxWaitMs`. */
   private blockingWaitFor(
     ctx: CallContext,
     maxWaitMs: number,
@@ -1506,10 +1400,7 @@ export class McpDispatchServer {
     const task = readString(args, "task");
     if (!task) return textResult("dispatch requires a non-empty task", true);
 
-    // ⚠ Recursion bound. A dispatched lane is itself an agent that can reach this same server, so
-    // without this a delegation loop is reachable and would spend quota until something died.
-    // Checked before anything branches, and before the spawn/fetch it bounds — the refusal must
-    // cost nothing.
+    // Refuse recursive delegation before any lane work starts.
     const depth = currentDepth();
     if (depth >= this.maxDepth) {
       return textResult(
@@ -1521,8 +1412,7 @@ export class McpDispatchServer {
 
     const lane = readString(args, "lane");
     const model = readString(args, "model");
-    // ⚠ Refused before anything is built or spawned: `lane` names a ladder rung and `model` a routing
-    // spec, so honouring either one would silently ignore the other.
+    // `lane` and `model` name different target namespaces; accepting both would ignore one.
     if (lane !== undefined && model !== undefined) {
       return textResult(
         "dispatch takes lane or model, not both: lane names a ladder rung, model names a routing spec",
@@ -1538,10 +1428,7 @@ export class McpDispatchServer {
     // claim the whole ladder was tried (`FORCED_LANE_ADVICE`).
     const forced = lane !== undefined || model !== undefined;
 
-    // ⚠ `?.` on `routing`, not just on the key. `McpServerDeps.config` is a public interface and a
-    // programmatic caller may hand over a partial config; a bare `.routing.dispatchWalk` throws
-    // there, and a throw inside a tool handler becomes a JSON-RPC error with no lane run at all.
-    // Absent settings mean the walk is off, which is the WEAKER claim and the safe fall-through.
+    // Programmatic embeds may provide partial config; absent walk settings mean walking is off.
     const declared = this.deps.config.routing?.dispatchWalk;
     const walk = declared !== undefined && declared.enabled ? declared : null;
     const { ordered, notTried } = this.walkOrder(view, walk, forced, view.next.id);
@@ -1562,10 +1449,7 @@ export class McpDispatchServer {
       dispatchSource: view.source === "local-fallback" ? "fallback" : "daemon",
     };
 
-    // ⚠ The read-only boundary is checked HERE, before anything spawns. A read-only dispatch asked
-    // to run in the caller's own tree is refused with zero egress, for the same reason the recursion
-    // bound and the `waitMs` refusal are checked before the spawn: a refusal must cost no lane run.
-    // The instruction "do not edit any file" is advice; the working directory is the mechanism.
+    // Enforce read-only containment before any egress or process spawn.
     const readOnlyVerdictResult = readOnlyVerdict({
       readOnly: opts.readOnly,
       mode: opts.mode,
@@ -1584,10 +1468,7 @@ export class McpDispatchServer {
     // What this dispatch was allowed to reach. Both halves gate the terminal advice below: it may
     // claim the ladder was exhausted only when a walk actually ran and nothing was left untried.
     this.jobs.noteWalkScope(job.id, { enabled: walk !== null, lanesNotTried: notTried, forced });
-    // ⚠ The blocking wait is bounded by the host's tool-call ceiling, never by the caller's
-    // ask alone: above ~45 s the host fails the call AND destroys the job handle. `?.` on
-    // `routing` for the same partial-config reason the walk lookup states above; an absent
-    // ceiling means the default.
+    // Bound blocking wait by the host/config ceiling so the caller keeps a pollable job handle.
     const maxWaitMs = this.deps.config.routing?.mcp?.maxWaitMs ?? DEFAULT_MCP_MAX_WAIT_MS;
     const blocking = this.blockingWaitFor(ctx, maxWaitMs);
     const ceiling = blocking?.ms ?? maxWaitMs;
@@ -1596,10 +1477,7 @@ export class McpDispatchServer {
     // A `waitMs` the server cannot honour is refused BEFORE anything spawns — the refusal must
     // cost no lane run, exactly like the recursion bound above.
     if ("refusal" in waitMs) return textResult(waitMs.refusal, true);
-    // ⚠ A walk must ALWAYS leave the job terminal. `runWalk` is written not to reject — every
-    // failure a lane can produce is an attempt — but the worst outcome available here is a caller
-    // polling a handle that can never settle, so an unexpected throw is caught and turned into a
-    // terminal failure rather than trusted not to happen.
+    // Unexpected walk errors still settle the job; a job handle must never remain permanently running.
     const settled = this.runWalk(job.id, view, ordered, task, opts)
       .catch(async (e: Error) => {
         await this.recordTreeDelta(job.id);
@@ -1618,21 +1496,9 @@ export class McpDispatchServer {
   }
 
   /**
-   * The lanes this dispatch will try, best first, and how many selectable lanes it leaves untried.
-   *
-   * `view.order` is the ONE definition of selection order (`dispatch.ts`). With the walk turned off
-   * — or with a view that carries no order — this collapses to EXACTLY the pre-walk behaviour: the
-   * single lane the view named as `next`, tried once, and never stopped for idleness.
-   *
-   * ⚠ The `Array.isArray` test is a VERSION SKEW guard, not defensive noise. `buildView` reaches the
-   * running daemon over HTTP, and a daemon started before this field existed answers without it — an
-   * MCP child upgraded ahead of a long-running daemon is the normal state on a machine that starts
-   * the relay at logon and leaves it up for days. Reading `.length` off `undefined` there would throw
-   * on EVERY dispatch, turning a new optional field into a total outage.
-   *
-   * ⚠ A second skew guard: a daemon older than `requester=mcp` still offers a pass-through rung as
-   * ready, and this process can never run one (`mcpPassThroughReason`). Such a lane is dropped from an
-   * UNFORCED walk here; a caller who named it still reaches it and reads why it cannot run.
+   * Resolve the lanes this dispatch will try. `view.order` owns selection order; missing order
+   * preserves single-lane behavior for version skew. Unforced walks also drop pass-through lanes an
+   * MCP child cannot execute.
    */
   private walkOrder(
     view: DispatchView,
@@ -1659,17 +1525,8 @@ export class McpDispatchServer {
   }
 
   /**
-   * Try each lane in turn until one answers. THE JOB IS THE WALK.
-   *
-   * ⚠ That is the load-bearing choice, and it is forced by a measurement: an MCP client tool call
-   * on this machine fails somewhere between 45 s and 100 s, and above that ceiling it destroys the
-   * job handle as well (a filed machine-wide defect; five lanes were lost to it in one night). So
-   * the walk cannot finish inside the blocking call. It continues in the background behind ONE
-   * handle, `dispatch_status` reports the lane running now, and `attempts` records the rest.
-   * Re-pointing the handle at each new lane instead would break polling outright.
-   *
-   * Never rejects: every failure a lane can produce is an ATTEMPT, and the walk decides what to do
-   * with it. Only a caller error ends the walk early — see `refusal` on `LaneAttemptOutcome`.
+   * Walk lanes behind one persistent job handle until one answers. Lane failures become attempt
+   * records; only caller errors end the walk as refusals.
    */
   private async runWalk(
     jobId: string,
@@ -1710,11 +1567,7 @@ export class McpDispatchServer {
       this.jobs.setCurrentLane(jobId, lane.id, lane.spec, lane.timeToAnswer);
       if (readOnly.bound !== undefined) this.jobs.noteReadOnly(jobId, lane.id, readOnly.bound.binding);
 
-      // ⚠ A lane is stopped only when it is IDLE — no relay traffic, no output, no file change for
-      // `idleMs` (owner decision 2026-09-17) — never because it ran longer than other runs did. The
-      // LAST lane is never stopped: with nowhere to move to, stopping it throws away the only answer
-      // still coming. Nor is a lane with nothing reliable after it (`stopWithheld`). Its own
-      // `timeoutMs` still bounds every lane.
+      // Idle stopping applies only when a useful later lane exists; each lane's own timeout still applies.
       const isLast = i === laneIds.length - 1;
       const idleMs = this.stopWithheld(view, laneIds, i) ? null : opts.idleMs;
       const startedAt = this.now();
