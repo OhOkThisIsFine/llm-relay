@@ -304,6 +304,7 @@ export function isArchivedJob(value: unknown): value is ArchivedJob {
     optStrings("launch") &&
     (value["process"] === undefined || isProcessReport(value["process"])) &&
     (value["dispatchSource"] === undefined || value["dispatchSource"] === "daemon" || value["dispatchSource"] === "fallback") &&
+    (value["executionOwner"] === undefined || value["executionOwner"] === "relay-daemon" || value["executionOwner"] === "local-fallback") &&
     (value["relay"] === undefined || isRecord(value["relay"])) &&
     (value["readOnly"] === undefined || isRecord(value["readOnly"]))
   );
