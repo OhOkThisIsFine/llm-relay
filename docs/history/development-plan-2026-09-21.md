@@ -4,6 +4,11 @@
 **Queue authority:** [`../backlog.md`](../backlog.md).  
 **Current-state authority:** [`../../HANDOFF.md`](../../HANDOFF.md).
 
+**Documentation checkpoint:** PR #70 (`fad96b7`) reconciled the live docs and implementation
+comments with the v0.86.0/D1/D2 state. Post-merge CI run 782 passed both required checks. This did
+not advance or reopen the continuation gate; Phase 5.2 remains blocked on live exact-resume +
+same-cwd isolation evidence.
+
 ## Goal
 
 Finish the remaining live evidence gates, then implement active hard-cap continuation one verified
