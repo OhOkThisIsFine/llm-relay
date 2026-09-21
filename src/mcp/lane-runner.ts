@@ -196,46 +196,20 @@ export interface LaneJob {
   laneId: string;
   /** What the rung addresses (`pool/high`, `agy`, …), when it names one. */
   spec: string | undefined;
-  /**
-   * Every lane this job tried, oldest first. Empty for a job that never advanced past its first
-   * lane and is still running; one entry for an ordinary single-lane dispatch that settled.
-   *
-   * ⚠ The JOB is the WALK, not one lane, and this field is what makes that legible. The walk
-   * cannot finish inside one blocking call — the measured client tool-call ceiling on this machine
-   * is between 45 s and 100 s, and above it the call fails AND destroys the job handle — so it
-   * continues in the background behind ONE handle. Re-pointing the handle at each new lane instead
-   * would break polling outright.
-   */
+  /** Every lane this job tried, oldest first. One job id follows the whole walk across lanes. */
   attempts: LaneAttempt[];
   /**
    * Selectable lanes the walk's `maxLanes` bound kept it from trying. Absent when it tried
    * everything the ladder offered — see `LaneJobStore.noteWalkScope`.
    */
   lanesNotTried?: number;
-  /**
-   * Whether this job ran as a WALK at all, or as the single pre-walk lane
-   * (`routing.dispatchWalk: false`).
-   *
-   * ⚠ It exists because a renderer cannot tell those apart from `attempts` alone: a walk that
-   * legitimately exhausted a one-rung ladder and a walk-disabled dispatch that tried its one lane
-   * produce the same record. Saying "every lane has been tried" for the second is false, and it
-   * also breaks the documented promise that `dispatchWalk: false` restores the pre-walk behaviour
-   * exactly — the pre-walk answer carried no such advice at all.
-   */
+  /** Whether dispatch walking was enabled; rendering uses this to avoid false exhaustion advice. */
   walkEnabled?: boolean;
-  /**
-   * The caller NAMED what to run — a `lane` override, or a `model` run as its own one-lane view —
-   * so the walk ran exactly one lane on purpose. `jobAnswer` then says that only that lane ran:
-   * "every dispatch lane has now been tried" would be false there, and it tells an autonomous
-   * caller to stop delegating altogether (measured 2026-09-10 on jobs 0023 and 0024).
-   */
+  /** The caller explicitly named a lane/model, so only that one target was intended to run. */
   forcedLane?: boolean;
   /**
-   * How long the lane now running usually takes to ANSWER in this dispatch's mode, from that
-   * lane's own completed runs. Diagnostic only: it gives duration context, but the caller follows
-   * `liveness.verdict` rather than deciding "stuck" from history. 23 of the 182 unanswered
-   * dispatches in the 2026-09-10 transcript sweep ended with the caller simply no longer polling.
-   * Absent when the lane has no completed run on record.
+   * Completed-run duration context for the current lane. Diagnostic only; liveness decisions use
+   * `liveness.verdict`. Absent when there is no completed-run history.
    */
   expected?: { medianMs: number | null; p80Ms: number | null; samples: number };
   startedAt: number;
@@ -261,13 +235,7 @@ export interface LaneJob {
    * reaches a terminal state. See `LaneProcessReport`.
    */
   process?: LaneProcessReport;
-  /**
-   * What the lane now running has produced so far, and when it last produced anything — so a poll
-   * can say how long a lane has been SILENT (`docs/backlog.md`: a Muse Spark lane logged a stream
-   * error in its first second, produced nothing more, and read `running` for nine minutes with
-   * nothing on the status to distinguish it from a lane still thinking). Present only while a
-   * SPAWNED attempt runs; an answer-mode call has no output stream and carries none.
-   */
+  /** Output byte/timestamp diagnostics for a spawned running attempt. Answer-mode HTTP calls omit it. */
   activity?: LaneActivity;
   /**
    * This record was read back from the archive after an MCP server restart: the job ended in a
@@ -518,19 +486,7 @@ export interface LaneSpawnOptions {
   onOutput?: ((chunk: { stream: "stdout" | "stderr"; bytes: number }) => void) | undefined;
 }
 
-/**
- * The spawn seam. Injected so the suite can exercise every path without spending real lane quota —
- * the same discipline `lane-quota-probe.ts` applies, and the reason its default spawner refuses to
- * run under vitest.
- */
-/**
- * What the store needs in order to REAP what a job owns and to report it: a way to stop it, and a
- * way to name what it started.
- *
- * ⚠ Narrower than a spawn handle on purpose. `startLane` wraps the spawner's promise in its own
- * outcome promise, so the value the walk registers is NOT a `LaneSpawnHandle` — typing this seam as
- * one would have forced the walk to register something other than what it actually holds.
- */
+/** Process ownership needed for cleanup and survivor reporting. */
 export interface OwnedProcess {
   /**
    * Terminate the process TREE this spawn started. Idempotent, and safe to call after the child has
@@ -538,11 +494,8 @@ export interface OwnedProcess {
    */
   kill: () => void;
   /**
-   * The root pids this spawn started, read LAZILY.
-   *
-   * ⚠ A thunk, not a number: the Windows shell fallback REPLACES the root process (an npm `.cmd`
-   * shim answers ENOENT and the real child is spawned through `exec`), so the pid is only knowable
-   * after the fact. Optional, so a hand-written test double that owns no OS process can omit it.
+   * Root pids, read lazily because Windows shim fallback can replace the initially attempted child.
+   * Test doubles that own no OS process may omit this.
    */
   pids?: () => number[];
 }
@@ -812,15 +765,8 @@ const nodeProcessApi: LaneProcessApi = {
 };
 
 /**
- * The real spawner.
- *
- * ⚠ Every guard here answers a measured failure; read the module header before removing one.
- * It never rejects — a failure becomes a result the caller can report, because a lane that died
- * is information, not an exception.
- *
- * ⚠ Refuses to spawn under vitest unless the suite injects its own seam. Same rule as
- * `winenv.ts`, `os-keyring.ts` and `lane-quota-probe.ts`: a test run must never spend real quota
- * or touch the operator's live agent sessions.
+ * Production lane spawner. Process failures resolve as `LaneRunResult` values rather than rejecting.
+ * Under vitest it refuses real spawns unless a test injects a seam.
  */
 export function createLaneSpawner(
   processApi: LaneProcessApi,
@@ -846,9 +792,7 @@ export function createLaneSpawner(
       encoding: "utf8",
       maxBuffer: MAX_OUTPUT_BYTES,
       timeout: opts.timeoutMs,
-      // ⚠ A console-subsystem child (agy.exe, codex's shim) makes Windows allocate a console when the
-      // parent has none, and that console steals the desktop focus. The MCP server is launched by a
-      // host that usually has no console, so this flag is not optional here.
+      // Prevent console-subsystem children from allocating a visible console for a console-less host.
       windowsHide: true,
       env: opts.env,
       cwd: opts.cwd,
@@ -905,8 +849,7 @@ export function createLaneSpawner(
         settle(err, stdout ?? "", stderr ?? "");
       });
 
-      // ⚠ An async execFile leaves stdin an OPEN pipe. `agy` reads stdin, finds no EOF, and produces
-      // zero bytes until the timeout kills it. Measured live; the synchronous form hid it.
+      // Some harnesses wait for stdin EOF before running.
       child.stdin?.end();
       observeOutput(child, opts.onOutput);
 
@@ -919,9 +862,7 @@ export function createLaneSpawner(
         if (child?.pid) terminateProcessTree(child.pid, processApi.platform);
         child?.kill();
       },
-      // ⚠ Read lazily, and that is load-bearing rather than tidy: the ENOENT fallback above REPLACES
-      // `child` with the direct Node process, so a pid captured at spawn time would name the shim
-      // that never ran. Whatever root the spawn settled on is what a reaper must terminate.
+      // The Windows shim fallback may replace `child`; report the final root process.
       pids: () => (child?.pid === undefined ? [] : [child.pid]),
     };
   };
@@ -1141,14 +1082,8 @@ export class LaneJobStore {
   }
 
   /**
-   * The jobs a PREVIOUS process died holding. They are adopted as terminal `"killed"` rows rather
-   * than dropped, because the measured cost of dropping them was ninety lane-minutes lost behind a
-   * bare `unknown jobId: job-0051` on a routine poll (2026-09-06).
-   *
-   * ⚠ No process is terminated here and none could be: this process holds no handle for those pids,
-   * and a pid from a previous process may already belong to something else. `process.terminated` is
-   * therefore false, and `ownedProcesses()` reports the job as un-reaped rather than claiming a
-   * termination that never happened.
+   * Adopt rows left by a dead MCP owner. Local rows become `killed`; broker-backed rows are claimed
+   * for daemon reconciliation. Never terminate a pid inherited from another process.
    */
   private adoptOrphans(): void {
     for (const row of this.journal.orphans()) {
@@ -1304,22 +1239,12 @@ export class LaneJobStore {
       // Fall through: the survivor check below is what reports it.
     }
     job.process = { pids, survivors: pids.filter((pid) => this.isAlive(pid)), terminated: true };
-    // ⚠ After the process report, so what is archived is the whole terminal record — and eagerly,
-    // because the restart this guards against runs no shutdown handler (job-archive.ts).
-    // A failed archive commit deliberately leaves the journal row in place; losing fidelity on
-    // restart ("killed" instead of this terminal status) is preferable to losing the job entirely.
+    // Archive the complete terminal/process record before clearing the running journal fallback.
     if (this.archive.record(job)) this.journal.clear(id);
   }
 
 
-  /**
-   * Every process this dispatcher started for a TERMINAL job, keyed by job id — so a stale lane can
-   * be found without enumerating the machine's processes by hand, which is the only way the
-   * measured case was ever found (four `opencode` processes, ~530 MB, burning CPU hours after their
-   * jobs had returned, appearing in no `dispatch_status` listing).
-   *
-   * A still-running job is deliberately absent: it owns its processes on purpose.
-   */
+  /** Process reports for terminal jobs only; running jobs still own their processes intentionally. */
   ownedProcesses(): Array<{ jobId: string; laneId: string; spec: string | undefined } & LaneProcessReport> {
     const rows: Array<{ jobId: string; laneId: string; spec: string | undefined } & LaneProcessReport> = [];
     for (const job of this.jobs.values()) {
@@ -1618,26 +1543,12 @@ export class LaneJobStore {
     job.launch = [...notes];
   }
 
-  /**
-   * Append one tried lane to the walk's record. Appended for EVERY attempt, the winner included,
-   * so the answer can say what it cost to get there — and so an abandoned lane leaves a trace,
-   * which is the case `docs/backlog.md` says matters most ("an operator who gives up on a slow
-   * lane leaves no trace").
-   */
+  /** Append every settled attempt, including the winner, so polls/final output show the walk history. */
   recordAttempt(id: string, attempt: LaneAttempt): void {
     this.jobs.get(id)?.attempts.push(attempt);
   }
 
-  /**
-   * Record what this dispatch was allowed to reach: whether it ran as a WALK, and how many
-   * selectable lanes its own `maxLanes` bound kept it from trying.
-   *
-   * ⚠ No silent caps, and no false claim of exhaustion. Both halves feed the same decision — a
-   * dispatch may only tell the caller "every lane has been tried" when it actually walked and
-   * nothing was left over. A walk that stopped at four of nine lanes, or a dispatch with the walk
-   * turned off entirely, saying that would be false on the one surface the caller acts on. Zero is
-   * not stored, so an uncapped walk renders exactly as it did before this field existed.
-   */
+  /** Record walk enablement and how many selectable lanes were left untried for terminal advice. */
   noteWalkScope(id: string, scope: { enabled: boolean; lanesNotTried: number; forced?: boolean }): void {
     const job = this.jobs.get(id);
     if (!job) return;
@@ -1646,13 +1557,7 @@ export class LaneJobStore {
     if (scope.forced === true) job.forcedLane = true;
   }
 
-  /**
-   * A rung the walk SKIPPED for its `maxConcurrent` cap "counts as NOT TRIED" (the backlog item's
-   * own wording), so it grows the same counter `noteWalkScope`'s `maxLanes` bound uses — one caller
-   * before the walk starts (a fixed bound known in advance), this one during it (a skip discovered
-   * lane by lane) — so `jobAnswer` cannot tell them apart and always prefers the PARTIAL advice over
-   * the EXHAUSTED one whenever anything was left untried, whichever reason left it untried.
-   */
+  /** Count a pre-spawn skip as untried so terminal advice cannot claim ladder exhaustion. */
   noteSkippedLane(id: string): void {
     const job = this.jobs.get(id);
     if (!job) return;
@@ -1660,23 +1565,8 @@ export class LaneJobStore {
   }
 
   /**
-   * How many jobs THIS MCP server process currently has a spawned process running for `laneId` —
-   * the job's CURRENT attempt (`job.laneId`, repointed by `setCurrentLane` as the walk advances
-   * from lane to lane), never its history. A job counts only while `status === "running"`: the
-   * moment an attempt settles (or the whole job ends), it stops occupying a slot.
-   *
-   * ⚠ `excludeJobId` matters, and omitting it is a real bug, not a cosmetic nicety: `create()` sets
-   * a fresh job's `laneId` to its FIRST candidate lane at CREATION, before the walk has attempted
-   * anything — so a walk asking "is my own first lane already at its cap?" would count ITSELF and
-   * skip its own opening attempt, on every dispatch, the moment any `maxConcurrent` is configured.
-   * Passing the asking job's own id excludes it, so this answers "how many OTHER jobs are running
-   * this lane right now" — the question a skip check actually needs.
-   *
-   * ⚠ Per MCP SERVER PROCESS by design. D1 moves the physical child into the daemon, but this
-   * admission policy still counts the jobs THIS MCP store owns or recovered. Another simultaneously
-   * live MCP process is not folded into the number, so two host sessions can together exceed a
-   * rung's `maxConcurrent`. This preserves the documented per-host cap rather than silently turning
-   * it into a machine-wide semaphore.
+   * Running jobs in this MCP store whose current lane is `laneId`. `excludeJobId` avoids counting
+   * the newly-created asking job itself. The cap is intentionally per MCP process, not machine-wide.
    */
   inFlight(laneId: string, excludeJobId?: string): number {
     let count = 0;
@@ -1691,15 +1581,7 @@ export class LaneJobStore {
     return this.jobs.get(id);
   }
 
-  /**
-   * A job for a CALLER: one this store holds, else one another `llm-relay mcp` process finished and
-   * archived after this store started (kept from then on, marked `restored`), else undefined.
-   *
-   * ⚠ Why a caller needs more than `get`. Claude Desktop and Codex Desktop each start their own
-   * server, and a session can poll through a different connection than the one that dispatched —
-   * observed 2026-09-16 as `unknown jobId` for a job that had finished. The archive is shared on
-   * disk, so the answer exists; it was read only once, at start.
-   */
+  /** Find a local job or lazily restore a terminal job written by another MCP process. */
   find(id: string): LaneJob | undefined {
     const held = this.jobs.get(id);
     if (held !== undefined) return held;
@@ -1755,16 +1637,7 @@ export class LaneJobStore {
     return [...this.jobs.values()].sort(newestFirst);
   }
 
-  /**
-   * `relay` carries an answer-mode job's captured provenance headers — absent for every
-   * agent-mode job, since those never touch HTTP directly.
-   *
-   * ⚠ `run.timedOut` is checked BEFORE the exit-code/semantic-failure branch and wins outright:
-   * a killed-by-timeout run gets `status: "timed_out"`, never `"failed"`, regardless of what
-   * `semanticFailure` a caller also passed (agent-mode quota classification already refuses to
-   * run on a timed-out result, so in practice this only ever arbitrates against the empty-output
-   * check — and a timeout is the more informative, more specific claim of the two).
-   */
+  /** Complete a job; an explicit timeout outranks exit-code or semantic-failure classification. */
   complete(id: string, run: LaneRunResult, semanticFailure?: string, relay?: RelayAnnouncements): void {
     const job = this.jobs.get(id);
     if (!job) return;
@@ -1784,10 +1657,7 @@ export class LaneJobStore {
       job.status = run.code === 0 && semanticFailure === undefined ? "completed" : "failed";
       if (semanticFailure !== undefined) job.error = semanticFailure;
     }
-    // ⚠ AFTER the status is set and BEFORE the caller sees it. The unmet property is that a
-    // terminal state ACCOUNTS FOR process-tree termination — reporting `timed_out` while the tree
-    // still runs is the measured defect (three OpenCode jobs reported `timed_out` at 1,800 s with
-    // their original processes found alive in their exact assigned worktrees).
+    // Terminal state includes process-tree cleanup before the result is observable.
     this.reap(id);
   }
 
