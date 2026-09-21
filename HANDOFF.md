@@ -29,7 +29,12 @@ The repository is in a consolidation phase after a large post-v0.85.0 developmen
 
 ### Immediate next
 
-The immediate task is the **release-readiness pass for the post-v0.85.0 delta**.
+The post-v0.85.0 subsystem audit is complete and the next release candidate is **v0.86.0**.
+The release remains open until the candidate lands under both required checks and the
+tag-triggered publish workflow passes its clean packed-artifact install smoke and publishes npm.
+
+Audit evidence:
+[`docs/history/release-readiness-audit-2026-09-21.md`](docs/history/release-readiness-audit-2026-09-21.md).
 
 Persistence and repository enforcement are no longer blockers:
 - the concurrency investigation found three correctness holes: unrelated journal writes filtered
@@ -45,9 +50,9 @@ Persistence and repository enforcement are no longer blockers:
 
 Work in this order:
 
-1. audit the v0.85.0 → current `main` delta by subsystem and re-verify D1/D2/status behavior;
-2. run the complete Linux/package and Windows gates and package/install smoke;
-3. reconcile public docs against the release candidate and publish the next checkpoint;
+1. land the v0.86.0 release candidate under required `check` and `windows-process-boundary`;
+2. push `v0.86.0` and require the publish workflow's packed-artifact smoke and npm publish to succeed;
+3. record the published checkpoint in the live docs;
 4. clear evidence/vendor/operator-blocked items as their inputs become available;
 5. begin active hard-cap continuation as staged, harness-specific work.
 
