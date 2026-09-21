@@ -2042,9 +2042,9 @@ as not a ladder rung, and it is never reported to `/dispatch/telemetry`, which k
 The last paragraph of a reply in which no lane answered tells the caller what to do next, and it
 says only what is true:
 
-- the walk STOPPED a lane at its time budget while the lane was still working — the reply names
-  that lane and the call that lets it finish: dispatch again with `lane: "<id>"` (a named lane runs
-  with no budget, only its own timeout);
+- the walk STOPPED a lane for apparent idleness before it answered — the reply names that lane
+  and the call that lets it run to its own timeout: dispatch again with `lane: "<id>"` (a named
+  lane is never idle-stopped);
 - the caller named the lane or the model — only that lane ran, so the reply says to call dispatch
   without `lane` or `model` to let the walk try the others;
 - lanes remain untried because the walk stopped at `maxLanes` — dispatch again reaches them;
