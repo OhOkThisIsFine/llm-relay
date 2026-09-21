@@ -94,6 +94,43 @@ describe("createLaneExecutionClient", () => {
     });
   });
 
+  it("accepts typed daemon liveness/launch-note fields and rejects malformed ones", async () => {
+    const good = {
+      execution: runningExecution({
+        cpuMs: 1200,
+        relayInFlight: 1,
+        relayLastActivityAt: 150,
+        launchNotes: ["HOME expanded from %USERPROFILE%"],
+      }),
+    };
+    const client = createLaneExecutionClient(cfg, {
+      authorization,
+      fetch: (async () => new Response(JSON.stringify(good), { status: 200 })) as typeof fetch,
+    });
+    expect((await client.request({
+      action: "status",
+      executionId: "exec-00112233445566778899aabbccddeeff",
+    })).ok).toBe(true);
+
+    for (const execution of [
+      runningExecution({ relayInFlight: -1 }),
+      runningExecution({ relayLastActivityAt: "now" }),
+      runningExecution({ launchNotes: [42] }),
+    ]) {
+      const bad = createLaneExecutionClient(cfg, {
+        authorization,
+        fetch: (async () =>
+          new Response(JSON.stringify({ execution }), { status: 200 })) as typeof fetch,
+      });
+      const result = await bad.request({
+        action: "status",
+        executionId: "exec-00112233445566778899aabbccddeeff",
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.kind).toBe("invalid-response");
+    }
+  });
+
   it("never turns malformed success JSON into an execution result", async () => {
     for (const payload of [
       { execution: { ...runningExecution(), schema: "future.v2" } },
