@@ -170,6 +170,15 @@ if (mode === "transaction") {
     writeFileSync(ready, "ready");
     for (;;) sleepSync(1_000);
   });
+} else if (mode === "hold-lock-timed") {
+  const path = arg(1);
+  const ready = arg(2);
+  const holdMs = Number(arg(3));
+  if (!Number.isSafeInteger(holdMs) || holdMs < 1) throw new Error("invalid hold-lock-timed duration");
+  withFileLockSync(path, () => {
+    writeFileSync(ready, "ready");
+    sleepSync(holdMs);
+  });
 } else {
   throw new Error(`unknown worker mode: ${mode}`);
 }
