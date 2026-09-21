@@ -66,16 +66,41 @@ red without anyone invoking a script by hand:
   per-step report and `<step>.exit.txt`, which is the attribution the sweep consumes. An unknown
   `--only` name, or any other argument, exits 2 touching nothing.
 
-Needs a locally authenticated harness account (manual measurement; never CI):
-- `measure-agy-continuation.mjs` — Phase 5.1 exact-resume measurement for active hard-cap
-  continuation. Run `npm run build:server` first, then
-  `node scripts/measure-agy-continuation.mjs`. It starts AGY in a fresh temp workspace with
-  `--output-format stream-json`, captures the exact `conversation_id`, waits until AGY emits an
-  ACTIVE agent-response event, terminates that process tree, then starts a NEW AGY process with
-  `--conversation <captured-id>`. The resumed process must report the same conversation id and
-  recover a random marker that appears only in the interrupted user turn. It never uses
-  `--continue`, requests no tools, and prints one `AGY_CONTINUATION_MEASUREMENT {...}` line. A
-  negative `success:false` is a valid capability measurement; setup/protocol failures throw.
+Needs a locally authenticated/configured harness account (manual measurement; never CI):
+- `continuation-probe-lib.mjs` — shared process/NDJSON plumbing for the four exact-resume
+  measurements below. It is not a standalone command. All probes reuse the production
+  `executable-lookup` and Windows npm-shim parser from `dist/`, launch without a shell, terminate
+  the exact process tree, fail closed on malformed JSONL, hash session identities in reported
+  output, and clean up a fresh temporary workspace.
+- `measure-agy-continuation.mjs` — captures AGY's early `conversation_id`, waits for an ACTIVE
+  agent-response event, kills the process tree, resumes with exact `--conversation <id>`, and
+  requires the same conversation plus recovery of a random marker from the interrupted user turn.
+- `measure-claude-continuation.mjs` — captures Claude Code's `system/init.session_id`, interrupts
+  after a streamed content delta, resumes with exact `--resume <id>`, and requires the interrupted
+  marker to survive. It records whether resumed init/result events reuse the original id but keeps
+  context recovery as the authority because Claude releases have changed resumed-id reporting.
+- `measure-codex-continuation.mjs` — captures `thread.started.thread_id`, waits for
+  `turn.started`, interrupts two seconds later while the first turn is still active, then runs
+  exact `codex exec resume <id>`. It requires BOTH the same resumed thread id and recovery of the
+  interrupted marker, specifically guarding against Codex's documented missing-id behavior that can
+  silently create a fresh thread.
+- `measure-opencode-continuation.mjs` — captures the `sessionID` stamped on OpenCode JSON events,
+  interrupts after `step_start`, resumes with exact `--session <id>`, requires a clean process
+  exit, the same session id, and recovery of the interrupted marker.
+
+Build first, then run any one probe:
+
+```
+npm run build:server
+node scripts/measure-agy-continuation.mjs
+node scripts/measure-claude-continuation.mjs
+node scripts/measure-codex-continuation.mjs
+node scripts/measure-opencode-continuation.mjs
+```
+
+None uses a "latest" resume facility. A `success:false` result is capability evidence; missing
+authentication/quota, malformed protocol output, unexpected tool use, or a hung/aborted CLI fails
+loudly so it cannot be mistaken for verified resume support.
 
 Offline / unit-test-safe (no external creds):
 - `measure-lane-orphan.mjs` (Windows only; run `npm run build:server` first) — S4's real
