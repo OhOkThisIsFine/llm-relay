@@ -3,8 +3,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig, type Plugin } from "vite";
 import react from "@vitejs/plugin-react";
-import tailwindcss from "tailwindcss";
-import autoprefixer from "autoprefixer";
+import tailwindcss from "@tailwindcss/vite";
 
 const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const nodeModulesRoot = join(projectRoot, "node_modules");
@@ -108,12 +107,7 @@ function dashboardBundleGraph(): Plugin {
 export default defineConfig({
   root: "dashboard",
   base: "/dashboard/",
-  plugins: [react(), dashboardBundleGraph()],
-  css: {
-    postcss: {
-      plugins: [tailwindcss({ config: "dashboard/tailwind.config.cjs" }), autoprefixer()],
-    },
-  },
+  plugins: [react(), tailwindcss(), dashboardBundleGraph()],
   build: {
     outDir: "../dist/dashboard",
     emptyOutDir: true,
