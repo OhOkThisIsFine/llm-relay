@@ -12,6 +12,7 @@
  */
 import type { ModelCatalog } from "./catalog.js";
 import type { Config } from "./config.js";
+import type { DispatchView } from "./dispatch.js";
 import { buildDaemonDispatchView } from "./daemon-dispatch-view.js";
 import {
   createLaneActivityTag,
@@ -31,6 +32,7 @@ import {
   checkCwd,
   defaultLaneSpawner,
   expandEnvReferences,
+  type LaneSpawnHandle,
   type LaneSpawner,
 } from "./mcp/lane-runner.js";
 import {
@@ -90,7 +92,7 @@ export function createConfiguredLaneExecutionLauncher(
       if (!boundary.ok) return refuse(boundary.refusal);
     }
 
-    let view;
+    let view: DispatchView;
     try {
       view = buildDaemonDispatchView(
         cfg,
@@ -154,7 +156,7 @@ export function createConfiguredLaneExecutionLauncher(
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let lastOutputAt: number | null = null;
-    let run;
+    let run: LaneSpawnHandle;
     try {
       run = spawn(invoke.command, invoke.args, {
         env,
