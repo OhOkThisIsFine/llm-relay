@@ -1755,6 +1755,14 @@ export class McpDispatchServer {
         { status, wallClockMs: elapsedMs, exitCode: outcome.run.code },
       );
 
+      if (status !== "completed" && !isLast && this.jobs.brokerExecution(jobId) !== undefined) {
+        // The daemon execution belongs to THIS attempt only. It is already terminal/cancelled here;
+        // remove its durable reference before moving the same job handle to the next rung.
+        this.jobs.clearBrokerExecution(jobId);
+        this.liveBrokerSnapshots.delete(jobId);
+        this.brokerCpu.delete(jobId);
+      }
+
       if (status === "completed" || isLast) {
         await this.recordTreeDelta(jobId);
         this.jobs.complete(
