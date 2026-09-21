@@ -1370,6 +1370,7 @@ export class LaneJobStore {
     const kill = this.kills.get(id);
     this.kills.delete(id);
     this.owned.delete(id);
+    const brokerOwned = this.brokerExecutions.delete(id) !== undefined;
     if (!job) {
       this.journal.clear(id);
       return;
@@ -1378,6 +1379,13 @@ export class LaneJobStore {
     delete job.activity;
     delete job.liveness;
     const pids = readOwnedPids(handle);
+    if (brokerOwned) {
+      // The daemon owns this process tree and the broker result is already terminal. Never signal
+      // it from MCP or invent pid ownership here; just archive the job and clear the journal row.
+      job.process = { pids: [], survivors: [], terminated: false };
+      if (this.archive.record(job)) this.journal.clear(id);
+      return;
+    }
     if (kill === undefined) {
       // Nothing of ours ran for this job. Reported rather than omitted, so "no owned process" and
       // "we forgot to look" cannot read the same way.
