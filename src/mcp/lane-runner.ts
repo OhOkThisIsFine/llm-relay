@@ -1771,11 +1771,11 @@ export class LaneJobStore {
    * Passing the asking job's own id excludes it, so this answers "how many OTHER jobs are running
    * this lane right now" — the question a skip check actually needs.
    *
-   * ⚠ Per-process by construction, and that is the whole design, not a limitation to work around:
-   * the daemon never spawns a lane, so the only process that ever knows a `cli` rung's process is
-   * running is the one that spawned it. Two host sessions each running their own `llm-relay mcp`
-   * can together exceed a rung's `maxConcurrent` — this bounds one host's own concurrency, and
-   * `docs/reference.md` says so rather than implying a machine-wide guarantee this cannot make.
+   * ⚠ Per MCP SERVER PROCESS by design. D1 moves the physical child into the daemon, but this
+   * admission policy still counts the jobs THIS MCP store owns or recovered. Another simultaneously
+   * live MCP process is not folded into the number, so two host sessions can together exceed a
+   * rung's `maxConcurrent`. This preserves the documented per-host cap rather than silently turning
+   * it into a machine-wide semaphore.
    */
   inFlight(laneId: string, excludeJobId?: string): number {
     let count = 0;
