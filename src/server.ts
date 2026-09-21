@@ -257,10 +257,9 @@ export interface ProxyDeps {
   dashboardAttributionPolicy?: AttributionPolicy;
   controlAuthorization?: ControlAuthorizationPort | null;
   /**
-   * D1 Phase 1: optional daemon-owned lane execution broker. Production MCP does not use it yet;
-   * tests inject it to pin the admitted control route before the ownership switchover.
+   * D1 daemon-owned lane execution broker. undefined installs the production configured broker;
+   * null explicitly disables it for fail-closed embeds/tests.
    */
-  /** undefined = install the production configured broker; null = explicitly disable it. */
   laneExecutionBroker?: LaneExecutionBrokerPort | null;
   /** Optional shutdown callback — called by POST /stop after responding 202. A bare programmatic proxy with no onStop answers 503. */
   onStop?: () => void;
