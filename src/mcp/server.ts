@@ -77,7 +77,7 @@ import { readOnlyInvoke, readOnlyVerdict, type LaneInvocation } from "./readonly
 import { agyQuotaStatement, type AgyLogSnapshot } from "./agy-quota-log.js";
 import { nullJobJournal, type JobJournal, type JournalRow } from "./job-journal.js";
 import { nullJobArchive, type JobArchive } from "./job-archive.js";
-import type { LaneExecutionSnapshot, LaneExecutionStartRequest } from "../lane-execution-broker.js";
+import { UNKNOWN_LANE_EXECUTION_MESSAGE, type LaneExecutionSnapshot, type LaneExecutionStartRequest } from "../lane-execution-broker.js";
 import {
   createLaneExecutionId,
   type LaneExecutionClient,
@@ -1443,7 +1443,7 @@ export class McpDispatchServer {
         );
       }
       if (!result.ok) {
-        if (result.kind === "rejected" && result.status === 404) {
+        if (result.kind === "rejected" && result.status === 404 && result.message === UNKNOWN_LANE_EXECUTION_MESSAGE) {
           this.jobs.markBrokerKilled(
             jobId,
             "the relay daemon is reachable but no longer knows this recovered lane execution",
@@ -1892,7 +1892,7 @@ export class McpDispatchServer {
       return true;
     }
     if (!result.ok) {
-      if (result.kind === "rejected" && result.status === 404) {
+      if (result.kind === "rejected" && result.status === 404 && result.message === UNKNOWN_LANE_EXECUTION_MESSAGE) {
         const killed = this.jobs.markBrokerKilled(
           jobId,
           "the relay daemon is reachable but no longer knows this recovered lane execution; " +
@@ -2482,7 +2482,7 @@ export class McpDispatchServer {
     for (;;) {
       const response = await this.brokerRequest({ action: "cancel", executionId });
       if (response.ok) return;
-      if (response.kind === "rejected" && (response.status === 404 || response.status === 503)) return;
+      if (response.kind === "rejected" && ((response.status === 404 && response.message === UNKNOWN_LANE_EXECUTION_MESSAGE) || response.status === 503)) return;
       await pollTimer(BROKER_STATUS_POLL_MS);
     }
   }
@@ -2505,7 +2505,7 @@ export class McpDispatchServer {
     // no start request has been sent yet and local fallback cannot duplicate work.
     for (let collision = 0; collision < 3; collision += 1) {
       const probe = await this.brokerRequest({ action: "status", executionId });
-      if (!probe.ok && probe.kind === "rejected" && probe.status === 404) break;
+      if (!probe.ok && probe.kind === "rejected" && probe.status === 404 && probe.message === UNKNOWN_LANE_EXECUTION_MESSAGE) break;
       if (!probe.ok) return { fallback: probe.message };
       executionId = createLaneExecutionId();
       if (collision === 2) return { fallback: "could not allocate a unique daemon execution id" };
