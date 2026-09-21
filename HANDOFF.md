@@ -146,10 +146,16 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   would widen the accepted API beyond the runtime floor. The matching line was refreshed instead
   from 22.20.1 to 22.20.4. Native TS7 build/typechecks, Linux, Windows and package smoke all pass;
   package measurement is 1,208,871 packed bytes, 5,970,011 unpacked bytes, and 460 entries.
-- **Immediate next in D5.** Upgrade `lucide-react` 0.x→1.x, the final independent major from the
-  original dependency inventory. M1 remains blocked on a first-party AGY success envelope.
-  Separately open: repository CI enforcement, Route B's vendor blocker, and the owner-driven
-  Codex/Code-tab checks.
+- **D5-h lucide-react 1 is the final dependency-major lap.** Lucide moved from 0.468.0
+  to 1.47.0; all named icon imports still build, 4,490 core tests and 46 dashboard tests pass,
+  and bundle attribution/packed smoke pass. Dashboard output is 394,900 raw bytes
+  (371,476 JS / 22,174 CSS); package measurement is 1,209,741 packed bytes, 5,973,679 unpacked
+  bytes, and 460 entries, all within ceilings.
+- **D5 is complete.** Shipped: Vitest 5, Vite 8 + plugin-react 6, jsdom 30, Tailwind 4,
+  native TypeScript 7 compiler, jest-dom 7, and lucide-react 1. Node types intentionally stay on
+  major 22 while Node 22 remains supported. No original D5 major remains.
+- **Immediate next.** M1 remains blocked on a first-party AGY success envelope. Separately open:
+  repository CI enforcement, Route B's vendor blocker, and the owner-driven Codex/Code-tab checks.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
