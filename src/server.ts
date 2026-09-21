@@ -860,7 +860,10 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   });
   const latencyDemotion = createLatencyDemotionFn({
     readPings: (provider, model) => pingLoop.getModelPings(provider, model),
-    settings: cfg.routing?.latency,
+    // D2: read through the live Config identity so a committed reload changes new requests.
+    get settings() {
+      return cfg.routing.latency;
+    },
   });
   const costClassOf = (attempt: ResolvedAttempt): CostClass | undefined => {
     const t = attempt.target;
@@ -906,7 +909,10 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   // through `ProbationDeps.readRequestSamples` rather than this real seam.
   const probationDeps: ProbationDeps = {
     readRequestSamples: countRequestSamples,
-    settings: cfg.routing.probation,
+    // D2: the evaluator reads this property on every call; do not snapshot reloadable policy.
+    get settings() {
+      return cfg.routing.probation;
+    },
     costClassOf,
   };
   const probation: ProbationFn = createProbationFn(probationDeps);
@@ -914,7 +920,14 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   // ceiling the deployment stated. Reads the breaker's per-cell attempt-start log — the ONE
   // dataset every egress on both fronts feeds through `beginHealthAttempt` — so every client on
   // the machine that routes through the relay is counted against the same window.
-  const pacing: PacingFn = createPacingFn({ cfg, breaker, settings: cfg.routing.pacing });
+  const pacing: PacingFn = createPacingFn({
+    cfg,
+    breaker,
+    // D2: pacing policy changes with the same in-place Config commit as its configured limits.
+    get settings() {
+      return cfg.routing.pacing;
+    },
+  });
   const hedgeSettings = resolveHedgeSettings(cfg.routing?.hedge);
   const hedgeDelay = (
     attempt: ResolvedAttempt,
