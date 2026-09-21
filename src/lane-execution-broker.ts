@@ -537,7 +537,7 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
           message: "lane execution id already exists with a different start request",
         };
       }
-      return { ok: true, execution: await this.snapshot(existing) };
+      return { ok: true, execution: await this.snapshot(existing, false) };
     }
 
     let handle: LaneExecutionLaunchHandle | { refusal: string };
@@ -579,7 +579,7 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
         }),
     );
 
-    return { ok: true, execution: await this.snapshot(stored) };
+    return { ok: true, execution: await this.snapshot(stored, false) };
   }
 
   private async status(executionId: string): Promise<LaneExecutionBrokerResult> {
@@ -604,7 +604,7 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
       }
       this.prune();
     }
-    return { ok: true, execution: await this.snapshot(stored) };
+    return { ok: true, execution: await this.snapshot(stored, false) };
   }
 
   private settle(stored: StoredExecution, raw: LaneExecutionRunResult): void {
@@ -623,8 +623,12 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
     this.prune();
   }
 
-  private async snapshot(stored: StoredExecution): Promise<LaneExecutionSnapshot> {
-    const activity = await safeActivity(stored.handle);
+  private async snapshot(stored: StoredExecution, sampleActivity = true): Promise<LaneExecutionSnapshot> {
+    // Start/cancel acknowledgements stay below the MCP client timeout. OS process-tree CPU may take
+    // seconds to enumerate; status polls are the only surface that pays for that liveness sample.
+    const activity = sampleActivity
+      ? await safeActivity(stored.handle)
+      : { stdoutBytes: 0, stderrBytes: 0, lastOutputAt: null };
     const result = stored.result;
     return {
       schema: LANE_EXECUTION_SCHEMA,
