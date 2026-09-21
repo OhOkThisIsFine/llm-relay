@@ -18,6 +18,8 @@ import { LaneJobStore } from "../src/mcp/lane-runner.js";
 import { createJobJournal, nullJobJournal } from "../src/mcp/job-journal.js";
 import { McpDispatchServer } from "../src/mcp/server.js";
 import type { Config } from "../src/config.js";
+import { LANE_EXECUTION_SCHEMA, type LaneExecutionSnapshot } from "../src/lane-execution-broker.js";
+import type { LaneExecutionClient, LaneExecutionClientResult } from "../src/mcp/lane-execution-client.js";
 import type { TreeSnapshot, TreeSnapshotReader } from "../src/mcp/tree-delta.js";
 
 function tempJournalPath(): { path: string; cleanup: () => void } {
@@ -29,6 +31,69 @@ const snap = (entries: Record<string, string>, prefix = ""): TreeSnapshot => ({
   prefix,
   entries: new Map(Object.entries(entries)),
 });
+
+const BROKER_EXECUTION_ID = "exec-00112233445566778899aabbccddeeff";
+
+function brokerSnapshot(
+  jobId: string,
+  laneId: string,
+  overrides: Partial<LaneExecutionSnapshot> = {},
+): LaneExecutionSnapshot {
+  return {
+    schema: LANE_EXECUTION_SCHEMA,
+    executionId: BROKER_EXECUTION_ID,
+    jobId,
+    laneId,
+    status: "running",
+    startedAt: 1_000,
+    endedAt: null,
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    lastOutputAt: null,
+    ...overrides,
+  };
+}
+
+function brokerClient(
+  fn: (action: "status" | "cancel", executionId: string) => LaneExecutionClientResult | Promise<LaneExecutionClientResult>,
+): LaneExecutionClient {
+  return {
+    request: async (request) => {
+      if (request.action === "start") throw new Error("recovery test never starts through broker");
+      return fn(request.action, request.executionId);
+    },
+  };
+}
+
+async function toolText(
+  server: McpDispatchServer,
+  id: number,
+  name: "dispatch_status" | "dispatch_result" | "dispatch_cancel",
+  jobId: string,
+): Promise<{ text: string; isError?: boolean }> {
+  const out: Array<{ id?: number; result?: { content?: Array<{ text?: string }>; isError?: boolean } }> = [];
+  const originalWrite = (server as unknown as { deps: { write: (chunk: string) => void } }).deps.write;
+  (server as unknown as { deps: { write: (chunk: string) => void } }).deps.write = (chunk: string) => {
+    out.push(JSON.parse(chunk) as (typeof out)[number]);
+  };
+  try {
+    await server.ingest(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name, arguments: { jobId } },
+      }) + "\n",
+    );
+  } finally {
+    (server as unknown as { deps: { write: (chunk: string) => void } }).deps.write = originalWrite;
+  }
+  const response = out.find((message) => message.id === id)?.result;
+  return {
+    text: response?.content?.[0]?.text ?? "",
+    ...(response?.isError === undefined ? {} : { isError: response.isError }),
+  };
+}
 
 async function killedResult(path: string, jobId: string, treeSnapshot?: TreeSnapshotReader): Promise<string> {
   const out: Array<{ id?: number; result?: { content: Array<{ text: string }> } }> = [];
@@ -51,6 +116,220 @@ async function killedResult(path: string, jobId: string, treeSnapshot?: TreeSnap
   );
   return out.find((message) => message.id === 1)?.result?.content[0]?.text ?? "";
 }
+
+describe("D1 broker-backed MCP restart recovery", () => {
+  function serverFor(
+    path: string,
+    client: LaneExecutionClient | undefined,
+    write: (chunk: string) => void = () => {},
+  ): McpDispatchServer {
+    return new McpDispatchServer({
+      config: { host: "127.0.0.1", port: 8791, routing: { default: "x" } } as unknown as Config,
+      buildView: async () => {
+        throw new Error("unused in broker recovery test");
+      },
+      journal: createJobJournal(path),
+      ...(client === undefined ? {} : { laneExecutionClient: client }),
+      write,
+    });
+  }
+
+  function seed(path: string): { jobId: string; laneId: string } {
+    const journal = createJobJournal(path);
+    const first = new LaneJobStore(journal);
+    const job = first.create("lane-a", "pool/high", "C:/tree");
+    first.noteBrokerExecution(job.id, BROKER_EXECUTION_ID);
+    return { jobId: job.id, laneId: job.laneId };
+  }
+
+  it("keeps a daemon execution running across MCP restart and publishes broker liveness", async () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const seeded = seed(path);
+      const client = brokerClient(() => ({
+        ok: true,
+        execution: brokerSnapshot(seeded.jobId, seeded.laneId, {
+          relayInFlight: 1,
+          relayLastActivityAt: 1_500,
+          cpuMs: 300,
+          launchNotes: ["HOME expanded from %USERPROFILE%"],
+        }),
+      }));
+      const out: Array<{ id?: number; result?: { content?: Array<{ text?: string }> } }> = [];
+      const server = serverFor(path, client, (chunk) => out.push(JSON.parse(chunk)));
+
+      await server.ingest(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name: "dispatch_status", arguments: { jobId: seeded.jobId } },
+        }) + "\n",
+      );
+      const text = out.find((message) => message.id === 1)?.result?.content?.[0]?.text ?? "";
+      expect(text).toContain("status: running");
+      expect(text).toContain("walk-verdict: no-idle-stop");
+      expect(text).toContain("relay-in-flight");
+      expect(text).not.toContain("killed");
+
+      // Host/MCP shutdown must not cancel/clear daemon-owned work.
+      server.shutdown();
+      const row = createJobJournal(path).orphans().find((candidate) => candidate.jobId === seeded.jobId);
+      expect(row?.brokerExecution?.executionId).toBe(BROKER_EXECUTION_ID);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("collects the original terminal answer from the daemon after restart", async () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const seeded = seed(path);
+      const client = brokerClient(() => ({
+        ok: true,
+        execution: brokerSnapshot(seeded.jobId, seeded.laneId, {
+          status: "completed",
+          endedAt: 2_000,
+          code: 0,
+          stdout: "answer survived the MCP restart",
+          stderr: "",
+          timedOut: false,
+          stdoutBytes: 31,
+        }),
+      }));
+      const out: Array<{ id?: number; result?: { content?: Array<{ text?: string }> } }> = [];
+      const server = serverFor(path, client, (chunk) => out.push(JSON.parse(chunk)));
+      await server.ingest(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: { name: "dispatch_result", arguments: { jobId: seeded.jobId } },
+        }) + "\n",
+      );
+      const text = out.find((message) => message.id === 2)?.result?.content?.[0]?.text ?? "";
+      expect(text).toContain("answer survived the MCP restart");
+      expect(text).toContain("completed");
+      expect(createJobJournal(path).orphans().find((row) => row.jobId === seeded.jobId)).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("treats broker transport failure as recovery unavailable, never as death", async () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const seeded = seed(path);
+      const client = brokerClient(() => ({
+        ok: false,
+        kind: "unavailable",
+        status: null,
+        message: "relay restarting",
+      }));
+      const out: Array<{ id?: number; result?: { content?: Array<{ text?: string }> } }> = [];
+      const server = serverFor(path, client, (chunk) => out.push(JSON.parse(chunk)));
+      await server.ingest(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 3,
+          method: "tools/call",
+          params: { name: "dispatch_status", arguments: { jobId: seeded.jobId } },
+        }) + "\n",
+      );
+      const text = out.find((message) => message.id === 3)?.result?.content?.[0]?.text ?? "";
+      expect(text).toContain("status: running");
+      expect(text).toContain("broker-unavailable");
+      expect(text).not.toContain("status: killed");
+      expect(createJobJournal(path).orphans().some((row) => row.jobId === seeded.jobId)).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("only a reachable broker 404 converts the recovered execution to killed", async () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const seeded = seed(path);
+      const client = brokerClient(() => ({
+        ok: false,
+        kind: "rejected",
+        status: 404,
+        message: "unknown lane execution id",
+      }));
+      const out: Array<{ id?: number; result?: { content?: Array<{ text?: string }>; isError?: boolean } }> = [];
+      const server = serverFor(path, client, (chunk) => out.push(JSON.parse(chunk)));
+      await server.ingest(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 4,
+          method: "tools/call",
+          params: { name: "dispatch_status", arguments: { jobId: seeded.jobId } },
+        }) + "\n",
+      );
+      const result = out.find((message) => message.id === 4)?.result;
+      expect(result?.content?.[0]?.text).toContain("killed");
+      expect(result?.isError).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("routes explicit cancellation to the daemon owner after restart", async () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const seeded = seed(path);
+      const actions: string[] = [];
+      const client = brokerClient((action) => {
+        actions.push(action);
+        return {
+          ok: true,
+          execution: brokerSnapshot(seeded.jobId, seeded.laneId, action === "cancel"
+            ? {
+                status: "cancelled",
+                endedAt: 2_500,
+              }
+            : {}),
+        };
+      });
+      const out: Array<{ id?: number; result?: { content?: Array<{ text?: string }> } }> = [];
+      const server = serverFor(path, client, (chunk) => out.push(JSON.parse(chunk)));
+      await server.ingest(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 5,
+          method: "tools/call",
+          params: { name: "dispatch_cancel", arguments: { jobId: seeded.jobId } },
+        }) + "\n",
+      );
+      expect(out.find((message) => message.id === 5)?.result?.content?.[0]?.text).toContain("cancelled");
+      expect(actions).toContain("cancel");
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("does not block MCP initialize while a broker recovery query is still pending", async () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      seed(path);
+      const client: LaneExecutionClient = {
+        request: () => new Promise<LaneExecutionClientResult>(() => {}),
+      };
+      const out: Array<{ id?: number; result?: unknown }> = [];
+      const server = serverFor(path, client, (chunk) => out.push(JSON.parse(chunk)));
+
+      await Promise.race([
+        server.ingest(JSON.stringify({ jsonrpc: "2.0", id: 6, method: "initialize", params: {} }) + "\n"),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("initialize waited on broker recovery")), 250),
+        ),
+      ]);
+      expect(out.some((message) => message.id === 6 && message.result !== undefined)).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+});
 
 describe("MCP server restart", () => {
   it("reports the jobs a previous process died holding, rather than unknown jobId", () => {
