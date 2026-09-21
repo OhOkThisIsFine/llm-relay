@@ -1501,6 +1501,11 @@ export class McpDispatchServer {
   }
 
   private async toolDispatch(args: Record<string, unknown>, ctx: CallContext): Promise<unknown> {
+    // After an MCP restart, daemon-owned attempts may still be active. Claim/reconcile them before
+    // maxConcurrent is evaluated so this replacement process does not briefly undercount its own
+    // surviving lanes. This waits only on broker recovery, never git/tree enrichment.
+    await this.brokerStartup;
+
     const task = readString(args, "task");
     if (!task) return textResult("dispatch requires a non-empty task", true);
 
