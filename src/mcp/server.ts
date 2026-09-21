@@ -1355,7 +1355,10 @@ export class McpDispatchServer {
       await this.refreshAllBrokerJobs();
       return textResult(this.recentJobs());
     }
-    await this.refreshBrokerJob(jobId);
+    // brokerStartup has already claimed/materialized any daemon-backed orphan. Do not run the
+    // ordinary status/liveness refresh here: it may sample process CPU and git before the operator's
+    // cancellation reaches the daemon. Broker cancel is idempotent and returns the current terminal
+    // snapshot when the execution already ended, so it is itself the authoritative refresh.
     const job = this.jobs.find(jobId);
     if (!job) return this.unknownJob(jobId);
     if (job.status === "running") return textResult(describeJob(job, this.now()));
