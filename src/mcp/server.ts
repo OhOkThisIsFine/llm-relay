@@ -700,17 +700,8 @@ function jobAnswer(job: LaneJob, now: number): string {
 function jobAnswerBody(job: LaneJob, now: number): string {
   const header = describeJob(job, now);
   const body = job.stdout.trim();
-  // ⚠ The lanes tried are NOT rendered here — `describeJob` owns them now, so a poll and the final
-  // answer show the same list rather than two nearly-identical renderings that can drift apart.
-  // The terminal fallback fires only when the walk ended with NO answer from any lane. A cancelled
-  // job is excluded: the caller stopped it, so the ladder was never exhausted.
-  // ⚠ Three conditions, and the last two were MISSING until adversarial review found it
-  // (2026-09-06). "No lane answered" is not the same claim as "every lane was tried":
-  //   - with `routing.dispatchWalk: false` exactly ONE lane runs, and the pre-walk answer carried
-  //     no advice at all — emitting it there breaks the documented byte-for-byte revert;
-  //   - with `maxLanes` below the selectable count the walk stopped early, and the answer would
-  //     then contain BOTH "N further lanes not tried" and "every lane has now been tried".
-  // A caller that stops delegating on a false premise abandons capacity nothing contacted.
+  // Attempt history is rendered by `describeJob`; terminal advice is added only when no attempt
+  // completed and the caller did not cancel the job.
   const nothingAnswered =
     job.status !== "running"
     && job.status !== "cancelled"
@@ -844,10 +835,7 @@ function attemptReason(status: DispatchLaneStatus, outcome: LaneAttemptOutcome, 
   if (outcome.semanticFailure !== undefined) return outcome.semanticFailure;
   if (status === "timed_out") return "the lane exceeded its own configured timeout";
   if (status === "failed") return "the lane failed";
-  // ⚠ Total over `DispatchLaneStatus`, not a bare fall-through. The union GREW this sprint
-  // (`abandoned`), which is the proof it grows; before this, a fifth member would have rendered
-  // silently as "the lane failed" — the repository's most repeated defect class, an unhandled
-  // member of a closed union resolving to a claim nobody checked.
+  // Exhaustive over `DispatchLaneStatus`; new statuses must choose their own reason.
   const _never: never = status;
   return String(_never);
 }
@@ -1862,14 +1850,9 @@ export class McpDispatchServer {
     }
   }
 
-  /**
-   * Is the lane at position `i` never stopped, even when idle? The last lane is not — there is
-   * nowhere to move to. Nor is a lane whose later lanes are all unlikely to answer: each is on a
-   * streak of `LANE_UNRELIABLE_STREAK` own failures or more, or marked `failing`. Stopping a lane
-   * that may still answer in order to reach those trades an answer for a near-certain failure —
-   * measured 2026-09-10, when the walk stopped `free-pool` to try lanes that had answered 0 of 12,
-   * 0 of 34 and 0 of 21 runs (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §1). A lane with no
-   * record counts as reliable: unmeasured is no opinion, never a failure.
+    /**
+   * Withhold idle stopping when no later lane is plausibly better: the final lane and lanes followed
+   * only by repeatedly failing candidates keep running to their own timeout.
    */
   private stopWithheld(view: DispatchView, laneIds: readonly string[], i: number): boolean {
     return !laneIds.slice(i + 1).some((id) => {
@@ -1909,13 +1892,9 @@ export class McpDispatchServer {
     return this.skipIfAtConcurrencyCap(jobId, lane) || this.skipIfBelowTier(jobId, lane, opts);
   }
 
-  /**
-   * A rung that declares a `capability` below this dispatch's tier — SKIP it, so the walk never
-   * moves a packet to a weaker lane only because the operator listed it in that tier's ladder
-   * (measured 2026-09-16: a `high` implementation packet was stopped on `free-pool` and restarted on
-   * a lane kept for short advisory work). Recorded like a concurrency-cap skip. A caller who NAMED
-   * the lane or a model still reaches it, and a tier or capability outside the effort vocabulary
-   * limits nothing.
+    /**
+   * Skip an unforced rung whose derived capability is below the requested tier. Forced lane/model
+   * dispatches bypass this filter.
    */
   private skipIfBelowTier(jobId: string, lane: DispatchLane, opts: WalkOptions): boolean {
     if (lane.capability === undefined || opts.tier === undefined) return false;
@@ -2467,9 +2446,7 @@ export class McpDispatchServer {
     }
 
     const result = run.result.then((r) => this.settleSpawnedRun(jobId, lane, invoke, opts, startedAt, r));
-    // ⚠ The pids travel WITH the handle: `runOneLane` registers it, and the reaper names a survivor
-    // by them. Until 2026-09-10 this returned `{ result, kill }` alone, so the v0.80.0 survivor
-    // report had no pid to check for any lane a walk started.
+    // Carry root pids with the handle so cleanup can verify and report survivors.
     return { result, kill: run.kill, ...(run.pids === undefined ? {} : { pids: run.pids }) };
   }
 
@@ -2516,12 +2493,9 @@ export class McpDispatchServer {
     return { run: out, abandoned: false, ...(semanticFailure === undefined ? {} : { semanticFailure }) };
   }
 
-  /**
-   * The quota death an AGY lane stated only in AGY's own log (`agy-quota-log.ts`). AGY retries a
-   * spent quota in silence, so a lane stopped by the walk or by its own timeout printed nothing, and
-   * the death reached the relay only when a run happened to last its whole length
-   * (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §4). Undefined unless the lane is AGY, names its
-   * model, and the log is provably this run's — `agyQuotaStatement` refuses everything else.
+    /**
+   * Recover AGY quota evidence stated only in AGY's log. Returns a report only when the log can be
+   * tied to this run and model; otherwise no inference is made.
    */
   private agyLogReport(
     lane: DispatchLane,
