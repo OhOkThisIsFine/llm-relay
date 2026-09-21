@@ -42,15 +42,9 @@ import {
   type Config,
 } from "./config-types.js";
 
-// The configuration vocabulary has ONE declaration, in `config-types.ts` (DR-001, 2026-09-04).
-// Re-exported here so every `from "./config.js"` importer keeps its binding.
-// Spec spelling moved to its own leaf so `config/routing-parser.ts` can depend on it without a
-// cycle back into this file (HOTSPOT-03 stage 1). Re-exported so no importer had to change.
+// Configuration vocabulary lives in config-types.ts. These leaf/parser symbols are re-exported
+// from config.ts to preserve the public import surface without introducing parser cycles.
 export { AUTO_MODEL, POOL_PREFIX, splitSpec } from "./spec.js";
-
-// The routing block's parser moved to its own module (HOTSPOT-03 stage 2). These three are
-// re-exported because `offload.ts`, `lane-cadence.ts` and `test/config.test.ts` import them from
-// here; the move was not supposed to make anyone edit an import line.
 export { DEFAULT_LANE_PROBE, parseOffload, parseRouting } from "./config/routing-parser.js";
 
 export {
@@ -242,16 +236,8 @@ function isDeepSeekHost(base: string): boolean {
 }
 
 /**
- * The resolved reasoning-mapping mode for one provider.
- *
- * The SAME labelled-fact mechanism as `resolveToolCallIdMode` / `resolveThoughtSignatureMode`, and
- * allowed by the SAME invariant — "Provider knowledge is data, not routing configuration" permits a
- * labelled provider fact in `src/` only while config can override it. DeepSeek's own API states its
- * thinking/reasoning vocabulary (thinking ON by default; `thinking: {type:"disabled"}` /
- * `reasoning_effort: low|high|max`; first-party evidence in
- * docs/history/deepseek-responses-truncation-2026-09-09.md), so `api.deepseek.com` defaults to `"deepseek"`
- * and every other host to `"none"`. An explicit `compat.reasoning` wins in BOTH directions —
- * `"none"` on deepseek, `"deepseek"` on anything else.
+ * Resolve provider reasoning compatibility. DeepSeek's own API defaults to its native reasoning
+ * mapping; explicit `compat.reasoning` overrides the host-derived default in either direction.
  */
 export function resolveReasoningMode(p: { base: string; compat?: ProviderCompatConfig }): ReasoningMode {
   if (p.compat?.reasoning !== undefined) return p.compat.reasoning;
@@ -522,16 +508,8 @@ export function subagentSpec(
 }
 
 /**
- * Tools a repaired call is never allowed to name. THE single definition — the
- * shipped config template, config.example.json and the docs all derive from or
- * are asserted equal to this list, because they previously disagreed: this array
- * had 8 entries including "remove" while the other three had 7, so a config that
- * omitted repair.destructiveTools got different coverage than a generated one.
- *
- * Matching is exact (see destructiveMatcher), so these are real tool names, not
- * fragments. The clients' own destructive tools are listed first — they are the
- * ones that can actually destroy something, and the previous fragment list
- * ("rm", "delete", …) matched none of them.
+ * Single default list of tool names that repaired calls may never invoke. Matching is exact, so the
+ * entries are concrete tool names rather than destructive-looking substrings.
  */
 export const DEFAULT_DESTRUCTIVE = [
   // Claude Code / harness tools that write, delete, or execute.
@@ -782,13 +760,8 @@ function expandEnv(value: string, where: string): string {
 }
 
 /**
- * Like `expandEnv`, but reports the missing variable names instead of throwing.
- *
- * Used ONLY for a provider's `base`. An unset `${ENV}` there used to be fatal, which meant
- * one optional provider (e.g. Cloudflare, whose URL embeds an account id) could stop the
- * whole proxy from starting — and since the proxy fronts every client session, that is a
- * total outage caused by a provider nobody was using. Disabling that one provider with a
- * loud warning is proportionate; refusing to boot is not.
+ * Expand provider-base environment references while collecting missing names. A missing variable
+ * disables that optional provider with a warning rather than preventing the whole relay from starting.
  */
 function expandEnvSoft(value: string): { value: string; missing: string[] } {
   const missing: string[] = [];
@@ -1261,14 +1234,7 @@ interface RawProviderFields {
   wire?: unknown;
 }
 
-/**
- * Assemble the validated `ProviderConfig` from its already-parsed pieces.
- *
- * Split out of `parseSingleProvider` (2026-09-09, `wire` field addition) purely to keep that
- * function's cognitive complexity under the repo's linted ceiling — every field here is optional
- * via a conditional spread, and `wire` was the branch that tipped it over. No behaviour moved with
- * it: this is the same object literal `parseSingleProvider` used to return inline.
- */
+/** Assemble a validated `ProviderConfig` from the pieces parsed by `parseSingleProvider`. */
 function buildProviderConfig(
   p: RawProviderFields,
   expanded: { value: string },
