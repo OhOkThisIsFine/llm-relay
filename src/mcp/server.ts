@@ -700,8 +700,8 @@ function jobAnswer(job: LaneJob, now: number): string {
 function jobAnswerBody(job: LaneJob, now: number): string {
   const header = describeJob(job, now);
   const body = job.stdout.trim();
-  // Attempt history is rendered by `describeJob`; terminal advice is added only when no attempt
-  // completed and the caller did not cancel the job.
+  // `describeJob` owns attempt history so polling and final results render consistently.
+  // Terminal advice applies only when a non-cancelled walk ran at least one lane and none completed.
   const nothingAnswered =
     job.status !== "running"
     && job.status !== "cancelled"
@@ -722,10 +722,7 @@ function jobAnswerBody(job: LaneJob, now: number): string {
       : `${header}\n\nThe lane was KILLED when the llm-relay MCP server restarted — it did not fail and it did not time out. Its process is gone. Re-dispatch from scratch, and check the working directory first: only files the lane wrote before the restart survive.`;
   }
   if (job.status === "timed_out") {
-    // ⚠ A timed-out dispatch must never render nothing (C:\Code\docs\backlog.md — a bounded
-    // design dispatch consumed its full 1,200s wait and surfaced no usable answer). The header
-    // above already carries status + elapsed + the one-line reason (`error:`); this adds
-    // whatever partial output the killed run actually captured, when any survived.
+    // Preserve usable partial output from a timed-out run; the header already states the timeout.
     const partial = isContentEmpty(body) ? "" : `\n\nPartial output before the timeout:\n\n${body}`;
     const tail = isContentEmpty(body) ? job.stderr.trim().slice(-1500) : "";
     return `${header}\n\nThe lane exceeded its timeout and was stopped before it finished.${partial}${
@@ -1850,10 +1847,12 @@ export class McpDispatchServer {
     }
   }
 
-    /**
-   * Withhold idle stopping when no later lane is plausibly better: the final lane and lanes followed
-   * only by repeatedly failing candidates keep running to their own timeout.
+      /**
+   * Withhold idle stopping when there is nowhere reliable to advance: the current lane is last, or
+   * every later lane has enough own failures to be considered unreliable. Unmeasured lanes remain
+   * eligible because missing evidence is not failure evidence.
    */
+
   private stopWithheld(view: DispatchView, laneIds: readonly string[], i: number): boolean {
     return !laneIds.slice(i + 1).some((id) => {
       const later = view.ladder.find((l) => l.id === id);
@@ -1892,10 +1891,11 @@ export class McpDispatchServer {
     return this.skipIfAtConcurrencyCap(jobId, lane) || this.skipIfBelowTier(jobId, lane, opts);
   }
 
-    /**
-   * Skip an unforced rung whose derived capability is below the requested tier. Forced lane/model
-   * dispatches bypass this filter.
+      /**
+   * Skip an unforced rung whose known capability is below the requested tier. Unknown or
+   * out-of-vocabulary capability imposes no ceiling, and explicit lane/model selection is never skipped.
    */
+
   private skipIfBelowTier(jobId: string, lane: DispatchLane, opts: WalkOptions): boolean {
     if (lane.capability === undefined || opts.tier === undefined) return false;
     if (this.jobs.get(jobId)?.forcedLane === true) return false;
