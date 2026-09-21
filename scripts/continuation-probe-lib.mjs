@@ -224,12 +224,29 @@ export async function terminateProbeTree(state, options = {}) {
   }
 }
 
+export function redactProbeDiagnostics(value) {
+  return String(value)
+    .replace(
+      /("(?:session_id|thread_id|sessionID|conversation_id)"\\s*:\\s*")[^"]+(")/g,
+      "$1<redacted>$2",
+    )
+    .replace(
+      /\\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b/gi,
+      "<redacted-id>",
+    )
+    .replace(/\\bses_[A-Za-z0-9_-]+\\b/g, "ses_<redacted>");
+}
+
 export function diagnosticFailure(prefix, error, states = []) {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${prefix}: ${message}\n`);
+  process.stderr.write(`${prefix}: ${redactProbeDiagnostics(message)}\n`);
   for (const [label, state] of states) {
     if (!state) continue;
-    if (state.stderr) process.stderr.write(`${label} stderr:\n${state.stderr}\n`);
-    if (state.stdoutTail) process.stderr.write(`${label} stdout tail:\n${state.stdoutTail}\n`);
+    if (state.stderr) {
+      process.stderr.write(`${label} stderr:\n${redactProbeDiagnostics(state.stderr)}\n`);
+    }
+    if (state.stdoutTail) {
+      process.stderr.write(`${label} stdout tail:\n${redactProbeDiagnostics(state.stdoutTail)}\n`);
+    }
   }
 }
