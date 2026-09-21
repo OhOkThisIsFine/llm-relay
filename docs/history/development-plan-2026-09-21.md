@@ -6,16 +6,16 @@
 
 ## Goal
 
-Turn the large post-v0.85.0 `main` delta into a trustworthy released checkpoint, then resume feature
-development from a clean baseline.
+Finish the remaining live evidence gates, then implement active hard-cap continuation one verified
+harness at a time without weakening process ownership, routing, or telemetry semantics.
 
-The ordering is intentional:
+Phases 1–3 below are complete and retained as evidence. Active sequencing is:
 
-1. correctness evidence before new architecture;
-2. repository enforcement before relying on CI as a merge gate;
-3. a release checkpoint before another large subsystem change;
-4. external/evidence-blocked work separated from source work;
-5. active hard-cap continuation implemented incrementally, one verified harness at a time.
+1. close external/operator evidence when inputs are available;
+2. verify at least one harness with both exact-resume and same-cwd isolation measurements;
+3. add behavior-neutral continuation state;
+4. implement one verified harness end to end;
+5. expand routing continuity, telemetry, and additional harnesses incrementally.
 
 ## Phase 1 — persistence-concurrency uncertainty — completed 2026-09-21
 
