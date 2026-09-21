@@ -2,8 +2,7 @@
 
 **Scope:** `v0.85.0` (`de4569d`) → release candidate `v0.86.0`.  
 **Delta:** 85 commits from the v0.85.0 tag to the audited `main` head `950db9c`.  
-**Status:** subsystem audit complete; publication remains gated on the release PR checks and the
-tag-triggered packed-artifact smoke.
+**Status:** complete; v0.86.0 published successfully from tag `v0.86.0` at `9e30cac`.
 
 ## Findings
 
@@ -75,3 +74,17 @@ The separate owner/operator checks in `docs/backlog.md` remain open: a >60 s dis
 freshly restarted external MCP host, Codex Desktop `relay` provenance, chronically unsuccessful
 lane review, and refusal/eligibility decisions. They are operational evidence tasks, not unverified
 source behavior hidden inside this release candidate.
+
+## Publication closeout
+
+Publish run **167** completed successfully for tag `v0.86.0` at `9e30cac`. The workflow passed:
+
+- default-branch ancestry verification;
+- package/tag version agreement;
+- build;
+- clean packed-artifact install and runtime asset smoke;
+- negative missing-asset detection;
+- `npm run check`;
+- `npm publish --access public`.
+
+This closes the post-v0.85.0 release-readiness property.
