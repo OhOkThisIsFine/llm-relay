@@ -1937,16 +1937,12 @@ child before the custom provider or relay is contacted. If MCP is unavailable, u
 fallback: `llm-relay dispatch --next-command -t "<task>"`, then follow exactly the returned command
 or target rather than guessing what this host can reach.
 
-Why that difference matters: executing a lane command correctly is the hard part. The lane needs
-three client idle timeouts lifted or a long think is aborted at about 300 seconds; it needs its
-stdin closed or `agy` waits on it until the timeout; and a console-subsystem child needs
-`windowsHide` or it steals the desktop focus. On Windows, an npm `.cmd` shim cannot be executed
-directly: the launcher locates npm's generated `.ps1` companion, reads its literal
-`$basedir/<entrypoint>` metadata, verifies that target is a Node script, then invokes the current
-Node executable directly with the original argument array. Neither `cmd.exe` nor PowerShell
-serializes the task text. A non-npm `.cmd`/`.bat`, or a shim whose generated metadata cannot be
-resolved conservatively, fails instead of falling back to shell reparsing. `llm-relay mcp` owns all
-of that once, so a caller never builds a command line.
+Why that difference matters: lane execution needs consistent timeout, stdin, environment, Windows
+shim and process-tree handling. The relay centralizes those mechanics. For normal agent-mode MCP
+dispatch, the daemon's lane-execution broker owns the physical process tree and the MCP server owns
+the logical walk/job handle; a replacement MCP process can therefore recover the same daemon
+execution by its opaque execution id. Shell fallback is fail-closed: arbitrary task text is never
+reparsed through `cmd.exe` or PowerShell.
 
 Add it to a host:
 
@@ -2021,12 +2017,9 @@ relay only reports: it never refuses and never reverts. A file that was already 
 the lane modified again keeps its status, so the block does not list it.
 
 While a job runs, `dispatch_status` also states the running lane's usual time to answer — the
-median and 80th percentile of the durations on record, in this mode when known — or says that none
-is on record, so a caller can tell a slow lane from a stuck one. Since 2026-09-10 only a completed
-run adds a duration; a history row written before that date, whose durations outnumber its
-answers, is emptied when it loads, because at least one of them was not an answer. And every reply from an
-`llm-relay mcp` process that runs older code than the installed package ends with a notice saying
-so: restart the host's MCP connection, or the host, to load the installed code.
+median and 80th percentile of completed-run history in the most specific matching window — or says
+that no duration is known. Every reply from an `llm-relay mcp` process that runs older code than
+the installed package also carries a restart notice.
 
 #### Naming a model
 
@@ -2117,13 +2110,13 @@ read-only form, and the reply's `read-only:` line states what was applied:
 A skipped lane counts as *not tried*: the walk moves to the next lane, nothing is spawned, and no
 telemetry or demotion is recorded for it. Answer mode spawns nothing and is unaffected.
 
-**A silent lane says so.** While a spawned lane runs, `dispatch_status` reports its output so far
-— `output: none yet — silent for 540s since this lane started`, or `output: 512 bytes so far
-(stdout 512, stderr 0); last output 30s ago` — so a lane that died on a stream error in its first
-second (measured: nine minutes of `running` with nothing to distinguish it from a lane still
-thinking) is legible on the first poll. Silence is *reported, never acted on*: `claude -p` buffers
-its whole answer until exit, so a healthy run on the free pool is silent while it works, and the
-status line says so. The caller decides.
+**Running status exposes the walk's liveness decision.** `dispatch_status` reports output byte
+counts plus the authoritative `walk-verdict` and its activity basis. Output silence alone is never
+treated as death: a lane can prove activity through tagged relay traffic, output, owned-process CPU
+or working-tree changes. If none of those signals advances for `routing.dispatchWalk.idleMs`, the
+walk may stop that lane and advance. The last lane, a lane with no reliable successor, and a
+caller-named lane are not idle-stopped. Status rendering uses the snapshot already taken by the walk;
+polling status does not consume or mutate liveness evidence.
 
 **A finished job survives a restart of the MCP server.** Every terminal job is written to
 `mcp-job-archive.json` under the cache directory the moment it ends (eagerly — the measured restart
@@ -2143,14 +2136,13 @@ is found on disk when you ask for it; a job another process still runs is named 
 are unique across the processes. `dispatch_status` with no `jobId` lists the newest 20 jobs from
 all of them, with the first line of each task, so a caller whose host lost the handle can find it.
 
-**A killed lane is distinguished from a failed one.** The MCP server writes a running-job journal
-under the cache directory (`mcp-jobs.json`, honouring `XDG_CACHE_HOME`); a row is removed the
-moment its job ends, so whatever a restarting server finds is exactly the set of jobs it killed.
-Those are adopted and reported as `killed` — with an explanation, and as an error result — rather
-than answering `unknown jobId` for a job that had been running. Measured 2026-09-06: five lanes
-in flight were destroyed by one restart, ~90 lane-minutes lost, and nothing announced it. A
-killed lane wrote nothing unless it wrote early, so **check the working directory before
-re-dispatching**.
+**Restart recovery depends on who owns the execution.** The running-job journal distinguishes
+ordinary locally owned rows from daemon-broker executions. A local orphan is reported as `killed`,
+not `failed` or `timed_out`. A broker-backed orphan is atomically claimed by one replacement MCP
+process and reconciled with the daemon: an existing execution remains running or yields its terminal
+result; a reachable daemon 404 is definitive loss; transport/auth/malformed-response uncertainty
+does **not** invent a death and leaves the job running with recovery unavailable. Check the working
+directory for partial files before re-dispatching a genuinely killed job.
 
 **Bounds.** Delegation depth is capped at 3 through `LLM_RELAY_DISPATCH_DEPTH`, because a
 dispatched lane can reach this server again. A lane runs in the server's own working directory
@@ -2165,25 +2157,16 @@ cannot escape a declared root):
 Answer mode needs no working directory at all — the `cwd`/`allowedRoots` check applies only to
 agent mode and to a `cli`-kind rung in answer mode, both of which spawn a process.
 
-**A timed-out dispatch never returns nothing — and it terminates what it started.** Whether the
-timeout kills a spawned child (agent mode) or aborts the fetch (answer mode), the job's status
-becomes the distinct `timed_out` — never a bare `failed` that hides *why* — and
-`dispatch`/`dispatch_result` render whatever partial output survived plus a one-line reason, so a
-caller polling a long lane is never left with an empty response to interpret.
+**A timed-out dispatch never returns nothing, and cleanup follows the execution owner.** A lane
+whose own `timeoutMs` expires becomes the distinct `timed_out` status, with any usable partial
+output and a clear reason. For a broker-backed lane, cancellation/termination is routed to the
+daemon owner; local fallback processes are reaped by the MCP store. Process cleanup is accounted for
+before the terminal record is presented, and any survivor is reported rather than assumed gone.
 
-⚠ Reaching a terminal state now **terminates the process tree this dispatcher started** and
-removes the job's journal row *before* the caller sees the status, on every terminal path
-(`completed`, `failed`, `cancelled`, `timed_out`). Measured 2026-09-09: three lane jobs reported
-`timed_out` at 1,800 s while their original processes were still alive in their exact assigned
-worktrees, and a separate measurement found four processes from *finished* runs still burning CPU
-hours later (~530 MB). The distinguishing signal is **ownership, not age** — a slow lane and a
-stale one look identical from outside, and one legitimately ran 29 minutes — so the dispatcher
-reaps only what it started. On POSIX, each lane root is started as its own session/process-group
-leader and cancellation or timeout kills that whole group; Windows uses `taskkill /T /F`. What it
-started is enumerable through `ownedProcesses()` by job id, and any pid still alive after termination
-is **reported** in the job's rendering (`owned processes
-STILL RUNNING after <job> ended: <pids>`) rather than assumed gone. A survivor is the one case
-worth acting on, so it is named rather than logged.
+**Active hard-cap continuation is not enabled yet.** Today, reaching the lane's absolute
+`timeoutMs` ends that logical attempt even when liveness shows ongoing work. The repository has
+manual exact-resume and same-cwd isolation probes for AGY, Claude, Codex and OpenCode, but runtime
+rollover remains gated until at least one harness passes both live measurements.
 
 **A content-empty answer is reported as a failure, not a success.** A lane can exit 0 (or answer
 HTTP 200) with text that is syntactically nonempty but carries nothing usable — a lone `#`, a bare
