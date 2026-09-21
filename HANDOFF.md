@@ -32,11 +32,14 @@ The repository is in a consolidation phase after a large post-v0.85.0 developmen
 The immediate task is the **release-readiness pass for the post-v0.85.0 delta**.
 
 Persistence and repository enforcement are no longer blockers:
-- the concurrency investigation found and fixed two row-loss mechanisms: unrelated journal writes
-  filtered foreign rows through liveness, and transactional reads could silently treat an existing
-  unreadable/invalid JSON file as empty and overwrite committed state;
-- the regression fixture now surfaces per-worker journal/archive commit failures instead of hiding
-  them until the final assertion;
+- the concurrency investigation found three correctness holes: unrelated journal writes filtered
+  foreign rows through liveness; transactional reads could silently treat an existing
+  unreadable/invalid JSON file as empty; and a lock contender propagated a stale rename error when
+  the incumbent released the lock between the failed rename and the contender's path inspection;
+- the lock-release race now has a deterministic regression, and the real four-process
+  journal+archive regression runs five independent rounds per CI execution;
+- the regression fixture surfaces per-worker journal/archive commit failures instead of hiding them
+  until the final assertion;
 - repository ruleset `Protect main` is active on the default branch and requires both `check` and
   `windows-process-boundary`, with no bypass actors.
 
