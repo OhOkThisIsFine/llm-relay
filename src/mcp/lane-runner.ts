@@ -1582,6 +1582,7 @@ export class LaneJobStore {
       error: undefined,
       attempts: [],
       restored: true,
+      executionOwner: "relay-daemon",
       ...(row.label === undefined ? {} : { label: row.label }),
     };
     this.jobs.set(job.id, job);
