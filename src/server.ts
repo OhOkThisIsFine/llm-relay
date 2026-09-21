@@ -110,7 +110,8 @@ import { countRequestSamples } from "./ping/probe-cache.js";
 import { detectOpenAiFrontProtocol, openAiFrontPath } from "./routes/openai-front.js";
 import { anthropicMessagesPath } from "./routes/messages.js";
 import { beginLaneRequest, LANE_ACTIVITY_HEADER, laneActivityTag } from "./lane-activity.js";
-import type { LaneExecutionBrokerPort } from "./lane-execution-broker.js";
+import { LaneExecutionBroker, type LaneExecutionBrokerPort } from "./lane-execution-broker.js";
+import { createConfiguredLaneExecutionLauncher } from "./configured-lane-execution-launcher.js";
 
 export { baseLog, logSafePath } from "./request-log.js";
 export { DEFAULT_MAX_BODY_BYTES } from "./stream-pipeline.js";
@@ -259,7 +260,8 @@ export interface ProxyDeps {
    * D1 Phase 1: optional daemon-owned lane execution broker. Production MCP does not use it yet;
    * tests inject it to pin the admitted control route before the ownership switchover.
    */
-  laneExecutionBroker?: LaneExecutionBrokerPort;
+  /** undefined = install the production configured broker; null = explicitly disable it. */
+  laneExecutionBroker?: LaneExecutionBrokerPort | null;
   /** Optional shutdown callback — called by POST /stop after responding 202. A bare programmatic proxy with no onStop answers 503. */
   onStop?: () => void;
 }
@@ -797,6 +799,11 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
   };
   const isDestructive = destructiveMatcher(cfg.repair.destructiveTools);
   const catalog = deps.catalog ?? new ModelCatalog();
+  const laneExecutionBroker =
+    deps.laneExecutionBroker === null
+      ? undefined
+      : deps.laneExecutionBroker ??
+        new LaneExecutionBroker(createConfiguredLaneExecutionLauncher(cfg, { catalog }));
   const laneCadence = process.env.VITEST ? null : new LaneCadence(cfg);
   // The breaker is built BEFORE the ping loop because the loop holds a narrow port onto it
   // (`rateLimitRecovery`, 2026-09-15): a probe that answers 200 ends a 429-sourced cooldown
@@ -1032,7 +1039,7 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       ...(stickySessions ? { stickySessions } : {}),
       server,
       ...(controlAuthorization ? { controlAuthorization } : {}),
-      ...(deps.laneExecutionBroker ? { laneExecutionBroker: deps.laneExecutionBroker } : {}),
+      ...(laneExecutionBroker ? { laneExecutionBroker } : {}),
       quotaDemotion,
       latencyDemotion,
       probation,
@@ -1049,6 +1056,8 @@ export function createProxy(cfg: Config, deps: ProxyDeps = {}) {
       logger.write(baseLog(started, req.url ?? "/", false, false, 502, "skipped", null));
     });
   });
+
+  if (laneExecutionBroker?.shutdown) server.on("close", () => laneExecutionBroker.shutdown?.());
 
   if (!process.env.VITEST) {
     server.on("listening", () => {
