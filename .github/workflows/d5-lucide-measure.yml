@@ -1,0 +1,57 @@
+name: Measure lucide 1 output
+
+on:
+  push:
+    branches: ["d5/lucide-react-1"]
+
+permissions:
+  contents: write
+
+jobs:
+  measure:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - name: Measure exact output
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { readdirSync, statSync, writeFileSync } from "node:fs";
+          import { join, relative } from "node:path";
+          import { execFileSync } from "node:child_process";
+          const root = process.cwd();
+          const dashboard = join(root, "dist", "dashboard");
+          function listFiles(dir) {
+            return readdirSync(dir, { withFileTypes: true }).flatMap(e => {
+              const p = join(dir, e.name);
+              return e.isDirectory() ? listFiles(p) : [p];
+            });
+          }
+          const files = listFiles(dashboard);
+          const out = { dashboardFiles: files.length, dashboardRawBytes: 0, jsBytes: 0, cssBytes: 0, htmlBytes: 0, manifestBytes: 0 };
+          for (const file of files) {
+            const size = statSync(file).size;
+            const p = relative(dashboard, file).replaceAll("\\", "/");
+            out.dashboardRawBytes += size;
+            if (p.endsWith(".js")) out.jsBytes += size;
+            if (p.endsWith(".css")) out.cssBytes += size;
+            if (p.endsWith(".html")) out.htmlBytes += size;
+            if (p === ".vite/manifest.json") out.manifestBytes += size;
+          }
+          const pack = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { encoding: "utf8" }));
+          const rec = Array.isArray(pack) ? pack[0] : pack.llm_relay ?? pack["llm-relay"] ?? pack;
+          Object.assign(out, { packBytes: rec.size, unpackedBytes: rec.unpackedSize, packageEntries: rec.entryCount });
+          writeFileSync(".lucide1-metrics.json", JSON.stringify(out, null, 2) + "\n");
+          NODE
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .lucide1-metrics.json
+          git commit -m "chore(d5): capture lucide 1 package metrics"
+          git push origin HEAD:d5/lucide-react-1
