@@ -4,23 +4,8 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 /**
- * What a `cli` lane's own tool says it can serve.
- *
- * A `cli` rung is opaque config rendered verbatim into a command the host runs, so nothing
- * validated it. Measured 2026-08-08: the ladder handed an agent
- * `agy --model claude-opus-5 --effort medium`, in which BOTH halves were wrong independently —
- * AGY serves no Claude 5 at all, and `--effort` is rejected outright for its Claude models. The
- * lane looked healthy and completed nothing. See docs/history/lane-discovery.md.
- *
- * ⚠ A model the vendor does not serve is `not-servable` — an EXISTENCE fact, so the rung is
- * REMOVED, not demoted. `target-facts.ts` already draws that line: `allowance-exhausted` demotes
- * because it expires, `not-servable` removes because it will not start existing.
- *
- * ⚠ Eviction requires POSITIVE evidence. "This lane's roster is known and the model is not in it"
- * evicts; "no manifest, or this lane was never probed" is UNKNOWN and changes nothing. Same
- * fail-safe as a signature miss in `refusal-interpretation.ts`, and the same reasoning that makes
- * an unset `${ENV}` disable one provider rather than abort startup — a stale manifest must never
- * be able to empty the ladder, because this proxy fronts every session.
+ * What a CLI harness reports it can serve. Fresh positive roster evidence may remove a model the
+ * harness does not serve; missing, stale, or unprobed evidence remains unknown and never evicts.
  */
 export interface LaneModel {
   id: string;
@@ -45,13 +30,7 @@ export interface LaneManifest {
   lanes: Record<string, LaneEntry>;
 }
 
-/**
- * ⚠ Under vitest, never read the developer's real manifest — same rule and same reason as
- * `getProbeCachePath()`. A suite fixture naming a made-up model (`agy-gemini`, `codex`) would be
- * evicted by the machine's ACTUAL roster, so three pre-existing dispatch tests went red the moment
- * a real `lanes --probe` had been run. A test's ladder must be decided by its own config, not by
- * whichever CLIs happen to be installed. Tests needing a manifest pass one explicitly.
- */
+/** Tests use an isolated manifest path so local CLI rosters cannot change fixture routing. */
 export function getLaneManifestPath(): string {
   if (process.env.VITEST) return join(tmpdir(), "llm-relay-vitest", "lane-manifest.json");
   return relayStatePath("cache", ["lane-manifest.json"]);
@@ -106,19 +85,8 @@ export function laneOfCommand(command: string): string | null {
 }
 
 /**
- * The lane a RUNG belongs to, seeing through wrapper commands — and which token is the lane's own
- * binary.
- *
- * `laneOfCommand` reads only `rung.command`, and that stopped matching reality on 2026-08-27 when
- * the agy rungs moved behind `lane-launch.ps1`: their `command` became `pwsh` and the agy binary
- * moved into `args`. From that day the agy roster could never refresh (`laneCommands` no longer
- * found an agy lane to probe) and `verifyModel` answered `unknown` for every agy rung — fail-safe,
- * but blind. Recognition therefore also scans the rung's ARGS for a token whose basename is a
- * known lane binary. The scan matches exact basenames from the same closed set only; an arg VALUE
- * like `gpt-5.3-codex-spark` has basename `gpt-5.3-codex-spark`, not `codex`, so it cannot match.
- *
- * Returns the matched token as `binary` because a prober must run the LANE's tool, not the
- * wrapper: probing `pwsh models` is not probing agy.
+ * Identify a known harness in either the command or wrapper args. Exact basenames avoid matching
+ * model values that merely contain a harness name. Returns the harness binary token for probing.
  */
 export function laneOfRung(
   command: string,
@@ -134,14 +102,8 @@ export function laneOfRung(
 }
 
 /**
- * How old a roster may grow while still counting as POSITIVE evidence for eviction.
- *
- * A roster is a snapshot of what a vendor served at probe time, and vendors rename and retire
- * models on their own schedule — measured here: both live rosters were 21 days old while the
- * loader's own comment promised "a stale manifest must never be able to empty the ladder". Age
- * does not make the roster WRONG, so a listed model stays `servable`; age makes it too weak to
- * EVICT on, so a missing model degrades to `unknown` instead of `not-servable`. Same fail-safe
- * direction as every other verdict here: only fresh positive evidence removes a rung.
+ * Maximum roster age for negative evidence. A stale roster may still confirm a listed model but is
+ * too weak to evict an unlisted one.
  */
 export const LANE_ROSTER_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -157,14 +119,7 @@ export type ModelVerdict =
   | { status: "servable" }
   | { status: "not-servable"; reason: string };
 
-/**
- * Is this model one the lane's tool says it serves?
- *
- * ⚠ Every negative path that is not positive evidence returns `unknown`. Only a KNOWN, FRESH
- * roster that omits the model produces `not-servable` — a stale roster keeps answering `servable`
- * for models it lists (age does not disprove presence) but may no longer evict (see
- * `LANE_ROSTER_TTL_MS`).
- */
+/** Resolve model support from roster evidence. Only a fresh known omission yields `not-servable`. */
 export function verifyModel(
   manifest: LaneManifest | null,
   command: string,
