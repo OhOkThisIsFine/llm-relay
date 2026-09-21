@@ -9,14 +9,6 @@
 
 ## Open
 
-- **The post-v0.85.0 architecture has not been released yet.**
-  `main` contains restart-safe daemon-owned lane execution, config hot reload, liveness/status
-  changes, persistence hardening, derived lane capability, failure escalation, and the completed D5
-  toolchain upgrades beyond the published v0.85.0 checkpoint.
-  **Property:** the accumulated delta is audited by subsystem, live D1/D2/status behavior is
-  re-verified, both required CI checks are green, package/install smoke passes, and the resulting
-  tree is published as the next release before another large architectural feature begins.
-
 - **Active hard-cap continuation is designed but not implemented.**
   Today an active lane that reaches its absolute runtime ceiling is terminated even when first-party
   liveness evidence says it is still working. The approved design is in

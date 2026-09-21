@@ -6,9 +6,10 @@ Entry point for any agent picking up llm-relay. Read this before `CLAUDE.md`.
 
 The repository is in a consolidation phase after a large post-v0.85.0 development run.
 
-- Published package version: **0.85.0**.
-- `main` is the **v0.86.0 release candidate**, containing the post-v0.85.0 architecture audited
-  in `docs/history/release-readiness-audit-2026-09-21.md`; npm publication is still pending.
+- Published package version: **0.86.0**.
+- `main` contains the architecture published in **v0.86.0**. The release passed protected CI on
+  the final source head and publish run 167 passed ancestry/version checks, clean packed-artifact
+  install smoke, `npm run check`, and `npm publish`.
 - Current `main` CI is green:
   - 4,490 core tests passed, 4 skipped;
   - 46 dashboard tests passed;
@@ -31,11 +32,11 @@ The repository is in a consolidation phase after a large post-v0.85.0 developmen
 
 ### Immediate next
 
-The post-v0.85.0 subsystem audit is complete and **v0.86.0 is the active release candidate**.
-PR #65 passed both required checks before merge; later Windows CI run 758 exposed one additional
-atomic-commit failure mode, now repaired in the candidate. Do not tag until the fixing PR has passed
-both required checks. After that, the remaining gate is the `v0.86.0` tag: its publish workflow must
-pass the clean packed-artifact install smoke and publish npm.
+**v0.86.0 is published.** Phase 3 is complete. The first-party hard-cap continuation harness
+survey is also complete: AGY is the strongest first candidate, while Claude, Codex and OpenCode
+have exact resume primitives with additional caveats. The immediate gate is a real AGY
+kill/resume probe; do not add continuation substrate until at least one harness passes the live
+protocol. Evidence/vendor/operator blockers remain parallel work.
 
 Audit evidence:
 [`docs/history/release-readiness-audit-2026-09-21.md`](docs/history/release-readiness-audit-2026-09-21.md).
@@ -54,11 +55,11 @@ Persistence and repository enforcement are no longer blockers:
 
 Work in this order:
 
-1. require both protected checks to pass on the Windows atomic-rename repair;
-2. push `v0.86.0` and require the publish workflow's packed-artifact smoke and npm publish to succeed;
-3. record the published checkpoint in the live docs;
-4. clear evidence/vendor/operator-blocked items as their inputs become available;
-5. begin active hard-cap continuation as staged, harness-specific work.
+1. run the documented AGY live kill/resume probe and prove exact conversation continuation;
+2. if AGY passes, mark it verified resumable and add the generic continuation substrate without changing behavior;
+3. implement AGY continuation end to end;
+4. probe and add Claude/Codex/OpenCode independently;
+5. clear evidence/vendor/operator-blocked items in parallel as their inputs become available.
 
 Detailed sequence and exit conditions:
 [`docs/history/development-plan-2026-09-21.md`](docs/history/development-plan-2026-09-21.md).
@@ -98,6 +99,7 @@ design records.
 | `docs/history/mcp-restart-safe-lane-execution-design-2026-09-20.md` | D1 design/evidence |
 | `docs/history/config-reload-design-2026-09-20.md` | D2 design/evidence |
 | `docs/history/active-hard-cap-lane-continuation-plan-2026-09-20.md` | Planned continuation feature |
+| `docs/history/active-hard-cap-harness-survey-2026-09-21.md` | Exact-resume capability matrix and live-probe gate |
 | `docs/history/stabilization-plan-2026-09-17.md` | Historical stabilization packets; not the live queue |
 
 ## 3. Verification
