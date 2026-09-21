@@ -1574,8 +1574,13 @@ export class LaneJobStore {
     if (snapshot.status === "running") return true;
 
     if (snapshot.status === "completed") {
-      if (snapshot.code !== 0 || snapshot.timedOut !== false) return false;
-      job.status = "completed";
+      if (snapshot.code !== 0 || snapshot.timedOut !== false || snapshot.stdout === undefined) return false;
+      if (isContentEmpty(snapshot.stdout)) {
+        job.status = "failed";
+        job.error = EMPTY_OUTPUT_REASON;
+      } else {
+        job.status = "completed";
+      }
     } else if (snapshot.status === "failed") {
       if (snapshot.timedOut !== false || snapshot.code === 0) return false;
       job.status = "failed";
