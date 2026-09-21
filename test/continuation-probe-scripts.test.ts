@@ -42,6 +42,7 @@ describe("continuation measurement scripts", () => {
       '{"thread_id":"223e4567-e89b-12d3-a456-426614174001"}',
       '{"conversation_id":"323e4567-e89b-12d3-a456-426614174002"}',
       '{"sessionID":"ses_abcDEF123-xyz"}',
+      "OpenCode resumed ses_freeform456 but then failed",
       "Session 423e4567-e89b-12d3-a456-426614174003 was not found",
     ].join("\n");
 
