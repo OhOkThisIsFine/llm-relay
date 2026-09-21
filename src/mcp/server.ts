@@ -665,7 +665,9 @@ function describeJob(job: LaneJob, now: number): string {
   if (job.dispatchSource === "fallback") head.push("dispatch-source: local-fallback (daemon unreachable)");
   if (job.restored === true) {
     head.push(
-      "record: restored from disk — this job ended in an earlier llm-relay MCP server process or in another host's one",
+      job.status === "running"
+        ? "record: recovered after MCP restart — this job's process tree is owned by the relay daemon"
+        : "record: restored from disk — this job ended in an earlier llm-relay MCP server process or in another host's one",
     );
   }
   if (job.readOnly) head.push(`read-only: ${job.readOnly.binding}`);
@@ -830,12 +832,12 @@ function jobAnswerBody(job: LaneJob, now: number): string {
     return `${header}\n\nStill running. Poll dispatch_status, then call dispatch_result.`;
   }
   if (job.status === "killed") {
-    // ⚠ Its own branch, NOT folded into `timed_out`. The lane did not exceed anything and it did not
-    // fail: the MCP server restarted underneath it. The next action differs too — nothing is
-    // collectable and nothing is on disk unless the lane wrote it early — so the header's `error:`
-    // line explains the restart, and the empty-output branch below (which advises a retry) is
-    // deliberately not reached.
-    return `${header}\n\nThe lane was KILLED when the llm-relay MCP server restarted — it did not fail and it did not time out. Its process is gone. Re-dispatch from scratch, and check the working directory first: only files the lane wrote before the restart survive.`;
+    // ⚠ Its own branch, NOT folded into `timed_out`. A broker-backed recovered job can become
+    // killed only after a REACHABLE daemon says the execution id is unknown; that is not the same
+    // claim as the old local-child case where the MCP restart itself killed the process tree.
+    return job.restored === true
+      ? `${header}\n\nThe daemon-owned lane execution could no longer be recovered. No terminal result was collectable, so re-dispatch from scratch and check the working directory for partial files first.`
+      : `${header}\n\nThe lane was KILLED when the llm-relay MCP server restarted — it did not fail and it did not time out. Its process is gone. Re-dispatch from scratch, and check the working directory first: only files the lane wrote before the restart survive.`;
   }
   if (job.status === "timed_out") {
     // ⚠ A timed-out dispatch must never render nothing (C:\Code\docs\backlog.md — a bounded
