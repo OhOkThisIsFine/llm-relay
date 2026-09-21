@@ -32,10 +32,11 @@ The repository is in a consolidation phase after a large post-v0.85.0 developmen
 
 ### Immediate next
 
-**v0.86.0 is published.** Phase 3 is complete. The next source-development packet is the active
-hard-cap continuation harness survey: establish exact, resumable session identity for each supported
-harness before any continuation substrate is added. Evidence/vendor/operator blockers remain
-parallel work and should be closed only when their inputs exist.
+**v0.86.0 is published.** Phase 3 is complete. The first-party hard-cap continuation harness
+survey is also complete: AGY is the strongest first candidate, while Claude, Codex and OpenCode
+have exact resume primitives with additional caveats. The immediate gate is a real AGY
+kill/resume probe; do not add continuation substrate until at least one harness passes the live
+protocol. Evidence/vendor/operator blockers remain parallel work.
 
 Audit evidence:
 [`docs/history/release-readiness-audit-2026-09-21.md`](docs/history/release-readiness-audit-2026-09-21.md).
@@ -54,10 +55,10 @@ Persistence and repository enforcement are no longer blockers:
 
 Work in this order:
 
-1. survey exact-resume support for Claude, Codex, AGY and OpenCode using first-party evidence;
-2. classify each harness as verified resumable or unsupported/unknown;
-3. add the continuation substrate without changing behavior;
-4. implement one verified harness end to end;
+1. run the documented AGY live kill/resume probe and prove exact conversation continuation;
+2. if AGY passes, mark it verified resumable and add the generic continuation substrate without changing behavior;
+3. implement AGY continuation end to end;
+4. probe and add Claude/Codex/OpenCode independently;
 5. clear evidence/vendor/operator-blocked items in parallel as their inputs become available.
 
 Detailed sequence and exit conditions:
@@ -98,6 +99,7 @@ design records.
 | `docs/history/mcp-restart-safe-lane-execution-design-2026-09-20.md` | D1 design/evidence |
 | `docs/history/config-reload-design-2026-09-20.md` | D2 design/evidence |
 | `docs/history/active-hard-cap-lane-continuation-plan-2026-09-20.md` | Planned continuation feature |
+| `docs/history/active-hard-cap-harness-survey-2026-09-21.md` | Exact-resume capability matrix and live-probe gate |
 | `docs/history/stabilization-plan-2026-09-17.md` | Historical stabilization packets; not the live queue |
 
 ## 3. Verification
