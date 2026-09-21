@@ -150,22 +150,68 @@ record because it hashes rather than prints the raw conversation id.
 
 ### Claude
 
-Same shape using initial `system/init.session_id` and exact `--resume`. Preserve the original ID
-even if the resumed invocation reports another init ID.
+Repeatable harness: `scripts/measure-claude-continuation.mjs`.
+
+```bash
+npm run build:server
+node scripts/measure-claude-continuation.mjs
+```
+
+The probe uses `--output-format stream-json --verbose --include-partial-messages`, captures
+`system/init.session_id`, interrupts only after a content-block delta, and resumes with exact
+`--resume <id>`. It requires recovery of a random marker that exists only in the interrupted user
+turn. Resumed init/result ids are recorded diagnostically; the original id stays canonical even if a
+Claude release reports an invocation-local id after resume.
 
 ### Codex
 
-Capture `thread.started.thread_id`, but do not mark `resumeReady` until durable session evidence
-exists. Kill both before and after that boundary: before must decline continuation; after must
-resume the exact thread. Verify the resumed `thread.started` ID matches.
+Repeatable harness: `scripts/measure-codex-continuation.mjs`.
+
+```bash
+npm run build:server
+node scripts/measure-codex-continuation.mjs
+```
+
+This probe targets the difficult boundary directly: it captures `thread.started.thread_id`, waits
+for `turn.started`, leaves the active turn alive for two seconds, then kills it before
+`turn.completed`. The resumed command must emit the SAME `thread.started.thread_id` and recover
+the interrupted marker. Both assertions matter: current Codex behavior can accept a missing resume
+id, silently create a fresh thread, and still exit zero.
+
+A failure here does not disprove normal completed-thread resume; it means the active first turn is
+not yet demonstrated durable enough for hard-cap rollover. If a later Codex release exposes an
+earlier explicit durability signal, add a second probe at that signal rather than weakening this
+one.
 
 ### OpenCode
 
-Capture `sessionID` from JSON mode, resume with `--session`, and include a tool-using/multi-step
-history because those are the histories implicated in current resumed-JSON bug reports.
+Repeatable first-stage harness: `scripts/measure-opencode-continuation.mjs`.
+
+```bash
+npm run build:server
+node scripts/measure-opencode-continuation.mjs
+```
+
+OpenCode creates/loads the exact session before its JSON event loop and stamps `sessionID` onto
+every emitted event. The probe captures it from `step_start`, interrupts the active turn, resumes
+with exact `--session <id>`, then requires a clean exit, the same session id and marker recovery.
+
+This is only the first-stage exact-resume proof. Before enabling production continuation for
+OpenCode, add a second live probe with a tool-using/multi-step history because current resumed-JSON
+bug reports cluster around richer histories and subagent/tool event handling.
 
 ## Gate to Phase 5.2
 
-Phase 5.2 may begin when at least one harness has passed the live protocol above and is marked
-**verified resumable**. AGY should be attempted first. The substrate should still model harness
-support generically so Claude/Codex/OpenCode can be added independently later.
+A harness is **verified resumable** only after BOTH live measurements pass:
+
+1. its single-job `measure-<harness>-continuation.mjs` exact-ID interruption/resume probe;
+2. `node scripts/measure-continuation-isolation.mjs <harness>`, which runs two exact-resume probes
+   concurrently in the same working directory and requires distinct canonical identities.
+
+The isolation runner never chooses a latest session; it merely launches the exact-ID probes in a
+shared cwd and proves neither crosses into the other's conversation. This pins the concurrency
+condition from the continuation design before any production continuation state exists.
+
+Phase 5.2 may begin when at least one harness satisfies both checks. AGY remains the preferred first
+candidate. The substrate should still model harness support generically so Claude/Codex/OpenCode can
+be added independently later.
