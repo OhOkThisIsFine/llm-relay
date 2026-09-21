@@ -20,10 +20,13 @@
  * suite exercises the whole surface without spawning a real lane or spending real quota. Same
  * discipline as `lane-quota-probe.ts` and `availability-snapshot.ts`.
  */
-import { randomUUID } from "node:crypto";
 import type { Config } from "../config.js";
-import { LANE_ACTIVITY_HEADER } from "../lane-activity.js";
-import { credentialCandidateEnvNames } from "../authEnv.js";
+import { buildLaneEnv } from "../lane-launch-env.js";
+export { buildLaneEnv, laneCredentialEnvNames } from "../lane-launch-env.js";
+import {
+  createLaneActivityTag,
+  withLaneActivityHeader,
+} from "../lane-activity.js";
 import { DEFAULT_MCP_BLOCKING_WAIT_MS, DEFAULT_MCP_MAX_WAIT_MS, EFFORT_LEVELS, type EffortLevel } from "../config-types.js";
 import type { AssistantMessage, ContentBlock, ToolUseBlock } from "../anthropic.js";
 import { isToolUseBlock } from "../anthropic.js";
@@ -948,22 +951,6 @@ export const IDLE_POLL_MS = 15_000;
 /** Minimum cumulative CPU increase between samples that proves process-tree activity. */
 const PROCESS_CPU_ACTIVITY_MS = 1_000;
 
-/** The header line Claude Code adds to every request, from `ANTHROPIC_CUSTOM_HEADERS`. */
-function withActivityHeader(existing: string | undefined, tag: string): string {
-  const line = `${LANE_ACTIVITY_HEADER}: ${tag}`;
-  if (existing === undefined || existing.trim() === "") return line;
-  // A nested dispatch can inherit ANTHROPIC_CUSTOM_HEADERS from its parent lane. One attempt must
-  // carry exactly one activity tag: duplicate copies may be joined by Node into a value that fails
-  // laneActivityTag's closed-token parser, making the daemon lose the strongest activity signal.
-  // Preserve every unrelated custom header verbatim apart from normalizing line separators.
-  const kept = existing.split(/\r?\n/).filter((headerLine) => {
-    const colon = headerLine.indexOf(":");
-    if (colon < 0) return true;
-    return headerLine.slice(0, colon).trim().toLowerCase() !== LANE_ACTIVITY_HEADER;
-  });
-  return [...kept, line].join("\n");
-}
-
 /** The newest usable activity time in `seen`, or null when none is a finite number. */
 function newestActivity(
   seen: ReadonlyArray<{ at: number | null | undefined; source: string }>,
@@ -977,11 +964,6 @@ function newestActivity(
   return best;
 }
 
-/** A random lane activity tag (`lane-activity.ts`). */
-function newActivityTag(): string {
-  return randomUUID().replaceAll("-", "");
-}
-
 /** Resolves `{ kind: "poll" }` after `ms`, without holding the event loop open. */
 function pollTimer(ms: number): Promise<{ kind: "poll" }> {
   return new Promise((resolve) => {
@@ -993,75 +975,6 @@ function pollTimer(ms: number): Promise<{ kind: "poll" }> {
 /** Did a spawned lane produce a usable answer? Exit 0, inside its own time, with real content. */
 function laneAnswered(r: LaneRunResult): boolean {
   return r.code === 0 && !r.timedOut && !isContentEmpty(r.stdout);
-}
-
-/** Every configured environment variable that may hold a relay-owned provider credential. */
-export function laneCredentialEnvNames(config: Config): string[] {
-  const names = new Set<string>();
-  for (const [providerName, provider] of Object.entries(config.providers ?? {})) {
-    if (provider.credentials !== undefined) {
-      // Explicit fleet slots deliberately do NOT alias-fallback (`resolveCredentialExact`), so
-      // scrub exactly the names those slots declare and no broader heuristic set.
-      for (const slot of provider.credentials) names.add(slot.authEnv);
-      continue;
-    }
-    for (const name of credentialCandidateEnvNames(provider.authEnv, providerName)) names.add(name);
-  }
-
-  // A legacy standalone reshaper can own a credential outside `providers`. Provider-backed
-  // reshapers are already covered above, but the explicit name is cheap and harmless to repeat.
-  if (config.reshaper?.authEnv) names.add(config.reshaper.authEnv);
-  for (const candidate of config.reshaperCandidates ?? []) {
-    if (candidate.authEnv) names.add(candidate.authEnv);
-  }
-  return [...names];
-}
-
-/**
- * Build a lane's child environment.
- *
- * A spawned agent receives the ordinary host environment EXCEPT relay-owned provider credentials.
- * An operator may deliberately reintroduce one by naming that variable in the rung's own `env`
- * block with a non-null value. That exception is explicit configuration, not inheritance.
- *
- * Windows environment names are case-insensitive, so the scrub and explicit-override checks are
- * case-insensitive there too.
- */
-export function buildLaneEnv(
-  base: NodeJS.ProcessEnv,
-  deltas: Record<string, string | null> | undefined,
-  config: Config,
-  platform: NodeJS.Platform = process.platform,
-): NodeJS.ProcessEnv {
-  const normalize = (name: string): string => platform === "win32" ? name.toUpperCase() : name;
-  const credentialNames = new Set(laneCredentialEnvNames(config).map(normalize));
-  const explicitlySet = new Set(
-    Object.entries(deltas ?? {})
-      .filter(([, value]) => value !== null)
-      .map(([name]) => normalize(name)),
-  );
-
-  const env: NodeJS.ProcessEnv = {};
-  for (const [name, value] of Object.entries(base)) {
-    if (credentialNames.has(normalize(name)) && !explicitlySet.has(normalize(name))) continue;
-    env[name] = value;
-  }
-  for (const [name, value] of Object.entries(deltas ?? {})) {
-    if (value === null) {
-      for (const existing of Object.keys(env)) {
-        if (normalize(existing) === normalize(name)) delete env[existing];
-      }
-    } else {
-      // Avoid two spellings of the same Windows variable surviving the copy.
-      if (platform === "win32") {
-        for (const existing of Object.keys(env)) {
-          if (existing !== name && normalize(existing) === normalize(name)) delete env[existing];
-        }
-      }
-      env[name] = value;
-    }
-  }
-  return env;
 }
 
 /**
@@ -2191,7 +2104,7 @@ export class McpDispatchServer {
       // AbortSignal.timeout self-cleans and needs no manual clearTimeout; `AbortSignal.any`
       // composes it with the cancel/abandon handle without either seam knowing about the other.
       const signal = AbortSignal.any([AbortSignal.timeout(opts.timeoutMs), controller.signal]);
-      const tag = newActivityTag();
+      const tag = createLaneActivityTag();
       this.activityTags.set(jobId, tag);
       const result = this.runAnswerFetch(lane.spec, task, opts, signal, tag).then((o): LaneAttemptOutcome => {
         // ⚠ The content-empty check applies HERE too, not only on the spawned path. HTTP 200 with
@@ -2240,9 +2153,9 @@ export class McpDispatchServer {
     env[DEPTH_ENV] = String(opts.depth + 1);
     // Every model request a Claude Code lane sends carries this lane's tag, so the relay daemon can
     // say whether the lane is active (`lane-activity.ts`). Other CLIs ignore the variable.
-    const tag = newActivityTag();
+    const tag = createLaneActivityTag();
     this.activityTags.set(jobId, tag);
-    env["ANTHROPIC_CUSTOM_HEADERS"] = withActivityHeader(env["ANTHROPIC_CUSTOM_HEADERS"], tag);
+    env["ANTHROPIC_CUSTOM_HEADERS"] = withLaneActivityHeader(env["ANTHROPIC_CUSTOM_HEADERS"], tag);
     this.jobs.noteLaunch(jobId, [...expansion.notes, ...(agy === null ? [] : [agy.note])]);
     const startedAt = this.now();
     // From here the job's output figure describes THIS attempt: zero bytes, until the spawner's
