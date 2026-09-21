@@ -87,7 +87,7 @@ Needs a locally authenticated/configured harness account (manual measurement; ne
 - `measure-opencode-continuation.mjs` — captures the `sessionID` stamped on OpenCode JSON events,
   interrupts after `step_start`, resumes with exact `--session <id>`, requires a clean process
   exit, the same session id, and recovery of the interrupted marker.
-- `measure-continuation-isolation.mjs <harness>` — the second-stage isolation measurement.
+- `measure-continuation-isolation.mjs` (`<harness>`) — the second-stage isolation measurement.
   It creates ONE temporary working directory, starts TWO copies of the selected single-job probe
   concurrently in it, and requires both exact-resume measurements to pass with distinct canonical
   identity hashes. This is the live proof that two jobs sharing a cwd do not cross-resume via an
