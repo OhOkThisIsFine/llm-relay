@@ -95,6 +95,27 @@ export interface TransactionalJsonUpdateOptions<T> extends AtomicJsonWriteOption
   readonly lock?: FileLockOptions | undefined;
 }
 
+function readTransactionJsonSync<T>(
+  targetPath: string,
+  validator: ((data: unknown) => data is T) | undefined,
+): T | null {
+  let raw: string;
+  try {
+    raw = readFileSync(targetPath, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+  if (raw.trim().length === 0) {
+    throw new Error(`Transactional JSON source is empty: ${targetPath}`);
+  }
+  const parsed: unknown = JSON.parse(raw);
+  if (validator !== undefined && !validator(parsed)) {
+    throw new Error(`Transactional JSON source failed validation: ${targetPath}`);
+  }
+  return parsed as T;
+}
+
 /**
  * Serialize one JSON mutation across processes, then commit it with the existing atomic writer.
  *
@@ -110,7 +131,10 @@ export function transactionalUpdateJsonSync<T>(
     return withFileLockSync(
       targetPath,
       () => {
-        const current = safeReadJsonSync<T>(targetPath, { validator: options.validator });
+        // A transaction may treat ENOENT as an empty starting state, but an existing file that
+        // cannot be read, parsed, or validated is NOT empty. Silently turning that failure into
+        // null would let the updater overwrite committed rows with a partial fresh snapshot.
+        const current = readTransactionJsonSync<T>(targetPath, options.validator);
         const next = update(current);
         return atomicWriteJsonSync(targetPath, next, {
           space: options.space,
