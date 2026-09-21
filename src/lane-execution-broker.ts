@@ -69,7 +69,8 @@ export interface LaneExecutionStartRequest {
   timeoutMs: number;
   /** Current MCP dispatch recursion depth; the daemon launcher writes depth + 1 into the child. */
   depth: number;
-  tier?: "low" | "medium" | "high" | "xhigh";
+  /** Routing ladder key; config may use names beyond the four effort bands. */
+  tier?: string;
   readOnly?: boolean;
   callerRoot?: string;
   host?: "routed" | "bypassed" | "unknown";
@@ -355,9 +356,7 @@ function parseStart(value: Record<string, unknown>): LaneExecutionStartRequest |
   const depth = value["depth"];
   if (typeof depth !== "number" || !Number.isSafeInteger(depth) || depth < 0) return null;
   const tier = value["tier"];
-  if (tier !== undefined && tier !== "low" && tier !== "medium" && tier !== "high" && tier !== "xhigh") {
-    return null;
-  }
+  if (tier !== undefined && !boundedId(tier)) return null;
   const readOnly = value["readOnly"];
   if (readOnly !== undefined && typeof readOnly !== "boolean") return null;
   if (!optionalBoundedString(value["callerRoot"], MAX_BROKER_PATH_CHARS)) return null;
