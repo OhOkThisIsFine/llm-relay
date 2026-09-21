@@ -245,14 +245,15 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
     note(row) {
       readOnce();
       const existing = rows.get(row.jobId);
-      // note() also repoints a running walk to its next lane. The starting tree and daemon broker
-      // execution are job-wide, so a lane transition must not erase either persisted fact.
+      // note() also repoints a running walk to its next lane. The starting tree is JOB-wide,
+      // so a lane transition preserves it. A broker execution id is ATTEMPT-scoped and is
+      // deliberately NOT preserved: carrying lane A's execution under lane B's row would let a
+      // restart attach the wrong process to the new lane. The new attempt writes its own id before
+      // sending the idempotent broker start.
       const startingTree = row.startingTree ?? existing?.startingTree;
-      const brokerExecution = row.brokerExecution ?? existing?.brokerExecution;
       rows.set(row.jobId, {
         ...row,
         ...(startingTree === undefined ? {} : { startingTree }),
-        ...(brokerExecution === undefined ? {} : { brokerExecution }),
         owner: { pid, instance },
       });
       persist();
