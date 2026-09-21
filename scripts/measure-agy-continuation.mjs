@@ -56,6 +56,7 @@ async function waitFor(read, timeoutMs, label, childState, intervalMs = 20) {
   while (Date.now() < deadline) {
     const value = read();
     if (value) return value;
+    if (childState?.parseError) throw new Error(childState.parseError);
     if (childState?.closed) {
       throw new Error(
         `AGY exited before ${label}: code=${childState.code} signal=${childState.signal}; stderr=${childState.stderr}`,
@@ -221,6 +222,14 @@ function activeAgentEvent(state) {
   );
 }
 
+function toolEvent(state) {
+  return state.events.find(
+    (event) =>
+      event?.event === "step_update" &&
+      event?.step_update?.step_type === "tool",
+  );
+}
+
 function resultEvent(state) {
   return state.events.find(
     (event) =>
@@ -270,6 +279,9 @@ try {
     first,
   );
 
+  if (toolEvent(first)) {
+    throw new Error("AGY used a tool despite the probe's tool-free instruction; measurement is invalid");
+  }
   if (resultEvent(first)) {
     throw new Error("fresh AGY run completed before it could be interrupted; measurement is invalid");
   }
