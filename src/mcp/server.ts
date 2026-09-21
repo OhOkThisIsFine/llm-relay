@@ -1224,9 +1224,9 @@ export class McpDispatchServer {
   }
 
   /**
-   * Kill every running child, then flush the finished-job archive. Wired to process exit so nothing
-   * is orphaned and nothing the archive still owes to disk is lost on a graceful stop (a hard kill
-   * is covered by the archive's eager terminal writes — `job-archive.ts`).
+   * Kill every LOCALLY owned running child, leave daemon-owned D1 executions running, then flush the
+   * finished-job archive. Explicit dispatch_cancel is the path that asks the daemon owner to stop a
+   * broker execution; MCP/host shutdown is the lifetime boundary D1 is designed to survive.
    */
   shutdown(): void {
     this.jobs.cancelAll();
@@ -1406,18 +1406,23 @@ export class McpDispatchServer {
    * measured polling one finished job 2,023 times over 71 minutes (2026-09-16). So the first poll
    * that sees the job end already holds the answer; a running job keeps the short form.
    */
-  private toolStatus(args: Record<string, unknown>): unknown {
+  private async toolStatus(args: Record<string, unknown>): Promise<unknown> {
     const jobId = readString(args, "jobId");
-    if (!jobId) return textResult(this.recentJobs());
+    if (!jobId) {
+      await this.refreshAllBrokerJobs();
+      return textResult(this.recentJobs());
+    }
+    await this.refreshBrokerJob(jobId);
     const job = this.jobs.find(jobId);
     if (!job) return this.unknownJob(jobId);
     if (job.status === "running") return textResult(describeJob(job, this.now()));
     return textResult(jobAnswer(job, this.now()), isFailureStatus(job.status));
   }
 
-  private toolResult(args: Record<string, unknown>): unknown {
+  private async toolResult(args: Record<string, unknown>): Promise<unknown> {
     const jobId = readString(args, "jobId");
     if (!jobId) return textResult("dispatch_result requires jobId", true);
+    await this.refreshBrokerJob(jobId);
     const job = this.jobs.find(jobId);
     if (!job) return this.unknownJob(jobId);
     return textResult(jobAnswer(job, this.now()), isFailureStatus(job.status));
@@ -1465,11 +1470,56 @@ export class McpDispatchServer {
     );
   }
 
-  private toolCancel(args: Record<string, unknown>): unknown {
+  private async toolCancel(args: Record<string, unknown>): Promise<unknown> {
     const jobId = readString(args, "jobId");
     if (!jobId) return textResult("dispatch_cancel requires jobId", true);
+
+    await this.refreshBrokerJob(jobId);
     const job = this.jobs.find(jobId);
     if (!job) return this.unknownJob(jobId);
+    if (job.status !== "running") {
+      return textResult(`${jobId} was already ${job.status}`);
+    }
+
+    const executionId = this.jobs.brokerExecution(jobId);
+    if (executionId !== undefined) {
+      const client = this.deps.laneExecutionClient;
+      if (client === undefined) {
+        return textResult(
+          `could not cancel ${jobId}: the daemon execution client is unavailable; the job was left running`,
+          true,
+        );
+      }
+      const result = await client.request({ action: "cancel", executionId });
+      if (!result.ok) {
+        if (result.kind === "rejected" && result.status === 404) {
+          this.jobs.markBrokerKilled(
+            jobId,
+            "the relay daemon is reachable but no longer knows this recovered lane execution",
+          );
+          await this.recordTreeDelta(jobId);
+          return textResult(`${jobId} was already killed`, true);
+        }
+        return textResult(
+          `could not cancel ${jobId}: ${result.message}; the daemon-owned execution was left untouched`,
+          true,
+        );
+      }
+      if (!this.jobs.applyBrokerSnapshot(jobId, result.execution)) {
+        return textResult(
+          `could not confirm cancellation of ${jobId}: the daemon returned a mismatched execution snapshot`,
+          true,
+        );
+      }
+      if (result.execution.status !== "running") await this.recordTreeDelta(jobId);
+      const current = this.jobs.find(jobId);
+      return textResult(
+        current?.status === "cancelled"
+          ? `cancelled ${jobId}`
+          : `${jobId} was already ${current?.status ?? result.execution.status}`,
+      );
+    }
+
     const cancelled = this.jobs.cancel(jobId);
     if (cancelled) void this.recordTreeDelta(jobId);
     return textResult(cancelled ? `cancelled ${jobId}` : `${jobId} was already ${job.status}`);
