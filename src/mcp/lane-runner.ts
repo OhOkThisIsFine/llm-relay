@@ -1511,6 +1511,33 @@ export class LaneJobStore {
     return this.brokerExecutions.get(id);
   }
 
+  /** Record which execution boundary owns the current attempt. */
+  noteExecutionOwner(id: string, owner: LaneJob["executionOwner"]): void {
+    const job = this.jobs.get(id);
+    if (job === undefined || job.status !== "running") return;
+    if (owner === undefined) delete job.executionOwner;
+    else job.executionOwner = owner;
+  }
+
+  /**
+   * Clear an attempt-scoped daemon execution after it is definitively terminal and the walk will
+   * continue. The job itself stays running; the journal row is rewritten without broker metadata.
+   */
+  clearBrokerExecution(id: string): void {
+    const job = this.jobs.get(id);
+    if (job === undefined || job.status !== "running") return;
+    this.brokerExecutions.delete(id);
+    if (job.executionOwner === "relay-daemon") delete job.executionOwner;
+    this.journal.note({
+      jobId: job.id,
+      laneId: job.laneId,
+      ...(job.spec === undefined ? {} : { spec: job.spec }),
+      cwd: job.cwd,
+      startedAt: job.startedAt,
+      ...(job.label === undefined ? {} : { label: job.label }),
+    });
+  }
+
   /**
    * Bind a live job to the daemon execution that now owns its process tree, and persist the opaque
    * reference before the broker start request is sent. Used by the later ownership switchover.
