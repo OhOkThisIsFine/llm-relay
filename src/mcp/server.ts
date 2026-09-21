@@ -2244,14 +2244,15 @@ export class McpDispatchServer {
     invoke?: LaneInvocation,
   ): Promise<LaneAttemptOutcome> {
     const attemptStart = this.now();
-    const started = this.startLane(jobId, lane, task, opts, invoke);
+    const started = await this.startLane(jobId, lane, task, opts, invoke);
     if ("refusal" in started) return { run: emptyRun(), abandoned: false, refusal: started.refusal };
-    // ⚠ `registerProcess`, never the bare kill callback: the handle carries the pids this
-    // dispatcher STARTED, which is the only reliable signal for a reaper. Age is not — a long
-    // lane and a stale one look identical from outside, and one legitimately ran 29 minutes.
-    this.jobs.registerProcess(jobId, started);
-    // The owned handle now describes THIS attempt. Never compare its CPU with the previous lane's.
+    if (started.brokerExecutionId === undefined) {
+      // Locally owned fallback/pre-D1 path: the MCP process owns and reaps this exact process tree.
+      this.jobs.registerProcess(jobId, started);
+    }
+    // Attempt-scoped CPU baselines never cross a lane boundary or an ownership boundary.
     this.processCpu.delete(jobId);
+    this.brokerCpu.delete(jobId);
 
     // The attempt promise is made total here, once, so neither branch below has to repeat it and
     // no rejection can escape into the walk.
@@ -2350,6 +2351,7 @@ export class McpDispatchServer {
     // never rejects, so the killed child's late settlement needs no further handler — it resolves
     // into a value nobody reads.
     started.kill();
+    if (started.waitForKill !== undefined) await started.waitForKill();
     return { run: emptyRun(), abandoned: true };
   }
 
