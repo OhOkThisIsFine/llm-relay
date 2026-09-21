@@ -205,6 +205,27 @@ describe("LaneExecutionBroker", () => {
       .toMatchObject({ ok: true, execution: { status: "cancelled", stdout: "partial" } });
   });
 
+  it("daemon shutdown cancels every still-running broker process tree", async () => {
+    const a = deferred<LaneExecutionRunResult>();
+    const b = deferred<LaneExecutionRunResult>();
+    const cancelled: string[] = [];
+    const broker = new LaneExecutionBroker((request) => ({
+      result: request.executionId.endsWith("aaaa") ? a.promise : b.promise,
+      cancel: () => cancelled.push(request.executionId),
+    }), () => 500);
+
+    await broker.handle(start({ executionId: "exec-0000000000000000000000000000aaaa" }));
+    await broker.handle(start({ executionId: "exec-0000000000000000000000000000bbbb" }));
+    broker.shutdown();
+
+    expect(cancelled.sort()).toEqual([
+      "exec-0000000000000000000000000000aaaa",
+      "exec-0000000000000000000000000000bbbb",
+    ]);
+    expect(await broker.handle({ action: "status", executionId: "exec-0000000000000000000000000000aaaa" }))
+      .toMatchObject({ ok: true, execution: { status: "cancelled", endedAt: 500 } });
+  });
+
   it("never prunes a cancelled execution while its child handle is still unsettled", async () => {
     const run = deferred<LaneExecutionRunResult>();
     const broker = new LaneExecutionBroker(
