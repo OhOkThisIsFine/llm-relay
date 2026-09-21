@@ -70,6 +70,12 @@ if (mode === "transaction") {
     // A larger row makes the old unlocked read/merge/rewrite overlap readily under real processes.
     label: "x".repeat(128 * 1024),
   });
+  const afterJournal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+    jobs?: Array<{ jobId?: string }>;
+  };
+  if (!afterJournal.jobs?.some((row) => row.jobId === id)) {
+    throw new Error(`journal mutation returned without persisting ${id}`);
+  }
 
   const archived: LaneJob = {
     id,
@@ -86,7 +92,16 @@ if (mode === "transaction") {
     cwd: process.cwd(),
     error: undefined,
   };
-  createJobArchive(archivePath).record(archived);
+  const archive = createJobArchive(archivePath);
+  if (!archive.record(archived)) {
+    throw new Error(`archive mutation failed for ${id}`);
+  }
+  const afterArchive = JSON.parse(readFileSync(archivePath, "utf8")) as {
+    jobs?: Array<{ id?: string }>;
+  };
+  if (!afterArchive.jobs?.some((row) => row.id === id)) {
+    throw new Error(`archive mutation returned without persisting ${id}`);
+  }
   writeFileSync(done, "done");
 
   // Keep every journal owner alive until the parent has inspected the shared file. A later writer
