@@ -7,8 +7,8 @@ Entry point for any agent picking up llm-relay. Read this before `CLAUDE.md`.
 The repository is in a consolidation phase after a large post-v0.85.0 development run.
 
 - Published package version: **0.85.0**.
-- `main` is substantially ahead of that release and contains several behavioral changes that
-  should be checkpointed in the next release before another large architectural feature lands.
+- `main` is the **v0.86.0 release candidate**, containing the post-v0.85.0 architecture audited
+  in `docs/history/release-readiness-audit-2026-09-21.md`; npm publication is still pending.
 - Current `main` CI is green:
   - 4,490 core tests passed, 4 skipped;
   - 46 dashboard tests passed;
@@ -29,9 +29,9 @@ The repository is in a consolidation phase after a large post-v0.85.0 developmen
 
 ### Immediate next
 
-The post-v0.85.0 subsystem audit is complete and the next release candidate is **v0.86.0**.
-The release remains open until the candidate lands under both required checks and the
-tag-triggered publish workflow passes its clean packed-artifact install smoke and publishes npm.
+The post-v0.85.0 subsystem audit is complete and **v0.86.0 is on `main`**. PR #65 passed both
+required checks before merge. The remaining release gate is the `v0.86.0` tag: its publish workflow
+must pass the clean packed-artifact install smoke and publish npm.
 
 Audit evidence:
 [`docs/history/release-readiness-audit-2026-09-21.md`](docs/history/release-readiness-audit-2026-09-21.md).
@@ -50,11 +50,10 @@ Persistence and repository enforcement are no longer blockers:
 
 Work in this order:
 
-1. land the v0.86.0 release candidate under required `check` and `windows-process-boundary`;
-2. push `v0.86.0` and require the publish workflow's packed-artifact smoke and npm publish to succeed;
-3. record the published checkpoint in the live docs;
-4. clear evidence/vendor/operator-blocked items as their inputs become available;
-5. begin active hard-cap continuation as staged, harness-specific work.
+1. push `v0.86.0` and require the publish workflow's packed-artifact smoke and npm publish to succeed;
+2. record the published checkpoint in the live docs;
+3. clear evidence/vendor/operator-blocked items as their inputs become available;
+4. begin active hard-cap continuation as staged, harness-specific work.
 
 Detailed sequence and exit conditions:
 [`docs/history/development-plan-2026-09-21.md`](docs/history/development-plan-2026-09-21.md).
