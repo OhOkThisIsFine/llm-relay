@@ -188,8 +188,10 @@ only because the number came from the operator's own configuration file.
 | Module | Responsibility |
 |---|---|
 | `dispatch.ts` | the lane ladder: which agent should take a whole task. |
-| `mcp/server.ts` | the `llm-relay mcp` tool surface. Five tools. |
-| `mcp/lane-runner.ts` | run a lane and hold the job while it runs. |
+| `mcp/server.ts` | the `llm-relay mcp` tool surface, walk orchestration, and restart reconciliation for daemon-owned attempts. |
+| `mcp/lane-runner.ts` | local fallback process ownership and job lifecycle bookkeeping. |
+| `lane-execution-broker.ts` | daemon-owned, idempotent agent-lane execution that survives an MCP host restart. |
+| `configured-lane-execution-launcher.ts` | resolve a broker start back through live daemon config and launch the configured lane. |
 | `lane-affinity.ts` | which lane answered, and which one stalled. |
 | `lane-activity.ts` | is a running lane still doing work? |
 
