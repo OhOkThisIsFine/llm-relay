@@ -84,7 +84,7 @@ function fakeBroker(
 }
 
 async function withProxy<T>(
-  broker: LaneExecutionBrokerPort | undefined,
+  broker: LaneExecutionBrokerPort | null | undefined,
   fn: (base: string) => Promise<T>,
 ): Promise<T> {
   const proxy = createProxy(cfg(), {
@@ -155,7 +155,7 @@ describe("POST /mcp/lane-execution", () => {
   });
 
   it("fails closed when no broker is installed", async () => {
-    await withProxy(undefined, async (base) => {
+    await withProxy(null, async (base) => {
       const response = await post(base, startBody());
       expect(response.status).toBe(503);
       expect(await response.json()).toMatchObject({
