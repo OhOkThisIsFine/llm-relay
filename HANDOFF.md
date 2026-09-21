@@ -18,8 +18,10 @@ The repository is in a consolidation phase after a large post-v0.85.0 developmen
 - D2 transactional config hot reload is implemented.
 - Public dispatch/liveness state is explicit rather than inferred from circumstantial clues.
 - Multi-process journal/archive mutations use cross-process transactional locking. The 2026-09-21
-  Windows row-loss investigation also made transactions fail closed on unreadable existing JSON
-  and stopped unrelated journal writes from garbage-collecting foreign rows.
+  Windows row-loss investigation made transactions fail closed on unreadable existing JSON, stopped
+  unrelated journal writes from garbage-collecting foreign rows, and the release gate subsequently
+  exposed a transient Windows `rename(tmp, target)` `EPERM`; the v0.86.0 candidate retries only
+  transient Windows replacement errors for a bounded ~1 s while retaining the lock and temp file.
 - Lane capability is derived from synced model evidence/pool bands; the legacy hand-set capability
   value has no routing authority.
 - Repeated 402/5xx failures use bounded recovery escalation and remain eligible for failover.
@@ -29,9 +31,11 @@ The repository is in a consolidation phase after a large post-v0.85.0 developmen
 
 ### Immediate next
 
-The post-v0.85.0 subsystem audit is complete and **v0.86.0 is on `main`**. PR #65 passed both
-required checks before merge. The remaining release gate is the `v0.86.0` tag: its publish workflow
-must pass the clean packed-artifact install smoke and publish npm.
+The post-v0.85.0 subsystem audit is complete and **v0.86.0 is the active release candidate**.
+PR #65 passed both required checks before merge; later Windows CI run 758 exposed one additional
+atomic-commit failure mode, now repaired in the candidate. Do not tag until the fixing PR has passed
+both required checks. After that, the remaining gate is the `v0.86.0` tag: its publish workflow must
+pass the clean packed-artifact install smoke and publish npm.
 
 Audit evidence:
 [`docs/history/release-readiness-audit-2026-09-21.md`](docs/history/release-readiness-audit-2026-09-21.md).
@@ -50,10 +54,11 @@ Persistence and repository enforcement are no longer blockers:
 
 Work in this order:
 
-1. push `v0.86.0` and require the publish workflow's packed-artifact smoke and npm publish to succeed;
-2. record the published checkpoint in the live docs;
-3. clear evidence/vendor/operator-blocked items as their inputs become available;
-4. begin active hard-cap continuation as staged, harness-specific work.
+1. require both protected checks to pass on the Windows atomic-rename repair;
+2. push `v0.86.0` and require the publish workflow's packed-artifact smoke and npm publish to succeed;
+3. record the published checkpoint in the live docs;
+4. clear evidence/vendor/operator-blocked items as their inputs become available;
+5. begin active hard-cap continuation as staged, harness-specific work.
 
 Detailed sequence and exit conditions:
 [`docs/history/development-plan-2026-09-21.md`](docs/history/development-plan-2026-09-21.md).
