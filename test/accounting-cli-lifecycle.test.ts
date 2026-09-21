@@ -174,6 +174,9 @@ describe("accounting store CLI lifecycle", () => {
       accountingReader: mocks.store,
       relayVersion: currentVersion(),
       dashboardAttributionPolicy: "include_all_labeled",
+      // D2 gives the production proxy the startup-equivalent config loader and post-commit warmer.
+      reloadConfig: expect.any(Function),
+      onReloaded: expect.any(Function),
       // `POST /stop` (backlog item 3, 2026-09-09) reaches the SAME shutdown as a signal.
       onStop: expect.any(Function),
     });
