@@ -65,7 +65,7 @@ function canonicalVirtualModules(value, label) {
 
 function assertEqual(actual, expected, label) {
   if (JSON.stringify(actual) !== JSON.stringify(expected)) {
-    fail(`${label} differs from the production Vite/Rollup module graph`);
+    fail(`${label} differs from the production Vite/Rolldown module graph`);
   }
 }
 
