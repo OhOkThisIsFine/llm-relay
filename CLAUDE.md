@@ -1278,9 +1278,9 @@ under `scripts/`). The one thing to know from outside that directory: most `scri
 
 ## Status & open work
 
-⚠ **Read [HANDOFF.md](HANDOFF.md) §0 for the current sprint, not this section.** HANDOFF is the
-living state; what follows is the durable residue — decisions, standing warnings and lessons that
-outlive any one release. Per-release narration belongs there and in git, never here.
+**Read [HANDOFF.md](HANDOFF.md) §0 for current state and the immediate next step, and
+[docs/backlog.md](docs/backlog.md) for open work.** What follows is durable historical residue:
+decisions, standing warnings and lessons that outlive any one release.
 
 **v0.46.0 closed a safety-shaped code gap and opened another one in the same commit** — the
 dialect-rescue destructive filter (`091cf7c`, 2026-08-24). What it closed: `destructive` had
@@ -1302,8 +1302,8 @@ name it RECOGNISED and the filter reads that list first.
 that sentence was false the day it was written.** Kept here as the correction rather than deleted,
 because the lesson is the durable part: a check that reads what an earlier stage COMMITTED inherits
 that stage's discard policy as its own trigger condition, and no test, typecheck or gate can see it.
-Do not replace this with a fresh "no known gaps" claim — say what has been LOOKED at instead.
-HANDOFF §6 still lists only recorded trades — no open code gaps.
+Do not replace this with a fresh "no known gaps" claim — say what has been reviewed instead.
+Current binding constraints are in HANDOFF §1; current unmet properties are in `docs/backlog.md`.
 
 **The metering sprint is complete (2026-08-22, evening)** — Stages 0–6 of
 `docs/history/quota-metering-spec-2026-08-16.md` are delivered, through the event-sourced accounting store
