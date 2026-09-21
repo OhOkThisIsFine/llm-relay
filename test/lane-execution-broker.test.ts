@@ -17,6 +17,7 @@ function start(overrides: Partial<LaneExecutionStartRequest> = {}): LaneExecutio
     task: "inspect the repository",
     cwd: "C:/Code/worktree",
     timeoutMs: 60_000,
+    depth: 0,
     ...overrides,
   };
 }

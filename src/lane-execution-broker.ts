@@ -58,6 +58,8 @@ export interface LaneExecutionStartRequest {
   task: string;
   cwd: string;
   timeoutMs: number;
+  /** Current MCP dispatch recursion depth; the daemon launcher writes depth + 1 into the child. */
+  depth: number;
   tier?: "low" | "medium" | "high" | "xhigh";
   readOnly?: boolean;
   callerRoot?: string;
@@ -265,6 +267,7 @@ function parseStart(value: Record<string, unknown>): LaneExecutionStartRequest |
     "task",
     "cwd",
     "timeoutMs",
+    "depth",
     "tier",
     "readOnly",
     "callerRoot",
@@ -298,6 +301,8 @@ function parseStart(value: Record<string, unknown>): LaneExecutionStartRequest |
   ) {
     return null;
   }
+  const depth = value["depth"];
+  if (typeof depth !== "number" || !Number.isSafeInteger(depth) || depth < 0) return null;
   const tier = value["tier"];
   if (tier !== undefined && tier !== "low" && tier !== "medium" && tier !== "high" && tier !== "xhigh") {
     return null;
@@ -331,6 +336,7 @@ function parseStart(value: Record<string, unknown>): LaneExecutionStartRequest |
     task: value["task"],
     cwd: value["cwd"],
     timeoutMs,
+    depth,
     ...(tier === undefined ? {} : { tier }),
     ...(readOnly === undefined ? {} : { readOnly }),
     ...(value["callerRoot"] === undefined ? {} : { callerRoot: value["callerRoot"] }),
@@ -365,6 +371,7 @@ function startSignature(request: LaneExecutionStartRequest): string {
         request.task,
         request.cwd,
         request.timeoutMs,
+        request.depth,
         request.tier ?? null,
         request.readOnly ?? null,
         request.callerRoot ?? null,

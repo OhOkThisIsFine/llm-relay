@@ -53,6 +53,7 @@ function startBody() {
     task: "inspect the repository",
     cwd: "C:/Code/worktree",
     timeoutMs: 60_000,
+    depth: 0,
   };
 }
 
