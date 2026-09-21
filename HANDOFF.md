@@ -103,10 +103,18 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   default `clearMocks: true` is retained because the suite does not depend on cross-test mock
   history. The package baseline was re-measured at 1,212,895 packed bytes, 5,979,413 unpacked
   bytes, and 460 entries, all within the existing ceilings.
-- **Immediate next in D5.** Upgrade Vite 6 → 8 alone, then re-run the full gate and package
-  measurement before touching another major. M1 remains blocked on a first-party AGY success
-  envelope. Separately open: repository CI enforcement, Route B's vendor blocker, and the
-  owner-driven Codex/Code-tab checks.
+- **D5-b Vite 8 is green.** Vite moved from `^6.4.3` to `^8.3.0`; its first-party
+  React adapter moved from `^4.4.1` to `^6.1.1` in the same lap because the old adapter's peer
+  range cannot install against Vite 8. No dashboard config rewrite was needed. The production
+  graph now carries `rolldown/runtime.js` beside Vite's module-preload helper, so the checked
+  bundle inventory and third-party notices were updated from observed build evidence. Full Linux
+  and Windows gates pass. The dashboard shrank to 388,654 raw bytes; package measurement is
+  1,208,601 packed bytes, 5,966,259 unpacked bytes, and 460 entries, all within the existing
+  ceilings.
+- **Immediate next in D5.** Upgrade jsdom 26 → 30 alone and run the full gate before touching
+  Tailwind 4 or TypeScript 7. M1 remains blocked on a first-party AGY success envelope.
+  Separately open: repository CI enforcement, Route B's vendor blocker, and the owner-driven
+  Codex/Code-tab checks.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
