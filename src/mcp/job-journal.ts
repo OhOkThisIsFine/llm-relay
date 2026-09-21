@@ -144,6 +144,12 @@ export interface JobJournalOptions {
   pid?: number;
   /** Does `pid` still name a running process? `process.kill(pid, 0)` by default. */
   isAlive?: (pid: number) => boolean;
+  /**
+   * Optional diagnostic seam for a best-effort persistence failure.
+   * Production leaves this unset; concurrency regressions use it to surface the exact swallowed
+   * lock/read/write error instead of discovering only a missing row later.
+   */
+  onPersistError?: (error: unknown) => void;
 }
 
 function defaultIsAlive(pid: number): boolean {
@@ -246,7 +252,8 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
         },
         { validator: isJournalFile, strict: true, lock: MCP_PERSISTENCE_LOCK },
       );
-    } catch {
+    } catch (error) {
+      options.onPersistError?.(error);
       // Best-effort by construction: the journal only ever IMPROVES the report of a crash, so a
       // full disk or unusable lock must not become a dispatch failure.
     }
@@ -364,7 +371,8 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
         if (committed) {
           startupOrphans = startupOrphans.filter((row) => !sameJournalRowIdentity(row, startup));
         }
-      } catch {
+      } catch (error) {
+        options.onPersistError?.(error);
         // Best-effort, like other journal mutations. A failed acknowledgement deliberately leaves
         // the orphan row in place so a later process can recover it again.
       }
