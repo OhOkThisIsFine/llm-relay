@@ -99,7 +99,7 @@ export interface JobJournal {
   note(row: JournalRow): void;
   /** Persist the starting git status for a running agent-mode job, when it fits the bound. */
   noteStartingTree?(jobId: string, tree: TreeSnapshot, scope: readonly string[] | undefined): void;
-  /** Persist the daemon-owned execution reference for a running job. D1 Phase 3 consumes it. */
+  /** Persist the daemon-owned execution reference used by restart recovery and daemon cancellation. */
   noteBrokerExecution?(jobId: string, execution: JournalBrokerExecution): void;
   /**
    * Atomically claim a dead-owner broker row for this MCP process. Exactly one replacement process
