@@ -1503,6 +1503,18 @@ export class LaneJobStore {
   }
 
   /**
+   * Bind a live job to the daemon execution that now owns its process tree, and persist the opaque
+   * reference before the broker start request is sent. Used by the later ownership switchover.
+   */
+  noteBrokerExecution(id: string, executionId: string): void {
+    const job = this.jobs.get(id);
+    if (job === undefined || job.status !== "running") return;
+    const execution = { kind: "daemon-v1" as const, executionId };
+    this.brokerExecutions.set(id, executionId);
+    this.journal.noteBrokerExecution?.(id, execution);
+  }
+
+  /**
    * Materialize a claimed broker row as a running job while the daemon is queried/retried.
    * The daemon, not this process, owns its process tree; no local kill handle is registered.
    */
