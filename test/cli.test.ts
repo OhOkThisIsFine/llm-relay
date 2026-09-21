@@ -27,6 +27,7 @@ import {
   runDispatch,
   runCooldowns,
   runOffload,
+  runReload,
   runStop,
   runConfigCommand,
   runPools,
@@ -1333,6 +1334,95 @@ describe("llm-relay stop — live control mutation", () => {
   });
 });
 
+describe("llm-relay reload — live control mutation", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rp-cli-reload-"));
+  const originalArgv = process.argv;
+  const configAt = (listen: string) => ({
+    listen,
+    providers: { anthropic: { base: "https://api.anthropic.com", kind: "anthropic" } },
+    routing: { default: "anthropic", tiers: {}, benchmarkSort: false },
+    repair: { maxAttempts: 2, destructiveTools: [] },
+    mode: "detect",
+    log: { level: "silent", file: null },
+  });
+
+  afterEach(() => {
+    process.argv = originalArgv;
+    vi.restoreAllMocks();
+  });
+
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("prints changed paths and exits 0 when the relay accepts the reload", async () => {
+    const server = createServer((req, res) => {
+      expect(req.method).toBe("POST");
+      expect(req.url).toBe("/reload");
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        reloaded: true,
+        changed: ["routing.default", "providers.anthropic.timeoutMs"],
+        warnings: [],
+      }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("missing test listener");
+      const configPath = join(dir, "accepted.json");
+      writeFileSync(configPath, JSON.stringify(configAt(`127.0.0.1:${address.port}`), null, 2));
+      process.argv = ["node", "cli.ts", "--config", configPath, "reload"];
+      const stdout: string[] = [];
+      vi.spyOn(process.stdout, "write").mockImplementation((chunk) => {
+        stdout.push(String(chunk));
+        return true;
+      });
+      vi.spyOn(process, "exit").mockImplementation((code) => {
+        throw new Error(`exit:${code}`);
+      });
+
+      await expect(runReload()).rejects.toThrow("exit:0");
+      expect(stdout.join("")).toContain("routing.default");
+      expect(stdout.join("")).toContain("providers.anthropic.timeoutMs");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it("prints only restart-required paths and exits 1 on a 409", async () => {
+    const server = createServer((_req, res) => {
+      res.writeHead(409, { "content-type": "application/json" });
+      res.end(JSON.stringify({
+        error: { type: "error", message: "restart required" },
+        requiresRestart: ["routing.sticky", "providers.anthropic.base"],
+      }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (address === null || typeof address === "string") throw new Error("missing test listener");
+      const configPath = join(dir, "restart.json");
+      writeFileSync(configPath, JSON.stringify(configAt(`127.0.0.1:${address.port}`), null, 2));
+      process.argv = ["node", "cli.ts", "--config", configPath, "reload"];
+      const stderr: string[] = [];
+      vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+        stderr.push(String(chunk));
+        return true;
+      });
+      vi.spyOn(process, "exit").mockImplementation((code) => {
+        throw new Error(`exit:${code}`);
+      });
+
+      await expect(runReload()).rejects.toThrow("exit:1");
+      const rendered = stderr.join("");
+      expect(rendered).toContain("routing.sticky");
+      expect(rendered).toContain("providers.anthropic.base");
+      expect(rendered).not.toContain("https://");
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+});
+
 describe("routing show — config-staleness notice", () => {
   const dir = mkdtempSync(join(tmpdir(), "rp-cli-routing-stale-"));
   const originalArgv = process.argv;
@@ -1380,7 +1470,7 @@ describe("routing show — config-staleness notice", () => {
 
       expect(JSON.parse(stdout.join(""))).toMatchObject(routingBlock);
       expect(stderr.join("")).toContain(
-        "config changed on disk since the relay loaded it — restart required (llm-relay stop, then start)",
+        'config changed on disk since the relay loaded it — run "llm-relay reload"; a restart is required if the changed fields are not reloadable',
       );
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
