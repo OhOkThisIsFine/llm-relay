@@ -73,6 +73,8 @@ import { readOnlyInvoke, readOnlyVerdict, type LaneInvocation } from "./readonly
 import { agyQuotaStatement, type AgyLogSnapshot } from "./agy-quota-log.js";
 import { nullJobJournal, type JobJournal } from "./job-journal.js";
 import { nullJobArchive, type JobArchive } from "./job-archive.js";
+import type { LaneExecutionSnapshot } from "../lane-execution-broker.js";
+import type { LaneExecutionClient } from "./lane-execution-client.js";
 import {
   RPC_INTERNAL_ERROR,
   RPC_INVALID_PARAMS,
@@ -179,6 +181,11 @@ export interface McpServerDeps {
    * job ids continue past the highest one the previous process minted (`job-archive.ts`).
    */
   archive?: JobArchive;
+  /**
+   * D1 daemon execution client. Optional until the ownership switchover; when present, broker-backed
+   * orphan rows are reconciled instead of being declared killed from the MCP owner pid alone.
+   */
+  laneExecutionClient?: LaneExecutionClient;
   /**
    * The llm-relay version INSTALLED on disk now, read fresh on each call — or null when unknown.
    * When it differs from `version` (the code this process started with), every tool reply says so:
@@ -1154,9 +1161,11 @@ export class McpDispatchServer {
   >();
   /** The activity tag (`lane-activity.ts`) of the lane each running job has started last. */
   private readonly activityTags = new Map<string, string>();
-  /** Last cumulative process-tree CPU reading for the current attempt of each job. */
+  /** Last cumulative process-tree CPU reading for the current attempt of each locally-owned job. */
   private readonly processCpu = new Map<string, number>();
-  /** Startup adoption work; only reads of restored terminal jobs wait for it. */
+  /** Last daemon-reported cumulative CPU reading for each recovered broker execution. */
+  private readonly brokerCpu = new Map<string, number>();
+  /** Startup adoption work; only job-control reads wait for it. */
   private readonly startup: Promise<void>;
 
   constructor(private readonly deps: McpServerDeps) {
@@ -1166,7 +1175,7 @@ export class McpDispatchServer {
     this.now = deps.now ?? Date.now;
     this.cwd = deps.cwd ?? (() => process.cwd());
     this.maxDepth = deps.maxDepth ?? DEFAULT_MAX_DEPTH;
-    this.startup = this.restoreKilledTreeDeltas();
+    this.startup = this.restoreRestartedJobs();
   }
 
   /**
@@ -1326,15 +1335,15 @@ export class McpDispatchServer {
       case "dispatch":
         return this.toolDispatch(args, ctx);
       case "dispatch_status":
-        // A restarted process may still be enriching killed jobs with their adoption-time tree
-        // delta. Status/result are the only surfaces that need that fidelity; never make MCP
-        // initialization, tool discovery, cancellation or a fresh dispatch wait on git.
+        // Restart reconciliation (tree delta + broker state) is deliberately off initialize/tool
+        // discovery/fresh dispatch. Job-control reads need it; the rest of MCP startup never waits.
         await this.startup;
         return this.toolStatus(args);
       case "dispatch_result":
         await this.startup;
         return this.toolResult(args);
       case "dispatch_cancel":
+        await this.startup;
         return this.toolCancel(args);
       case "dispatch_lanes":
         return this.toolLanes(args);
