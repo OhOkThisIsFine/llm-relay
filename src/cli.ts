@@ -72,6 +72,7 @@ import {
 } from "./config-edit.js";
 import { createControlAuthorization, resolveControlAuthorizationConfigDir } from "./control-authorization.js";
 import { isCooldownClearResult, type CooldownClearTargetKey } from "./cooldown-clear.js";
+import { createLaneExecutionClient } from "./mcp/lane-execution-client.js";
 import { createDashboardSnapshotReadPort, type CostReportQuery } from "./dashboard-snapshot.js";
 import { DASHBOARD_MEDIA_TYPE, isDashboardUtcTimestamp, SHARE_CELL_KEYS, type CostReportV1, type CostRowV1, type WriterHealth, type WriterState } from "./dashboard-contract.js";
 import { DASHBOARD_BOOTSTRAP_SCHEMA, DASHBOARD_BOOTSTRAP_REQUEST_SCHEMA } from "./dashboard-routes.js";
@@ -2772,6 +2773,9 @@ export async function runMcp(): Promise<void> {
     // It also seeds the id counter, so a handle from before the restart never names a different
     // job after it.
     archive: createJobArchive(),
+    // D1 recovery client is inert for pre-broker rows. Once daemon ownership is enabled, this is
+    // how a replacement MCP process reconciles the opaque execution id without pid adoption.
+    laneExecutionClient: createLaneExecutionClient(cfg),
     write: (chunk) => process.stdout.write(chunk),
   });
 
