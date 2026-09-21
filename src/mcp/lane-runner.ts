@@ -1464,6 +1464,7 @@ export class LaneJobStore {
     // note below clears its persisted reference; the next brokered attempt writes a fresh id before
     // start. This also makes a crash between attempts degrade honestly to the local killed path.
     this.brokerExecutions.delete(id);
+    delete job.executionOwner;
     // A different MCP process can answer status for this running job from the shared journal.
     // Keep the lane identity current there too; liveness itself stays process-local so the journal
     // is not rewritten every 15 seconds.
