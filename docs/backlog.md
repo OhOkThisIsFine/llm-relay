@@ -9,21 +9,13 @@
 
 ## Open
 
-- **Cross-process MCP persistence is not yet demonstrated stable on Windows.**
-  The targeted Windows CI job failed twice on 2026-09-21 in
-  `test/mcp-persistence-concurrency.test.ts`, each time with one expected journal row missing from
-  the real concurrent-process test. The failures occurred on unrelated dependency commits
-  (`f5e7ff9` and `73c7ed0`); later runs, including current `main`, passed. Treat the property as
-  open until the failure mechanism is understood rather than dismissing it as dependency noise.
-  **Property:** concurrent journal/archive mutations from multiple MCP processes never lose a
-  non-conflicting row on supported platforms, and the regression can be stressed repeatedly on
-  Windows and Linux without silent persistence failure.
-
-- **The default branch does not enforce the CI gate.**
-  The repository has the two checks that should be required — `check` and
-  `windows-process-boundary` — but `main` is not protected by a branch rule/ruleset requiring
-  them.
-  **Property:** both checks are required before a change can land on the default branch.
+- **The post-v0.85.0 architecture has not been released yet.**
+  `main` contains restart-safe daemon-owned lane execution, config hot reload, liveness/status
+  changes, persistence hardening, derived lane capability, failure escalation, and the completed D5
+  toolchain upgrades beyond the published v0.85.0 checkpoint.
+  **Property:** the accumulated delta is audited by subsystem, live D1/D2/status behavior is
+  re-verified, both required CI checks are green, package/install smoke passes, and the resulting
+  tree is published as the next release before another large architectural feature begins.
 
 - **Active hard-cap continuation is designed but not implemented.**
   Today an active lane that reaches its absolute runtime ceiling is terminated even when first-party

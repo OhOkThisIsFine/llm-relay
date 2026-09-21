@@ -17,7 +17,9 @@ The repository is in a consolidation phase after a large post-v0.85.0 developmen
 - D1 restart-safe daemon-owned lane execution is implemented.
 - D2 transactional config hot reload is implemented.
 - Public dispatch/liveness state is explicit rather than inferred from circumstantial clues.
-- Multi-process journal/archive mutations use cross-process transactional locking.
+- Multi-process journal/archive mutations use cross-process transactional locking. The 2026-09-21
+  Windows row-loss investigation also made transactions fail closed on unreadable existing JSON
+  and stopped unrelated journal writes from garbage-collecting foreign rows.
 - Lane capability is derived from synced model evidence/pool bands; the legacy hand-set capability
   value has no routing authority.
 - Repeated 402/5xx failures use bounded recovery escalation and remain eligible for failover.
@@ -27,17 +29,25 @@ The repository is in a consolidation phase after a large post-v0.85.0 developmen
 
 ### Immediate next
 
-The immediate source task is **cross-process MCP persistence stability**.
+The immediate task is the **release-readiness pass for the post-v0.85.0 delta**.
 
-Two Windows CI runs on 2026-09-21 failed the real concurrent-process persistence regression with one
-journal row missing. Those failures occurred on unrelated dependency changes, while later runs
-passed. Do not classify this as harmless flakiness until the mechanism is known.
+Persistence and repository enforcement are no longer blockers:
+- the concurrency investigation found three correctness holes: unrelated journal writes filtered
+  foreign rows through liveness; transactional reads could silently treat an existing
+  unreadable/invalid JSON file as empty; and a lock contender propagated a stale rename error when
+  the incumbent released the lock between the failed rename and the contender's path inspection;
+- the lock-release race now has a deterministic regression, and the real four-process
+  journal+archive regression runs five independent rounds per CI execution;
+- the regression fixture surfaces per-worker journal/archive commit failures instead of hiding them
+  until the final assertion;
+- repository ruleset `Protect main` is active on the default branch and requires both `check` and
+  `windows-process-boundary`, with no bypass actors.
 
 Work in this order:
 
-1. reproduce/stress and resolve the persistence-concurrency failure;
-2. require `check` and `windows-process-boundary` on `main`;
-3. perform a release-readiness pass over the post-v0.85.0 delta and publish a stable checkpoint;
+1. audit the v0.85.0 → current `main` delta by subsystem and re-verify D1/D2/status behavior;
+2. run the complete Linux/package and Windows gates and package/install smoke;
+3. reconcile public docs against the release candidate and publish the next checkpoint;
 4. clear evidence/vendor/operator-blocked items as their inputs become available;
 5. begin active hard-cap continuation as staged, harness-specific work.
 

@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createJobArchive } from "../../src/mcp/job-archive.js";
 import { createJobJournal } from "../../src/mcp/job-journal.js";
 import type { LaneJob } from "../../src/mcp/lane-runner.js";
@@ -62,7 +62,12 @@ if (mode === "transaction") {
   waitForFile(start);
 
   const startedAt = Date.now();
-  createJobJournal(journalPath).note({
+  const journal = createJobJournal(journalPath, {
+    onPersistError: (error) => {
+      throw error;
+    },
+  });
+  journal.note({
     jobId: id,
     laneId: `lane-${id}`,
     cwd: process.cwd(),
@@ -70,6 +75,12 @@ if (mode === "transaction") {
     // A larger row makes the old unlocked read/merge/rewrite overlap readily under real processes.
     label: "x".repeat(128 * 1024),
   });
+  const afterJournal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+    jobs?: Array<{ jobId?: string }>;
+  };
+  if (!afterJournal.jobs?.some((row) => row.jobId === id)) {
+    throw new Error(`journal mutation returned without persisting ${id}`);
+  }
 
   const archived: LaneJob = {
     id,
@@ -86,11 +97,20 @@ if (mode === "transaction") {
     cwd: process.cwd(),
     error: undefined,
   };
-  createJobArchive(archivePath).record(archived);
+  const archive = createJobArchive(archivePath);
+  if (!archive.record(archived)) {
+    throw new Error(`archive mutation failed for ${id}`);
+  }
+  const afterArchive = JSON.parse(readFileSync(archivePath, "utf8")) as {
+    jobs?: Array<{ id?: string }>;
+  };
+  if (!afterArchive.jobs?.some((row) => row.id === id)) {
+    throw new Error(`archive mutation returned without persisting ${id}`);
+  }
   writeFileSync(done, "done");
 
-  // Keep every journal owner alive until the parent has inspected the shared file. A later writer
-  // is otherwise allowed to drop a row whose owner process has already exited.
+  // Keep every owner alive until the parent inspects the shared files. This makes the regression
+  // specifically about concurrent persistence rather than startup-orphan adoption/cleanup.
   waitForFile(release);
 } else if (mode === "journal-clear") {
   const journalPath = arg(1);

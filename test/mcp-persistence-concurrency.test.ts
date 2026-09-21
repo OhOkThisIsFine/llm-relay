@@ -110,45 +110,149 @@ describe("cross-process MCP persistence", () => {
     }
   });
 
-  it("preserves every distinct journal and archive row from real concurrent MCP processes", async () => {
-    const { dir, cleanup } = tempDir();
-    const workers: Worker[] = [];
-    try {
-      const journalPath = join(dir, "mcp-jobs.json");
-      const archivePath = join(dir, "mcp-job-archive.json");
-      const start = join(dir, "start");
-      const release = join(dir, "release");
-      const ids = ["job-concurrent-a", "job-concurrent-b", "job-concurrent-c", "job-concurrent-d"];
-      const ready = ids.map((id) => join(dir, `ready-${id}`));
-      const done = ids.map((id) => join(dir, `done-${id}`));
-      for (let i = 0; i < ids.length; i += 1) {
-        workers.push(
-          spawnWorker([
-            "mcp",
-            journalPath,
-            archivePath,
-            ids[i] as string,
-            ready[i] as string,
-            start,
-            done[i] as string,
-            release,
-          ]),
-        );
+  it("preserves every distinct journal and archive row across repeated real concurrent MCP rounds", async () => {
+    for (let round = 0; round < 5; round += 1) {
+      const { dir, cleanup } = tempDir();
+      const workers: Worker[] = [];
+      try {
+        const journalPath = join(dir, "mcp-jobs.json");
+        const archivePath = join(dir, "mcp-job-archive.json");
+        const start = join(dir, "start");
+        const release = join(dir, "release");
+        const ids = ["a", "b", "c", "d"].map((suffix) => `job-concurrent-${round}-${suffix}`);
+        const ready = ids.map((id) => join(dir, `ready-${id}`));
+        const done = ids.map((id) => join(dir, `done-${id}`));
+        for (let i = 0; i < ids.length; i += 1) {
+          workers.push(
+            spawnWorker([
+              "mcp",
+              journalPath,
+              archivePath,
+              ids[i] as string,
+              ready[i] as string,
+              start,
+              done[i] as string,
+              release,
+            ]),
+          );
+        }
+
+        await waitForFiles(ready, workers);
+        writeFileSync(start, "go");
+        await waitForFiles(done, workers);
+
+        const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { jobs: Array<{ jobId: string }> };
+        const archive = JSON.parse(readFileSync(archivePath, "utf8")) as { jobs: Array<{ id: string }> };
+        expect(new Set(journal.jobs.map((row) => row.jobId))).toEqual(new Set(ids));
+        expect(new Set(archive.jobs.map((row) => row.id))).toEqual(new Set(ids));
+
+        writeFileSync(release, "done");
+        await Promise.all(workers.map(waitForExit));
+      } finally {
+        stopWorkers(workers);
+        cleanup();
       }
+    }
+  });
 
-      await waitForFiles(ready, workers);
-      writeFileSync(start, "go");
-      await waitForFiles(done, workers);
+  it("an unrelated write preserves a foreign row even when liveness says its owner is dead", () => {
+    const { dir, cleanup } = tempDir();
+    try {
+      const path = join(dir, "mcp-jobs.json");
+      createJobJournal(path, { pid: 111_111, isAlive: () => true }).note({
+        jobId: "job-foreign",
+        laneId: "lane-foreign",
+        cwd: "C:/tree",
+        startedAt: 1,
+      });
 
-      const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { jobs: Array<{ jobId: string }> };
-      const archive = JSON.parse(readFileSync(archivePath, "utf8")) as { jobs: Array<{ id: string }> };
-      expect(new Set(journal.jobs.map((row) => row.jobId))).toEqual(new Set(ids));
-      expect(new Set(archive.jobs.map((row) => row.id))).toEqual(new Set(ids));
+      createJobJournal(path, { pid: 222_222, isAlive: () => false }).note({
+        jobId: "job-local",
+        laneId: "lane-local",
+        cwd: "C:/tree",
+        startedAt: 2,
+      });
 
-      writeFileSync(release, "done");
-      await Promise.all(workers.map(waitForExit));
+      const stored = JSON.parse(readFileSync(path, "utf8")) as {
+        jobs: Array<{ jobId: string }>;
+      };
+      expect(new Set(stored.jobs.map((row) => row.jobId))).toEqual(
+        new Set(["job-foreign", "job-local"]),
+      );
     } finally {
-      stopWorkers(workers);
+      cleanup();
+    }
+  });
+
+  it("explicit orphan acknowledgement removes the exact adopted dead row", () => {
+    const { dir, cleanup } = tempDir();
+    try {
+      const path = join(dir, "mcp-jobs.json");
+      createJobJournal(path, { pid: 111_111, isAlive: () => false }).note({
+        jobId: "job-dead",
+        laneId: "lane-dead",
+        cwd: "C:/tree",
+        startedAt: 1,
+      });
+      createJobJournal(path, { pid: 333_333, isAlive: () => true }).note({
+        jobId: "job-live",
+        laneId: "lane-live",
+        cwd: "C:/tree",
+        startedAt: 2,
+      });
+
+      const replacement = createJobJournal(path, {
+        pid: 222_222,
+        isAlive: (pid) => pid === 333_333,
+      });
+      const orphan = replacement.orphans().find((row) => row.jobId === "job-dead");
+      expect(orphan).toBeDefined();
+      replacement.clearOrphan?.(orphan!);
+
+      const stored = JSON.parse(readFileSync(path, "utf8")) as {
+        jobs: Array<{ jobId: string }>;
+      };
+      expect(stored.jobs.map((row) => row.jobId)).toEqual(["job-live"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("orphan acknowledgement cannot erase a same-id row republished by another owner", () => {
+    const { dir, cleanup } = tempDir();
+    try {
+      const path = join(dir, "mcp-jobs.json");
+      createJobJournal(path, { pid: 111_111, isAlive: () => false }).note({
+        jobId: "job-reused",
+        laneId: "lane-old",
+        cwd: "C:/tree",
+        startedAt: 1,
+      });
+
+      const replacement = createJobJournal(path, { pid: 222_222, isAlive: () => false });
+      const orphan = replacement.orphans().find((row) => row.jobId === "job-reused");
+      expect(orphan).toBeDefined();
+
+      createJobJournal(path, { pid: 333_333, isAlive: () => true }).note({
+        jobId: "job-reused",
+        laneId: "lane-new",
+        cwd: "C:/tree",
+        startedAt: 2,
+      });
+
+      replacement.clearOrphan?.(orphan!);
+
+      const stored = JSON.parse(readFileSync(path, "utf8")) as {
+        jobs: Array<{ jobId: string; laneId: string; startedAt: number; owner?: { pid: number } }>;
+      };
+      expect(stored.jobs).toHaveLength(1);
+      expect(stored.jobs[0]).toMatchObject({
+        jobId: "job-reused",
+        laneId: "lane-new",
+        startedAt: 2,
+        owner: { pid: 333_333 },
+      });
+    } finally {
       cleanup();
     }
   });
@@ -182,6 +286,47 @@ describe("cross-process MCP persistence", () => {
       cleanup();
     }
   }, 20_000);
+
+  it("retries when a contended lock is released before the contender inspects it", () => {
+    const { dir, cleanup } = tempDir();
+    try {
+      const path = join(dir, "state.json");
+      const lockPath = `${path}.lock`;
+      mkdirSync(lockPath);
+      writeFileSync(
+        join(lockPath, "owner.json"),
+        JSON.stringify({
+          version: 1,
+          pid: process.pid,
+          instance: "incumbent-test-lock",
+          acquiredAt: Date.now(),
+        }),
+      );
+
+      let contentions = 0;
+      expect(
+        transactionalUpdateJsonSync(
+          path,
+          () => ({ value: 1 }),
+          {
+            strict: true,
+            lock: {
+              retryMs: 1,
+              timeoutMs: 500,
+              onContention: () => {
+                contentions += 1;
+                if (contentions === 1) rmSync(lockPath, { recursive: true, force: true });
+              },
+            },
+          },
+        ),
+      ).toBe(true);
+      expect(contentions).toBeGreaterThanOrEqual(1);
+      expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ value: 1 });
+    } finally {
+      cleanup();
+    }
+  });
 
   it("ignores an abandoned unpublished claim directory", () => {
     const { dir, cleanup } = tempDir();
@@ -359,6 +504,68 @@ describe("cross-process MCP persistence", () => {
     } finally {
       cleanup();
     }
+  });
+
+  it("archives a killed startup orphan before acknowledging its journal row", () => {
+    const calls: string[] = [];
+    const orphan = {
+      jobId: "job-orphan",
+      laneId: "lane",
+      cwd: "C:/tree",
+      startedAt: 1,
+    };
+    const journal: JobJournal = {
+      note: () => {},
+      clear: () => {},
+      clearOrphan: () => calls.push("clear-orphan"),
+      orphans: () => [orphan],
+      foreign: () => undefined,
+      foreignRows: () => [],
+    };
+    const archive: JobArchive = {
+      record: () => {
+        calls.push("archive");
+        return true;
+      },
+      restore: () => ({ jobs: [], lastSeq: 0 }),
+      flush: () => {},
+      lookup: () => undefined,
+      all: () => [],
+    };
+
+    new LaneJobStore(journal, archive, () => "unused");
+    expect(calls).toEqual(["archive", "clear-orphan"]);
+  });
+
+  it("leaves a startup orphan journaled when its killed report cannot be archived", () => {
+    const calls: string[] = [];
+    const orphan = {
+      jobId: "job-orphan",
+      laneId: "lane",
+      cwd: "C:/tree",
+      startedAt: 1,
+    };
+    const journal: JobJournal = {
+      note: () => {},
+      clear: () => {},
+      clearOrphan: () => calls.push("clear-orphan"),
+      orphans: () => [orphan],
+      foreign: () => undefined,
+      foreignRows: () => [],
+    };
+    const archive: JobArchive = {
+      record: () => {
+        calls.push("archive-failed");
+        return false;
+      },
+      restore: () => ({ jobs: [], lastSeq: 0 }),
+      flush: () => {},
+      lookup: () => undefined,
+      all: () => [],
+    };
+
+    new LaneJobStore(journal, archive, () => "unused");
+    expect(calls).toEqual(["archive-failed"]);
   });
 
   it("archives a terminal job before clearing its running journal row", () => {
