@@ -62,7 +62,12 @@ if (mode === "transaction") {
   waitForFile(start);
 
   const startedAt = Date.now();
-  createJobJournal(journalPath).note({
+  const journal = createJobJournal(journalPath, {
+    onPersistError: (error) => {
+      throw error;
+    },
+  });
+  journal.note({
     jobId: id,
     laneId: `lane-${id}`,
     cwd: process.cwd(),
