@@ -1,25 +1,9 @@
 /**
- * Running a dispatch lane, and holding the job while it runs.
+ * Lane execution and job state for the host-launched MCP process.
  *
- * WHY THIS EXISTS — and it is the whole argument for the MCP server. `llm-relay dispatch
- * --next-command` hands the caller a COMMAND. Executing that command correctly is where every
- * measured failure on this machine lives, and the list is long enough that expecting each caller
- * to get it right is the defect:
- *
- * - Three client idle watchdogs abort a long think at ~300 s unless the lane env lifts all three
- *   (`CLAUDE_STREAM_IDLE_TIMEOUT_MS`, `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS`, `API_FORCE_IDLE_TIMEOUT`).
- * - An async `execFile` leaves stdin an OPEN pipe, and `agy` then waits on it until the timeout.
- * - An npm `.cmd` shim cannot be executed directly; on Windows its generated shim metadata is
- *   resolved to a Node entrypoint so arbitrary task argv never passes through a shell.
- * - A console-subsystem child spawned from a console-less parent ALLOCATES a console and steals
- *   the desktop focus, unless `windowsHide` is set.
- * - `claude -p` buffers its whole answer until exit, so an empty log does not mean a dead lane.
- *
- * Every one of those is handled once, here. A caller supplies a task and gets an answer.
- *
- * WHERE THIS RUNS. In the `llm-relay mcp` process, which the HOST launches over stdio — never in
- * the relay daemon. The daemon's rule stands untouched: no HTTP turn causes a lane spawn. This
- * process answers no HTTP at all.
+ * This module centralizes process spawning because lane launches need consistent timeout, stdin,
+ * Windows-shim, environment and process-tree handling. It runs in `llm-relay mcp`, not in the
+ * HTTP relay daemon.
  */
 import { exec, execFile, execSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -55,15 +39,7 @@ export const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
 /** Ceiling on one lane run. agy's own `--print-timeout` convention here is 30 minutes. */
 export const DEFAULT_LANE_TIMEOUT_MS = 30 * 60 * 1000;
 
-/**
- * `"timed_out"` is its own terminal status, DISTINCT from `"failed"` (2026-09-03,
- * C:\Code\docs\backlog.md "A bounded llm-relay design dispatch can consume its full 1,200-second
- * wait and return no result"). A killed-by-timeout run used to fall into the same bucket as an
- * ordinary nonzero exit, so a caller reading `status` could not tell "the lane ran and failed"
- * from "the lane never finished" — the two call for different next actions (retry a different
- * lane vs. maybe poll a little longer next time). `complete()` sets it whenever the run result
- * says `timedOut`, ahead of the exit-code/semantic-failure check.
- */
+/** `timed_out` is distinct from `failed`: the lane hit its own runtime ceiling rather than settling normally. */
 export type JobStatus = "running" | "completed" | "failed" | "cancelled" | "timed_out" | "killed";
 
 /**
@@ -76,22 +52,15 @@ export const TERMINAL_JOB_STATUSES = [
   "failed",
   "cancelled",
   "timed_out",
-  /**
-   * ⚠ `"killed"` joined on 2026-09-10 and it is NOT a synonym for `"failed"`. A lane killed by its
-   * own MCP server restarting is not a lane that failed — nothing was learned about the lane, and
-   * the caller's next action is different (re-dispatch from scratch, and expect nothing on disk).
-   * It is reachable ONLY from the journal, so a single-server run can never produce it.
-   */
+  /** Recovered journal rows whose owning MCP process died. This is not lane-failure evidence. */
   "killed",
 ] as const satisfies readonly JobStatus[];
 
 export type TerminalJobStatus = (typeof TERMINAL_JOB_STATUSES)[number];
 
 /**
- * Terminal statuses worth reporting as lane telemetry: every terminal status but `cancelled` and
- * `killed` — a caller cancellation is not lane evidence, so it is discarded, never reported. Keyed as a `Record` over `Exclude<…, "cancelled">` so a NEW terminal status is
- * a compile error HERE, at the classifier, rather than a silent drop at the forwarder (the
- * closed-union gotcha in CLAUDE.md); the forwarder ranges over this list, never a hand copy.
+ * Terminal statuses that describe lane behavior. Caller cancellation and owner-process death are
+ * excluded because neither is evidence about the lane.
  */
 const REPORTABLE_JOB_STATUS_MAP: Record<Exclude<TerminalJobStatus, "cancelled" | "killed">, true> = {
   completed: true,
@@ -128,17 +97,8 @@ export interface RelayAnnouncements {
 }
 
 /**
- * "skipped" — a rung the walk never started at all, because it was already at its configured
- * `maxConcurrent` cap when its turn in the ladder came (backlog item "a per-lane CONCURRENCY cap
- * on cli dispatch rungs", 2026-09-09).
- *
- * ⚠ Deliberately NOT a member of `DispatchLaneStatus`. That type is what a settled RUN is reported
- * to the daemon as (`DispatchedTelemetryReport.status`, validated by `routes/admin.ts`'s pin/demote
- * and failure-kind total tables, and folded into `dispatch-lane-stats.json`'s wall-clock window by
- * `recordLaneRun`), and a skipped rung never ran — "spawn nothing … report no telemetry for it,
- * nothing ran" is the brief's whole point. Widening the REPORTED vocabulary to include a state
- * nothing ever reports would be exactly the closed-union defect CLAUDE.md warns about: a member
- * reachable only in theory, decided nowhere real.
+ * A walk-only state for a rung skipped before spawn, currently because `maxConcurrent` is full.
+ * It is not a `DispatchLaneStatus`: skipped lanes produce no run telemetry.
  */
 export const SKIPPED_LANE_STATUS = "skipped" as const;
 
@@ -151,14 +111,7 @@ export const SKIPPED_LANE_STATUS = "skipped" as const;
  */
 export type LaneAttemptStatus = DispatchLaneStatus | typeof SKIPPED_LANE_STATUS;
 
-/**
- * Did this attempt actually run a lane, or was it skipped before any process started? Total over
- * `LaneAttemptStatus` (`const _never: never` below), so a future member — whether added here or
- * inherited from a `DispatchLaneStatus` that grows — is a compile error at this switch rather than
- * a silent "counts as tried" default (the closed-union gotcha in CLAUDE.md). `mcp/server.ts` uses
- * it to keep a walk's terminal "N tried" message honest when every remaining lane was capped rather
- * than actually attempted — a skipped rung "counts as NOT TRIED" per the backlog item's own wording.
- */
+/** True only when the walk actually started the lane. The exhaustive switch keeps new statuses explicit. */
 export function attemptWasTried(status: LaneAttemptStatus): boolean {
   switch (status) {
     case "completed":
@@ -175,16 +128,7 @@ export function attemptWasTried(status: LaneAttemptStatus): boolean {
   }
 }
 
-/**
- * One lane a dispatch WALK tried, in the order it tried them.
- *
- * ⚠ Its `status` is a `LaneAttemptStatus`, IMPORTED rather than restated — see that type's own
- * doc comment for why it is not simply `DispatchLaneStatus`. Two hand-written copies of one closed
- * set is the most-repeated defect in this repository's history, and here the type additionally buys
- * a guarantee: that union has no `cancelled` member, so "a caller cancellation is never reported as
- * lane evidence" becomes a property the compiler enforces at every call site rather than a runtime
- * check somebody can forget.
- */
+/** One lane attempt in walk order. Caller cancellation is job state, not an attempt status. */
 export interface LaneAttempt {
   laneId: string;
   spec: string | undefined;
@@ -198,15 +142,8 @@ export interface LaneAttempt {
 }
 
 /**
- * The status one lane attempt earns. Shares its PRIORITY ORDER with `LaneJobStore.complete()`
- * below, and `test/mcp-server.test.ts` pins that the two agree — they cannot share one
- * implementation because `complete()` maps onto `JobStatus`, which describes the WALK, while this
- * maps onto `DispatchLaneStatus`, which describes one lane.
- *
- * ⚠ `abandoned` is tested FIRST, ahead of `timedOut`. A lane the walk kills at its budget usually
- * reports `timedOut` from the killed child as well, and between the two the walk's own decision is
- * the MORE SPECIFIC claim: the relay knows it stopped this lane after N seconds, whereas the
- * child's timeout flag would report it as having exhausted a ceiling it never reached.
+ * Classify one lane attempt. `abandoned` wins over the child timeout flag because it means the walk
+ * deliberately stopped the attempt before the lane's own timeout.
  */
 export function classifyLaneAttempt(
   run: LaneRunResult,
@@ -363,14 +300,8 @@ export interface LaneJob {
 }
 
 /**
- * Output progress of the attempt now running. Byte counts and timestamps only — never the bytes.
- *
- * ⚠ Silence is REPORTED here, never acted on. `claude -p` — the transposed `cliLane` form every
- * `relay` rung takes in agent mode, i.e. the free pool itself — buffers its whole answer until
- * exit (module header), so "zero bytes after N seconds" is the ordinary shape of a healthy run on
- * the most-used lane. A threshold that killed on it would manufacture the false failure the backlog
- * item names as worse than a slow honest status. This figure is diagnostic only; the caller follows
- * the walk's published liveness verdict instead of interpreting silence.
+ * Output progress for the running attempt. This is diagnostic only; the walk acts on its published
+ * liveness verdict, not on output silence alone.
  */
 export interface LaneActivity {
   /** When the running attempt was spawned. */
@@ -382,17 +313,8 @@ export interface LaneActivity {
 }
 
 /**
- * The record of one job's OWNED processes, written at the moment the job goes terminal.
- *
- * ⚠ It exists because ownership is the only reliable signal. A stale lane and a slow lane are
- * indistinguishable from the outside (`docs/backlog.md`: one legitimately ran 29 minutes), so a
- * rule based on age would eventually kill a live lane — which is why the dispatcher terminates what
- * IT started, and why what it started is enumerable by job id rather than by hand.
- *
- * `survivors` is the honest half: a termination that did not take is REPORTED, never assumed away.
- * `terminated: false` means no process was ever registered for this job (a pre-spawn failure, or an
- * answer-mode job whose direct HTTP call owns no OS process), and is distinct from `pids: []` with
- * `terminated: true` — the first says "nothing of ours ran", the second says "ours ran and is gone".
+ * Process-tree termination record for one job. `survivors` reports failed cleanup explicitly;
+ * `terminated: false` means no OS process was registered for the job.
  */
 export interface LaneProcessReport {
   /** Root pids this dispatcher started for the job. */
@@ -412,18 +334,8 @@ export interface LaneRunResult {
 }
 
 /**
- * A lane can exit 0 (agent mode) or answer HTTP 200 (answer mode) with text that is
- * syntactically nonempty but carries nothing usable — a lone `#`, a bare `---`, a block of
- * `***`. The pre-existing check caught only the LITERALLY empty string, which a scaffold-only
- * fragment slips past (C:\Code\docs\backlog.md: a 652-second review returned only `#`).
- *
- * Deliberately STRUCTURAL, not semantic: it strips whitespace, punctuation and Markdown
- * scaffolding characters and asks only whether anything ALPHANUMERIC remains — it does not judge
- * whether the content actually answers the task, which would cross this repo's own repair
- * boundary ("routing comes from config and deterministic classification, never from an LLM's
- * opinion inserted into the request path"). `isContentEmpty("Here is")` is `false`: a generic
- * lead-in with nothing after it is a real judgement call this predicate refuses to make. `"OK"`
- * and `"42"` must both read as content, and do.
+ * Structural empty-output check. It removes whitespace/Markdown scaffolding but deliberately makes
+ * no semantic judgment about whether the remaining text answers the task.
  */
 export function isContentEmpty(text: string): boolean {
   return text.replace(/[\s#*_\-|>`~=]/g, "").length === 0;
@@ -440,15 +352,9 @@ const ENV_REFERENCE = /%([A-Za-z_][A-Za-z0-9_()]*)%/g;
 const WHOLE_ENV_REFERENCE = /^%[A-Za-z_][A-Za-z0-9_()]*%$/;
 
 /**
- * Expand the `%NAME%` references a Windows environment value still holds (`docs/backlog.md`: a lane
- * inherited `HOME=%USERPROFILE%` literally, and a child that honours `HOME` wrote into a directory
- * named `%USERPROFILE%`). A reference expands from the SAME environment, looked up without case as
- * Windows does, in one pass. A value that is ONE unresolved reference is removed, because the literal
- * is never a usable value. An unresolved reference inside a longer value (a `PATH` entry) stays: removing
- * the whole value would lose the parts that are real. Windows only — `%` has no meaning to a POSIX
- * shell, and a POSIX value that holds one is data.
- *
- * Returns the notes `LaneJobStore.noteLaunch` records: variable and reference NAMES, never a value.
+ * Expand Windows `%NAME%` references from the same environment, case-insensitively. A value that is
+ * only one unresolved reference is removed; unresolved references inside larger values are kept.
+ * Notes contain variable/reference names only, never values.
  */
 export function expandEnvReferences(
   env: NodeJS.ProcessEnv,
@@ -485,13 +391,8 @@ export function expandEnvReferences(
 type LaneInvoke = { command: string; args: string[]; env?: Record<string, string | null> };
 
 /**
- * Give an AGY lane the caller's working directory (`docs/backlog.md`: AGY works in its own scratch
- * directory whatever `cwd` its process gets, so a lane asked to edit a worktree saw none of its
- * files). AGY reads a directory only through `--add-dir`, so the directory goes on the command line,
- * and the task text names it. Null for every other lane.
- *
- * The prompt is the argument after AGY's own `-p`; a rung with no `-p` gets `--add-dir` alone. An
- * `--add-dir` the rung already declares for the same directory is not repeated.
+ * Bind AGY to the dispatch working directory with `--add-dir` and a prompt prefix. Other harnesses
+ * are unchanged; an existing identical `--add-dir` is not duplicated.
  */
 export function agyWorkingDirInvoke<T extends LaneInvoke>(
   invoke: T,
