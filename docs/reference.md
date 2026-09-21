@@ -230,7 +230,11 @@ version with the installed package and prints
 when they differ. When the relay reports `changedOnDisk: true`, the command prints
 `config changed on disk since the relay loaded it — run "llm-relay reload"; a restart is required if the changed fields are not reloadable`.
 A successful reload replaces the daemon's loaded mtime, so telemetry immediately returns to
-`changedOnDisk: false`. The daemon logs a later disk change once again.
+`changedOnDisk: false`. The daemon logs a later disk change once again. If the edit itself changes
+`listen`, the running daemon is still at the OLD listener (that field is restart-only); target it
+explicitly with `llm-relay reload --listen <current-listener>` so it can return the 409. The same
+endpoint-discovery limitation applies to other control commands because no daemon endpoint registry
+is persisted.
 
 ### Where state actually lives
 
