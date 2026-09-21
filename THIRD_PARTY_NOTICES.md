@@ -4,7 +4,7 @@ The dashboard is compiled locally and does not load application code, fonts, ima
 media from a CDN. This notice covers source packages physically represented in the production
 dashboard bundle, generated CSS assets, and generated virtual-runtime helpers. The checked
 inventory is `docs/dashboard-bundle-inventory.json`; `scripts/dashboard-package-check.mjs`
-compares its JavaScript package list to Vite/Rollup's production module graph and validates the
+compares its JavaScript package list to Vite/Rolldown's production module graph and validates the
 manual generated-output attributions.
 
 ## Emitted package modules
@@ -26,7 +26,8 @@ manual generated-output attributions.
 
 | Virtual module | Attribution | License |
 | --- | --- | --- |
-| `vite/modulepreload-polyfill.js` | `vite@6.4.3`, Copyright (c) 2019-present VoidZero, Inc. and Vite contributors | MIT |
+| `rolldown/runtime.js` | `rolldown@1.2.9`, Copyright (c) 2024-present VoidZero Inc. & Contributors | MIT |
+| `vite/modulepreload-polyfill.js` | `vite@8.3.0`, Copyright (c) 2019-present VoidZero, Inc. and Vite contributors | MIT |
 
 Dependencies not physically included in the dashboard bundle are not represented by this
 dashboard-specific notice.

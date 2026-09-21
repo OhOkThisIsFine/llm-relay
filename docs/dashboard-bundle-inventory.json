@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "method": "Production Vite/Rollup module graph. dashboard/vite.config.ts emits dist/dashboard/.vite/dashboard-bundle-graph.json from every rendered chunk; scripts/dashboard-package-check.mjs requires this complete graph to equal this inventory.",
+  "method": "Production Vite/Rolldown module graph. dashboard/vite.config.ts emits dist/dashboard/.vite/dashboard-bundle-graph.json from every rendered chunk; scripts/dashboard-package-check.mjs requires this complete graph to equal this inventory.",
   "packages": [
     { "packagePath": "node_modules/lucide-react", "name": "lucide-react", "version": "0.468.0", "license": "ISC" },
     { "packagePath": "node_modules/react", "name": "react", "version": "19.2.8", "license": "MIT" },
@@ -11,6 +11,7 @@
     { "assetKind": "Tailwind-generated CSS (Preflight, components and utilities)", "source": "dashboard/src/styles.css", "attribution": { "packagePath": "node_modules/tailwindcss", "name": "tailwindcss", "version": "3.4.19", "license": "MIT" } }
   ],
   "virtualRuntime": [
-    { "moduleId": "vite/modulepreload-polyfill.js", "kind": "Vite module-preload runtime", "attribution": { "packagePath": "node_modules/vite", "name": "vite", "version": "6.4.3", "license": "MIT" } }
+    { "moduleId": "rolldown/runtime.js", "kind": "Rolldown bundler runtime", "attribution": { "packagePath": "node_modules/rolldown", "name": "rolldown", "version": "1.2.9", "license": "MIT" } },
+    { "moduleId": "vite/modulepreload-polyfill.js", "kind": "Vite module-preload runtime", "attribution": { "packagePath": "node_modules/vite", "name": "vite", "version": "8.3.0", "license": "MIT" } }
   ]
 }
