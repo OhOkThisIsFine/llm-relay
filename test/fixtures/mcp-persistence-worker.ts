@@ -104,8 +104,8 @@ if (mode === "transaction") {
   }
   writeFileSync(done, "done");
 
-  // Keep every journal owner alive until the parent has inspected the shared file. A later writer
-  // is otherwise allowed to drop a row whose owner process has already exited.
+  // Keep every owner alive until the parent inspects the shared files. This makes the regression
+  // specifically about concurrent persistence rather than startup-orphan adoption/cleanup.
   waitForFile(release);
 } else if (mode === "journal-clear") {
   const journalPath = arg(1);
