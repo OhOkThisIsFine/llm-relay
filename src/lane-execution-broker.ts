@@ -35,6 +35,9 @@ export interface LaneExecutionActivity {
   lastOutputAt: number | null;
   /** Cumulative CPU ms for the exact process tree the daemon owns, when available. */
   cpuMs?: number;
+  /** Relay traffic for this execution's private activity tag, when the daemon has seen any. */
+  relayInFlight?: number;
+  relayLastActivityAt?: number;
 }
 
 export interface LaneExecutionRunResult {
@@ -47,7 +50,13 @@ export interface LaneExecutionRunResult {
 export interface LaneExecutionLaunchHandle {
   result: Promise<LaneExecutionRunResult>;
   cancel: () => void;
-  activity?: () => LaneExecutionActivity;
+  /** May sample OS process state, so status collection allows an async reader. */
+  activity?: () => LaneExecutionActivity | Promise<LaneExecutionActivity>;
+  /**
+   * Bounded launch corrections the caller would have recorded locally before D1. Never include
+   * environment VALUES; the existing correction producers name only variable/reference names.
+   */
+  launchNotes?: readonly string[];
 }
 
 export interface LaneExecutionStartRequest {
@@ -94,6 +103,9 @@ export interface LaneExecutionSnapshot {
   stderrBytes: number;
   lastOutputAt: number | null;
   cpuMs?: number;
+  relayInFlight?: number;
+  relayLastActivityAt?: number;
+  launchNotes?: string[];
   /** Terminal-only process result. */
   code?: number | null;
   stdout?: string;
@@ -117,6 +129,9 @@ const SNAPSHOT_KEYS = new Set([
   "stderrBytes",
   "lastOutputAt",
   "cpuMs",
+  "relayInFlight",
+  "relayLastActivityAt",
+  "launchNotes",
   "code",
   "stdout",
   "stderr",
@@ -175,6 +190,29 @@ export function parseLaneExecutionSnapshot(value: unknown): LaneExecutionSnapsho
   if (cpuMs !== undefined && (typeof cpuMs !== "number" || !Number.isFinite(cpuMs) || cpuMs < 0)) {
     return null;
   }
+  const relayInFlight = value["relayInFlight"];
+  if (
+    relayInFlight !== undefined &&
+    (typeof relayInFlight !== "number" || !Number.isSafeInteger(relayInFlight) || relayInFlight < 0)
+  ) {
+    return null;
+  }
+  const relayLastActivityAt = value["relayLastActivityAt"];
+  if (
+    relayLastActivityAt !== undefined &&
+    (typeof relayLastActivityAt !== "number" || !Number.isFinite(relayLastActivityAt))
+  ) {
+    return null;
+  }
+  const launchNotes = value["launchNotes"];
+  if (
+    launchNotes !== undefined &&
+    (!Array.isArray(launchNotes) ||
+      launchNotes.length > 16 ||
+      launchNotes.some((note) => typeof note !== "string" || note.length > 500))
+  ) {
+    return null;
+  }
 
   const hasCode = Object.hasOwn(value, "code");
   const hasStdout = Object.hasOwn(value, "stdout");
@@ -197,6 +235,9 @@ export function parseLaneExecutionSnapshot(value: unknown): LaneExecutionSnapsho
     stderrBytes,
     lastOutputAt,
     ...(cpuMs === undefined ? {} : { cpuMs }),
+    ...(relayInFlight === undefined ? {} : { relayInFlight }),
+    ...(relayLastActivityAt === undefined ? {} : { relayLastActivityAt }),
+    ...(launchNotes === undefined ? {} : { launchNotes: [...launchNotes] }),
   };
   if (resultCount === 4) {
     const code = value["code"];
@@ -208,10 +249,17 @@ export function parseLaneExecutionSnapshot(value: unknown): LaneExecutionSnapsho
     ) {
       return null;
     }
+    const timedOut = value["timedOut"];
+    // Status and process result are one claim. Reject contradictions at the wire boundary rather
+    // than asking every recovery consumer to decide which half to trust.
+    if (status === "completed" && (code !== 0 || timedOut !== false)) return null;
+    if (status === "failed" && (code === 0 || timedOut !== false)) return null;
+    if (status === "timed_out" && timedOut !== true) return null;
+
     out.code = code;
     out.stdout = value["stdout"];
     out.stderr = value["stderr"];
-    out.timedOut = value["timedOut"];
+    out.timedOut = timedOut;
   }
   return out;
 }
@@ -235,6 +283,7 @@ interface StoredExecution {
   handle: LaneExecutionLaunchHandle | null;
   result: LaneExecutionRunResult | null;
   cancelRequested: boolean;
+  launchNotes: string[];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -389,12 +438,12 @@ function bounded(text: string): string {
   return `[broker: first ${removed} characters cut; the tail follows]\n${text.slice(removed)}`;
 }
 
-function safeActivity(handle: LaneExecutionLaunchHandle | null): LaneExecutionActivity {
+async function safeActivity(handle: LaneExecutionLaunchHandle | null): Promise<LaneExecutionActivity> {
   if (!handle?.activity) {
     return { stdoutBytes: 0, stderrBytes: 0, lastOutputAt: null };
   }
   try {
-    const value = handle.activity();
+    const value = await handle.activity();
     const stdoutBytes =
       Number.isSafeInteger(value.stdoutBytes) && value.stdoutBytes >= 0 ? value.stdoutBytes : 0;
     const stderrBytes =
@@ -408,11 +457,23 @@ function safeActivity(handle: LaneExecutionLaunchHandle | null): LaneExecutionAc
       typeof value.cpuMs === "number" && Number.isFinite(value.cpuMs) && value.cpuMs >= 0
         ? value.cpuMs
         : undefined;
+    const relayInFlight =
+      typeof value.relayInFlight === "number" &&
+      Number.isSafeInteger(value.relayInFlight) &&
+      value.relayInFlight >= 0
+        ? value.relayInFlight
+        : undefined;
+    const relayLastActivityAt =
+      typeof value.relayLastActivityAt === "number" && Number.isFinite(value.relayLastActivityAt)
+        ? value.relayLastActivityAt
+        : undefined;
     return {
       stdoutBytes,
       stderrBytes,
       lastOutputAt,
       ...(cpuMs === undefined ? {} : { cpuMs }),
+      ...(relayInFlight === undefined ? {} : { relayInFlight }),
+      ...(relayLastActivityAt === undefined ? {} : { relayLastActivityAt }),
     };
   } catch {
     return { stdoutBytes: 0, stderrBytes: 0, lastOutputAt: null };
@@ -448,7 +509,7 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
     }
   }
 
-  private start(request: LaneExecutionStartRequest): LaneExecutionBrokerResult {
+  private async start(request: LaneExecutionStartRequest): Promise<LaneExecutionBrokerResult> {
     const signature = startSignature(request);
     const existing = this.executions.get(request.executionId);
     if (existing) {
@@ -459,7 +520,7 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
           message: "lane execution id already exists with a different start request",
         };
       }
-      return { ok: true, execution: this.snapshot(existing) };
+      return { ok: true, execution: await this.snapshot(existing) };
     }
 
     let handle: LaneExecutionLaunchHandle | { refusal: string };
@@ -483,6 +544,10 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
       handle,
       result: null,
       cancelRequested: false,
+      launchNotes: [...(handle.launchNotes ?? [])]
+        .filter((note): note is string => typeof note === "string")
+        .slice(0, 16)
+        .map((note) => note.slice(0, 500)),
     };
     this.executions.set(request.executionId, stored);
 
@@ -497,17 +562,17 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
         }),
     );
 
-    return { ok: true, execution: this.snapshot(stored) };
+    return { ok: true, execution: await this.snapshot(stored) };
   }
 
-  private status(executionId: string): LaneExecutionBrokerResult {
+  private async status(executionId: string): Promise<LaneExecutionBrokerResult> {
     const stored = this.executions.get(executionId);
     return stored
-      ? { ok: true, execution: this.snapshot(stored) }
+      ? { ok: true, execution: await this.snapshot(stored) }
       : { ok: false, status: 404, message: "unknown lane execution id" };
   }
 
-  private cancel(executionId: string): LaneExecutionBrokerResult {
+  private async cancel(executionId: string): Promise<LaneExecutionBrokerResult> {
     const stored = this.executions.get(executionId);
     if (!stored) return { ok: false, status: 404, message: "unknown lane execution id" };
     if (stored.status === "running") {
@@ -522,7 +587,7 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
       }
       this.prune();
     }
-    return { ok: true, execution: this.snapshot(stored) };
+    return { ok: true, execution: await this.snapshot(stored) };
   }
 
   private settle(stored: StoredExecution, raw: LaneExecutionRunResult): void {
@@ -541,8 +606,8 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
     this.prune();
   }
 
-  private snapshot(stored: StoredExecution): LaneExecutionSnapshot {
-    const activity = safeActivity(stored.handle);
+  private async snapshot(stored: StoredExecution): Promise<LaneExecutionSnapshot> {
+    const activity = await safeActivity(stored.handle);
     const result = stored.result;
     return {
       schema: LANE_EXECUTION_SCHEMA,
@@ -558,6 +623,11 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
         result === null ? activity.stderrBytes : Buffer.byteLength(result.stderr, "utf8"),
       lastOutputAt: activity.lastOutputAt,
       ...(activity.cpuMs === undefined ? {} : { cpuMs: activity.cpuMs }),
+      ...(activity.relayInFlight === undefined ? {} : { relayInFlight: activity.relayInFlight }),
+      ...(activity.relayLastActivityAt === undefined
+        ? {}
+        : { relayLastActivityAt: activity.relayLastActivityAt }),
+      ...(stored.launchNotes.length === 0 ? {} : { launchNotes: [...stored.launchNotes] }),
       ...(result === null
         ? {}
         : {

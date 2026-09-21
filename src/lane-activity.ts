@@ -17,6 +17,8 @@
  * (`INTERNAL_REQUEST_HEADERS` in `candidate-runner.ts`).
  */
 
+import { randomUUID } from "node:crypto";
+
 /** The request header that carries a lane's activity tag. */
 export const LANE_ACTIVITY_HEADER = "x-llm-relay-lane-activity";
 
@@ -24,6 +26,27 @@ export const LANE_ACTIVITY_HEADER = "x-llm-relay-lane-activity";
 export const MAX_LANE_ACTIVITY_TAGS = 1_000;
 
 const TAG_PATTERN = /^[A-Za-z0-9_-]{8,64}$/;
+
+/** Create one opaque activity tag carrying no lane/task meaning. */
+export function createLaneActivityTag(): string {
+  return randomUUID().replaceAll("-", "");
+}
+
+/**
+ * Add exactly one lane-activity header to an ANTHROPIC_CUSTOM_HEADERS value.
+ * A nested dispatch may inherit its parent's value, so replace this header while preserving every
+ * unrelated custom header.
+ */
+export function withLaneActivityHeader(existing: string | undefined, tag: string): string {
+  const line = `${LANE_ACTIVITY_HEADER}: ${tag}`;
+  if (existing === undefined || existing.trim() === "") return line;
+  const kept = existing.split(/\r?\n/).filter((headerLine) => {
+    const colon = headerLine.indexOf(":");
+    if (colon < 0) return true;
+    return headerLine.slice(0, colon).trim().toLowerCase() !== LANE_ACTIVITY_HEADER;
+  });
+  return [...kept, line].join("\n");
+}
 
 /** What the daemon knows about one tag. */
 export interface LaneTrafficRecord {

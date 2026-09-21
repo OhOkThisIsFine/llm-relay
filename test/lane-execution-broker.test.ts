@@ -115,6 +115,42 @@ describe("LaneExecutionBroker", () => {
     });
   });
 
+  it("carries bounded launch notes and async relay/cpu liveness without exposing internal ids", async () => {
+    const run = deferred<LaneExecutionRunResult>();
+    const broker = new LaneExecutionBroker(() => ({
+      result: run.promise,
+      cancel: () => {},
+      launchNotes: ["HOME expanded from %USERPROFILE%", "agy works in C:/tree (--add-dir)"],
+      activity: async () => ({
+        stdoutBytes: 9,
+        stderrBytes: 2,
+        lastOutputAt: 150,
+        cpuMs: 700,
+        relayInFlight: 1,
+        relayLastActivityAt: 160,
+      }),
+    }), () => 100);
+
+    await broker.handle(start());
+    const status = await broker.handle({ action: "status", executionId: start().executionId });
+    expect(status).toMatchObject({
+      ok: true,
+      execution: {
+        stdoutBytes: 9,
+        stderrBytes: 2,
+        lastOutputAt: 150,
+        cpuMs: 700,
+        relayInFlight: 1,
+        relayLastActivityAt: 160,
+        launchNotes: [
+          "HOME expanded from %USERPROFILE%",
+          "agy works in C:/tree (--add-dir)",
+        ],
+      },
+    });
+    expect(JSON.stringify(status)).not.toContain("pid");
+  });
+
   it("reports injected activity while running without exposing process ids or task text", async () => {
     const run = deferred<LaneExecutionRunResult>();
     const handle: LaneExecutionLaunchHandle = {
