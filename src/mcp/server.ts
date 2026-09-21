@@ -1417,7 +1417,6 @@ export class McpDispatchServer {
     const jobId = readString(args, "jobId");
     if (!jobId) return textResult("dispatch_cancel requires jobId", true);
 
-    await this.refreshBrokerJob(jobId);
     const job = this.jobs.find(jobId);
     if (!job) return this.unknownJob(jobId);
     if (job.status !== "running") {
@@ -1852,7 +1851,10 @@ export class McpDispatchServer {
         });
       }
 
-      await this.refreshBrokerJob(row.jobId);
+      // Do not sample the broker here. On Windows, process-tree CPU collection may take seconds.
+      // Adoption should claim/materialize quickly; status/result refresh on demand, and cancel goes
+      // straight to the daemon owner. This keeps replacement MCP startup/control responsive.
+      this.noteBrokerRecoveryUnavailable(row.jobId, "recovered-broker-pending");
     }));
   }
 
