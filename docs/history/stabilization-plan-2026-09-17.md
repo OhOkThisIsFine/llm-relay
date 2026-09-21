@@ -511,7 +511,7 @@ the owner these questions.
 
 ### D5 Major development-dependency upgrades
 `typescript` 5.9 → 7.0 (also a RUNTIME dependency for `delegate-gate`),
-`tailwindcss` 3 → 4, `jsdom` 26 → 30, and three more remain. None is a defect today.
+`tailwindcss` 3 → 4, and three more remain. None is a defect today.
 Recommendation: one upgrade per lap, each with the full gate and the package baseline measured
 again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
 
@@ -548,8 +548,25 @@ again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
   passes; packed-dashboard smoke passes. Exact dashboard output fell from 399,513 to 388,654 raw
   bytes (JS 367,804; CSS 19,599). Package measurement is `packBytes=1208601`,
   `unpackedBytes=5966259`, `packageEntries=460`, all below the existing ceilings.
-- **Next D5 lap.** Upgrade jsdom 26 → 30 by itself. Leave Tailwind 4 and TypeScript 7 for later
-  laps because each has a broader migration surface.
+- **Next D5 lap (historical plan).** Upgrade jsdom 26 → 30 by itself. Leave Tailwind 4 and
+  TypeScript 7 for later laps because each has a broader migration surface.
+
+#### D5-c DONE (2026-09-20) jsdom 26 → 30
+- **Shipped candidate.** `jsdom ^26.1.0` → `^30.1.0`. Vite/Vitest remain 8.3.0 / 5.0.1;
+  TypeScript, Tailwind, and every unrelated major are unchanged.
+- **Migration review.** The repository imports no jsdom API directly; jsdom is only Vitest's
+  dashboard DOM environment. jsdom 30 raises its Node floor to `^22.22.2 || ^24.15.0 || >=26`;
+  CI runs Node 22.23.2, so the dev/test dependency is satisfied without changing llm-relay's
+  runtime engine declaration.
+- **Proof.** 4,490 core tests and all 46 dashboard tests pass, including the focus/accessibility
+  contracts most sensitive to DOM behavior. The Windows process-boundary suite passes and
+  packed-dashboard smoke passes.
+- **Package remeasurement.** Built dashboard bytes are unchanged from D5-b:
+  `dashboardRawBytes=388654`, `jsBytes=367804`, `cssBytes=19599`. Package measurement is
+  `packBytes=1208600`, `unpackedBytes=5966259`, `packageEntries=460`, all below the existing
+  ceilings.
+- **Next D5 lap.** Upgrade Tailwind 3 → 4 in its own migration lap. Keep TypeScript 7 separate
+  because it is also a runtime dependency of `delegate-gate`.
 
 ### D6 A lane's capability must come from the synced capability data (owner correction, 2026-09-17)
 - **Owner statement.** "The capability value is supposed to be set by data scraped from
