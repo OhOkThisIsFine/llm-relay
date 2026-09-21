@@ -421,12 +421,14 @@ export interface Routing {
    *
    * Before it, `dispatch` ran ONE lane and reported a failure when that lane was slow; the calling
    * agent then picked the next lane by hand, which is the friction the owner reported. With it,
-   * the relay walks the ladder past a lane that does not answer inside `attemptMs`, pins the lane
-   * that does, and demotes the lane it left.
+   * the relay walks the ladder past a lane only after it has remained idle for `idleMs` with no
+   * relay traffic, output, owned-process CPU increase or working-tree change; it pins the lane
+   * that answers and demotes the lane it left.
    *
-   * ⚠ Read ONLY by `llm-relay mcp`, exactly like `mcp` below — the walk spawns lanes, and the
-   * daemon never spawns a lane for an HTTP turn. The daemon does read the PIN and the DEMOTION
-   * those walks record, because ordering a ladder is not spawning one.
+   * ⚠ Read ONLY by `llm-relay mcp`, exactly like `mcp` below — the MCP walk owns delegation
+   * policy even when D1 asks the daemon's token-gated broker to own the physical process tree.
+   * No PUBLIC MODEL HTTP turn spawns a lane. The daemon also reads the PIN and DEMOTION those
+   * walks record, because ordering a ladder is not choosing to delegate.
    *
    * `false` is the shorthand for `{ enabled: false }` and restores the pre-walk behaviour exactly:
    * one lane per call, no memory.
@@ -724,10 +726,10 @@ export interface LadderRung {
    * and `mcp/server.ts`'s walk. Absent means unbounded, which is the byte-for-byte pre-existing
    * behaviour: nothing here changes for an operator who never sets it.
    *
-   * ⚠ The count this bounds is per MCP SERVER PROCESS, by construction — the daemon never spawns a
-   * lane, so the only process that knows a lane is running is the one that spawned it. Two host
-   * sessions each running their own `llm-relay mcp` can still together exceed this figure; it bounds
-   * one host's own concurrency, not a machine-wide total.
+   * ⚠ The ADMISSION count remains per MCP SERVER PROCESS by design, even though D1 moves physical
+   * process ownership to the daemon. The originating MCP job store counts its own/recovered jobs;
+   * another simultaneously-live MCP process is not folded into that count. Two host sessions can
+   * therefore still exceed this figure together: this is a per-host cap, not a machine-wide semaphore.
    */
   maxConcurrent?: number;
   /**

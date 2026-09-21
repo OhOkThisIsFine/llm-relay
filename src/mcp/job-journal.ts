@@ -19,6 +19,7 @@
  * the relay daemon, so it writes its own file under the cache directory and touches no relay state.
  */
 import { safeReadJsonSync, transactionalUpdateJsonSync } from "../storage/json-store.js";
+import { MCP_PERSISTENCE_LOCK } from "./persistence-lock.js";
 import { relayStatePath } from "../state-paths.js";
 import { MAX_ACTIVITY_STAT_PATHS, type TreeSnapshot } from "./tree-delta.js";
 
@@ -98,7 +99,7 @@ export interface JobJournal {
   note(row: JournalRow): void;
   /** Persist the starting git status for a running agent-mode job, when it fits the bound. */
   noteStartingTree?(jobId: string, tree: TreeSnapshot, scope: readonly string[] | undefined): void;
-  /** Persist the daemon-owned execution reference for a running job. D1 Phase 3 consumes it. */
+  /** Persist the daemon-owned execution reference used by restart recovery and daemon cancellation. */
   noteBrokerExecution?(jobId: string, execution: JournalBrokerExecution): void;
   /**
    * Atomically claim a dead-owner broker row for this MCP process. Exactly one replacement process
@@ -232,7 +233,7 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
           for (const row of rows.values()) merged.set(row.jobId, row);
           return { version: JOB_JOURNAL_VERSION, jobs: [...merged.values()] };
         },
-        { validator: isJournalFile, strict: true },
+        { validator: isJournalFile, strict: true, lock: MCP_PERSISTENCE_LOCK },
       );
     } catch {
       // Best-effort by construction: the journal only ever IMPROVES the report of a crash, so a
@@ -317,7 +318,7 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
             claimed = next;
             return { version: JOB_JOURNAL_VERSION, jobs: valid };
           },
-          { validator: isJournalFile, strict: true },
+          { validator: isJournalFile, strict: true, lock: MCP_PERSISTENCE_LOCK },
         );
       } catch {
         return undefined;

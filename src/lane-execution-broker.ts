@@ -11,6 +11,7 @@
 import { createHash } from "node:crypto";
 
 export const LANE_EXECUTION_SCHEMA = "mcp.lane-execution.v1" as const;
+export const UNKNOWN_LANE_EXECUTION_MESSAGE = "unknown lane execution id" as const;
 export const MAX_BROKER_TERMINAL_EXECUTIONS = 100;
 // The HTTP server already caps the entire request body at 36 MiB by default. Keep only enough
 // headroom here to reject a pathological programmatic call without imposing the old 4 KiB packet
@@ -69,7 +70,8 @@ export interface LaneExecutionStartRequest {
   timeoutMs: number;
   /** Current MCP dispatch recursion depth; the daemon launcher writes depth + 1 into the child. */
   depth: number;
-  tier?: "low" | "medium" | "high" | "xhigh";
+  /** Routing ladder key; config may use names beyond the four effort bands. */
+  tier?: string;
   readOnly?: boolean;
   callerRoot?: string;
   host?: "routed" | "bypassed" | "unknown";
@@ -270,6 +272,8 @@ export type LaneExecutionLauncher = (
 
 export interface LaneExecutionBrokerPort {
   handle(request: LaneExecutionBrokerRequest): Promise<LaneExecutionBrokerResult>;
+  /** Daemon shutdown owns and terminates every still-running broker process tree. */
+  shutdown?(): void;
 }
 
 interface StoredExecution {
@@ -353,9 +357,7 @@ function parseStart(value: Record<string, unknown>): LaneExecutionStartRequest |
   const depth = value["depth"];
   if (typeof depth !== "number" || !Number.isSafeInteger(depth) || depth < 0) return null;
   const tier = value["tier"];
-  if (tier !== undefined && tier !== "low" && tier !== "medium" && tier !== "high" && tier !== "xhigh") {
-    return null;
-  }
+  if (tier !== undefined && !boundedId(tier)) return null;
   const readOnly = value["readOnly"];
   if (readOnly !== undefined && typeof readOnly !== "boolean") return null;
   if (!optionalBoundedString(value["callerRoot"], MAX_BROKER_PATH_CHARS)) return null;
@@ -494,6 +496,21 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
     private readonly maxTerminal: number = MAX_BROKER_TERMINAL_EXECUTIONS,
   ) {}
 
+  /** Graceful daemon shutdown: cancel every process tree this broker still owns. */
+  shutdown(): void {
+    for (const stored of this.executions.values()) {
+      if (stored.status !== "running") continue;
+      stored.cancelRequested = true;
+      stored.status = "cancelled";
+      stored.endedAt = this.now();
+      try {
+        stored.handle?.cancel();
+      } catch {
+        // Shutdown continues; process-tree termination is best-effort at this seam.
+      }
+    }
+  }
+
   async handle(request: LaneExecutionBrokerRequest): Promise<LaneExecutionBrokerResult> {
     switch (request.action) {
       case "start":
@@ -520,7 +537,7 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
           message: "lane execution id already exists with a different start request",
         };
       }
-      return { ok: true, execution: await this.snapshot(existing) };
+      return { ok: true, execution: await this.snapshot(existing, false) };
     }
 
     let handle: LaneExecutionLaunchHandle | { refusal: string };
@@ -562,19 +579,19 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
         }),
     );
 
-    return { ok: true, execution: await this.snapshot(stored) };
+    return { ok: true, execution: await this.snapshot(stored, false) };
   }
 
   private async status(executionId: string): Promise<LaneExecutionBrokerResult> {
     const stored = this.executions.get(executionId);
     return stored
       ? { ok: true, execution: await this.snapshot(stored) }
-      : { ok: false, status: 404, message: "unknown lane execution id" };
+      : { ok: false, status: 404, message: UNKNOWN_LANE_EXECUTION_MESSAGE };
   }
 
   private async cancel(executionId: string): Promise<LaneExecutionBrokerResult> {
     const stored = this.executions.get(executionId);
-    if (!stored) return { ok: false, status: 404, message: "unknown lane execution id" };
+    if (!stored) return { ok: false, status: 404, message: UNKNOWN_LANE_EXECUTION_MESSAGE };
     if (stored.status === "running") {
       stored.cancelRequested = true;
       stored.status = "cancelled";
@@ -587,7 +604,7 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
       }
       this.prune();
     }
-    return { ok: true, execution: await this.snapshot(stored) };
+    return { ok: true, execution: await this.snapshot(stored, false) };
   }
 
   private settle(stored: StoredExecution, raw: LaneExecutionRunResult): void {
@@ -606,8 +623,12 @@ export class LaneExecutionBroker implements LaneExecutionBrokerPort {
     this.prune();
   }
 
-  private async snapshot(stored: StoredExecution): Promise<LaneExecutionSnapshot> {
-    const activity = await safeActivity(stored.handle);
+  private async snapshot(stored: StoredExecution, sampleActivity = true): Promise<LaneExecutionSnapshot> {
+    // Start/cancel acknowledgements stay below the MCP client timeout. OS process-tree CPU may take
+    // seconds to enumerate; status polls are the only surface that pays for that liveness sample.
+    const activity = sampleActivity
+      ? await safeActivity(stored.handle)
+      : { stdoutBytes: 0, stderrBytes: 0, lastOutputAt: null };
     const result = stored.result;
     return {
       schema: LANE_EXECUTION_SCHEMA,

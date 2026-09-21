@@ -18,6 +18,7 @@ import { LaneJobStore } from "../src/mcp/lane-runner.js";
 import { createJobJournal, nullJobJournal } from "../src/mcp/job-journal.js";
 import { McpDispatchServer } from "../src/mcp/server.js";
 import type { Config } from "../src/config.js";
+import type { DispatchLane, DispatchView } from "../src/dispatch.js";
 import { LANE_EXECUTION_SCHEMA, type LaneExecutionSnapshot } from "../src/lane-execution-broker.js";
 import type { LaneExecutionClient, LaneExecutionClientResult } from "../src/mcp/lane-execution-client.js";
 import type { TreeSnapshot, TreeSnapshotReader } from "../src/mcp/tree-delta.js";
@@ -343,7 +344,69 @@ describe("D1 broker-backed MCP restart recovery", () => {
         }) + "\n",
       );
       expect(out.find((message) => message.id === 5)?.result?.content?.[0]?.text).toContain("cancelled");
-      expect(actions).toContain("cancel");
+      // Cancellation is the first broker operation after orphan claiming: no status/liveness probe
+      // may delay it with process-CPU or git IO.
+      expect(actions).toEqual(["cancel"]);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("claims recovered broker rows before evaluating maxConcurrent on a fresh dispatch", async () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const seeded = seed(path);
+      const actions: string[] = [];
+      const client: LaneExecutionClient = {
+        request: async (request) => {
+          actions.push(request.action);
+          throw new Error(`fresh dispatch should be capped before broker request: ${request.action}`);
+        },
+      };
+      const lane: DispatchLane = {
+        id: seeded.laneId,
+        kind: "cli",
+        position: 1,
+        state: "ready",
+        invoke: { command: "codex", args: ["exec", "{task}"] },
+        maxConcurrent: 1,
+      };
+      const dispatchView: DispatchView = {
+        tier: "medium",
+        offload: false,
+        client: "claude",
+        host: "bypassed",
+        ladder: [lane],
+        order: [lane.id],
+        next: lane,
+        reason: "test",
+        source: "daemon",
+      };
+      const out: Array<{ id?: number; result?: { content?: Array<{ text?: string }>; isError?: boolean } }> = [];
+      const server = new McpDispatchServer({
+        config: {
+          host: "127.0.0.1",
+          port: 8791,
+          routing: { default: "x", dispatchWalk: { enabled: true, idleMs: 300_000, maxLanes: 4 } },
+        } as unknown as Config,
+        buildView: async () => dispatchView,
+        journal: createJobJournal(path),
+        laneExecutionClient: client,
+        write: (chunk) => out.push(JSON.parse(chunk)),
+      });
+
+      await server.ingest(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 60,
+          method: "tools/call",
+          params: { name: "dispatch", arguments: { task: "new work" } },
+        }) + "\n",
+      );
+      const result = out.find((message) => message.id === 60)?.result;
+      expect(result?.content?.[0]?.text).toContain("maxConcurrent");
+      expect(result?.isError).toBe(true);
+      expect(actions).toEqual([]);
     } finally {
       cleanup();
     }
@@ -352,12 +415,34 @@ describe("D1 broker-backed MCP restart recovery", () => {
   it("does not block MCP initialize while a broker recovery query is still pending", async () => {
     const { path, cleanup } = tempJournalPath();
     try {
-      seed(path);
+      const seeded = seed(path);
+      let releaseRecovery!: (result: LaneExecutionClientResult) => void;
+      let queryStarted!: () => void;
+      const started = new Promise<void>((resolve) => { queryStarted = resolve; });
+      const recovery = new Promise<LaneExecutionClientResult>((resolve) => { releaseRecovery = resolve; });
       const client: LaneExecutionClient = {
-        request: () => new Promise<LaneExecutionClientResult>(() => {}),
+        request: () => {
+          queryStarted();
+          return recovery;
+        },
       };
       const out: Array<{ id?: number; result?: unknown }> = [];
       const server = serverFor(path, client, (chunk) => out.push(JSON.parse(chunk)));
+
+      const pendingStatus = server.ingest(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 7,
+          method: "tools/call",
+          params: { name: "dispatch_status", arguments: { jobId: seeded.jobId } },
+        }) + "\n",
+      );
+      await Promise.race([
+        started,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("broker recovery query did not start")), 250),
+        ),
+      ]);
 
       await Promise.race([
         server.ingest(JSON.stringify({ jsonrpc: "2.0", id: 6, method: "initialize", params: {} }) + "\n"),
@@ -366,6 +451,10 @@ describe("D1 broker-backed MCP restart recovery", () => {
         ),
       ]);
       expect(out.some((message) => message.id === 6 && message.result !== undefined)).toBe(true);
+      expect(out.some((message) => message.id === 7)).toBe(false);
+
+      releaseRecovery({ ok: true, execution: brokerSnapshot(seeded.jobId, seeded.laneId) });
+      await pendingStatus;
     } finally {
       cleanup();
     }

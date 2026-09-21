@@ -77,8 +77,12 @@ import { readOnlyInvoke, readOnlyVerdict, type LaneInvocation } from "./readonly
 import { agyQuotaStatement, type AgyLogSnapshot } from "./agy-quota-log.js";
 import { nullJobJournal, type JobJournal, type JournalRow } from "./job-journal.js";
 import { nullJobArchive, type JobArchive } from "./job-archive.js";
-import type { LaneExecutionSnapshot } from "../lane-execution-broker.js";
-import type { LaneExecutionClient } from "./lane-execution-client.js";
+import { UNKNOWN_LANE_EXECUTION_MESSAGE, type LaneExecutionSnapshot, type LaneExecutionStartRequest } from "../lane-execution-broker.js";
+import {
+  createLaneExecutionId,
+  type LaneExecutionClient,
+  type LaneExecutionClientResult,
+} from "./lane-execution-client.js";
 import {
   RPC_INTERNAL_ERROR,
   RPC_INVALID_PARAMS,
@@ -663,6 +667,8 @@ function describeJob(job: LaneJob, now: number): string {
   if (job.error) head.push(`error: ${job.error}`);
   head.push(...relayProvenanceLines(job));
   if (job.dispatchSource === "fallback") head.push("dispatch-source: local-fallback (daemon unreachable)");
+  if (job.executionOwner === "relay-daemon") head.push("execution-owner: relay-daemon (survives MCP host restart)");
+  if (job.executionOwner === "local-fallback") head.push("execution-owner: local-fallback (does NOT survive MCP host restart)");
   if (job.restored === true) {
     head.push(
       job.status === "running"
@@ -883,6 +889,8 @@ interface WalkOptions {
   scope: readonly string[] | undefined;
   /** Ladder tier the lanes came from, for quota reports and the daemon's routing memory. */
   tier: string | undefined;
+  /** Host-routing verdict used to build this view; broker resolution must use the same verdict. */
+  host: DispatchView["host"];
   /** The lane's OWN ceiling, unchanged by this feature. */
   timeoutMs: number;
   /** How long a lane may show no activity before the walk stops it; null when the walk is off. */
@@ -908,6 +916,19 @@ interface LaneAttemptOutcome {
    */
   refusal?: string;
 }
+
+interface StartedLaneHandle {
+  result: Promise<LaneAttemptOutcome>;
+  kill: () => void;
+  pids?: () => number[];
+  /** Present only when the daemon broker owns this attempt. */
+  brokerExecutionId?: string;
+  /** Broker cancellation is asynchronous; idle advancement waits for its acknowledgement. */
+  waitForKill?: () => Promise<void>;
+}
+
+/** Loopback broker status cadence while the original MCP process still owns the walk. */
+export const BROKER_STATUS_POLL_MS = 1_000;
 
 /** A run that produced nothing: the shape an abandoned or never-started attempt reports. */
 function emptyRun(): LaneRunResult {
@@ -1081,6 +1102,8 @@ export class McpDispatchServer {
   private readonly processCpu = new Map<string, number>();
   /** Last daemon-reported cumulative CPU reading for each recovered broker execution. */
   private readonly brokerCpu = new Map<string, number>();
+  /** Latest broker snapshot for a fresh daemon-owned attempt in this still-running MCP walk. */
+  private readonly liveBrokerSnapshots = new Map<string, LaneExecutionSnapshot>();
   /** Full restart enrichment; status/result wait for final tree fidelity. */
   private readonly startup: Promise<void>;
   /** Broker orphan claiming/reconciliation only; explicit cancel waits on this, never on git. */
@@ -1332,6 +1355,9 @@ export class McpDispatchServer {
       await this.refreshAllBrokerJobs();
       return textResult(this.recentJobs());
     }
+    // Status is the observation surface: refresh the recovered daemon execution on demand.
+    // Cancellation deliberately does NOT take this path, so an expensive CPU/git sample can never
+    // delay an operator's cancel request to the actual process owner.
     await this.refreshBrokerJob(jobId);
     const job = this.jobs.find(jobId);
     if (!job) return this.unknownJob(jobId);
@@ -1394,7 +1420,6 @@ export class McpDispatchServer {
     const jobId = readString(args, "jobId");
     if (!jobId) return textResult("dispatch_cancel requires jobId", true);
 
-    await this.refreshBrokerJob(jobId);
     const job = this.jobs.find(jobId);
     if (!job) return this.unknownJob(jobId);
     if (job.status !== "running") {
@@ -1420,7 +1445,7 @@ export class McpDispatchServer {
         );
       }
       if (!result.ok) {
-        if (result.kind === "rejected" && result.status === 404) {
+        if (result.kind === "rejected" && result.status === 404 && result.message === UNKNOWN_LANE_EXECUTION_MESSAGE) {
           this.jobs.markBrokerKilled(
             jobId,
             "the relay daemon is reachable but no longer knows this recovered lane execution",
@@ -1528,6 +1553,7 @@ export class McpDispatchServer {
       readOnly: args["readOnly"] === true,
       scope: readStringArray(args, "scope"),
       tier: view.tier ?? undefined,
+      host: view.host,
       timeoutMs: readNumber(args, "timeoutMs") ?? DEFAULT_LANE_TIMEOUT_MS,
       idleMs: walk !== null ? walk.idleMs : null,
       system: readString(args, "system"),
@@ -1547,6 +1573,11 @@ export class McpDispatchServer {
       callerRoot: this.cwd(),
     });
     if (!readOnlyVerdictResult.ok) return textResult(readOnlyVerdictResult.refusal, true);
+
+    // After an MCP restart, daemon-owned attempts may still be active. Claim/reconcile them before
+    // maxConcurrent is evaluated inside runWalk so this replacement process does not briefly
+    // undercount its own surviving lanes. This waits only on broker recovery, never git enrichment.
+    await this.brokerStartup;
 
     const first = view.ladder.find((l) => l.id === ordered[0]) ?? view.next;
     const job = this.jobs.create(first.id, first.spec, opts.cwd, opts.dispatchSource, taskLabel(task));
@@ -1736,6 +1767,14 @@ export class McpDispatchServer {
         { status, wallClockMs: elapsedMs, exitCode: outcome.run.code },
       );
 
+      if (status !== "completed" && !isLast && this.jobs.brokerExecution(jobId) !== undefined) {
+        // The daemon execution belongs to THIS attempt only. It is already terminal/cancelled here;
+        // remove its durable reference before moving the same job handle to the next rung.
+        this.jobs.clearBrokerExecution(jobId);
+        this.liveBrokerSnapshots.delete(jobId);
+        this.brokerCpu.delete(jobId);
+      }
+
       if (status === "completed" || isLast) {
         await this.recordTreeDelta(jobId);
         this.jobs.complete(
@@ -1806,16 +1845,21 @@ export class McpDispatchServer {
           prefix: row.startingTree.prefix,
           entries: new Map(row.startingTree.entries),
         };
-        const current = await this.readTree(row.cwd);
+        // Keep broker orphan claiming independent of git IO. dispatch_cancel waits on
+        // brokerStartup, so replacement control must not inherit a slow git-status read.
+        // A later liveness/tree read establishes activityLastSeen; final tree-delta collection
+        // still compares against this persisted starting snapshot.
         this.trees.set(row.jobId, {
           cwd: row.cwd,
           before,
           scope: row.startingTree.scope,
-          ...(current === null ? {} : { activityLastSeen: current }),
         });
       }
 
-      await this.refreshBrokerJob(row.jobId);
+      // Do not sample the broker here. On Windows, process-tree CPU collection may take seconds.
+      // Adoption should claim/materialize quickly; status/result refresh on demand, and cancel goes
+      // straight to the daemon owner. This keeps replacement MCP startup/control responsive.
+      this.noteBrokerRecoveryUnavailable(row.jobId, "recovered-broker-pending");
     }));
   }
 
@@ -1833,6 +1877,11 @@ export class McpDispatchServer {
    * temporarily unreachable. Never converts transport failure or malformed success JSON into death.
    */
   private async refreshBrokerJob(jobId: string): Promise<boolean> {
+    const job = this.jobs.get(jobId);
+    // Fresh broker attempts are owned by runWalk's watcher. Only a restart-adopted job may be
+    // terminalized directly from a status snapshot; otherwise a failed first lane could bypass the
+    // remaining walk simply because the caller polled at the wrong instant.
+    if (job !== undefined && job.restored !== true) return false;
     const executionId = this.jobs.brokerExecution(jobId);
     if (executionId === undefined) return false;
 
@@ -1850,7 +1899,7 @@ export class McpDispatchServer {
       return true;
     }
     if (!result.ok) {
-      if (result.kind === "rejected" && result.status === 404) {
+      if (result.kind === "rejected" && result.status === 404 && result.message === UNKNOWN_LANE_EXECUTION_MESSAGE) {
         const killed = this.jobs.markBrokerKilled(
           jobId,
           "the relay daemon is reachable but no longer knows this recovered lane execution; " +
@@ -2105,8 +2154,24 @@ export class McpDispatchServer {
     const seen: Array<{ at: number | null | undefined; source: string }> = [
       { at: this.jobs.get(jobId)?.activity?.lastOutputAt, source: "lane-output" },
     ];
+    const broker = this.liveBrokerSnapshots.get(jobId);
+    if (broker !== undefined) {
+      seen.push(
+        broker.relayInFlight !== undefined && broker.relayInFlight > 0
+          ? { at: now, source: "relay-in-flight" }
+          : { at: broker.relayLastActivityAt, source: "relay-traffic" },
+      );
+      if (broker.cpuMs !== undefined) {
+        const previous = this.brokerCpu.get(jobId);
+        this.brokerCpu.set(jobId, broker.cpuMs);
+        if (previous !== undefined && broker.cpuMs - previous >= PROCESS_CPU_ACTIVITY_MS) {
+          seen.push({ at: now, source: "process-cpu" });
+        }
+      }
+    }
+
     const tag = this.activityTags.get(jobId);
-    if (tag !== undefined && this.deps.readLaneActivity !== undefined) {
+    if (broker === undefined && tag !== undefined && this.deps.readLaneActivity !== undefined) {
       const traffic = await this.deps.readLaneActivity(tag).catch(() => null);
       seen.push(
         traffic !== null && traffic.inFlight > 0
@@ -2121,7 +2186,7 @@ export class McpDispatchServer {
     // tree this dispatcher already owns for reaping, and only after cheaper signals went stale.
     // The first reading is a baseline and proves nothing; a later >=1 s cumulative CPU increase
     // is current activity. A failed read is no signal, never an idle verdict.
-    const pids = this.jobs.runningPids(jobId);
+    const pids = broker === undefined ? this.jobs.runningPids(jobId) : [];
     if (pids.length > 0 && this.deps.readProcessCpu !== undefined) {
       const cpuMs = await this.deps.readProcessCpu(pids).catch(() => null);
       if (typeof cpuMs === "number" && Number.isFinite(cpuMs) && cpuMs >= 0) {
@@ -2209,14 +2274,15 @@ export class McpDispatchServer {
     invoke?: LaneInvocation,
   ): Promise<LaneAttemptOutcome> {
     const attemptStart = this.now();
-    const started = this.startLane(jobId, lane, task, opts, invoke);
+    const started = await this.startLane(jobId, lane, task, opts, invoke);
     if ("refusal" in started) return { run: emptyRun(), abandoned: false, refusal: started.refusal };
-    // ⚠ `registerProcess`, never the bare kill callback: the handle carries the pids this
-    // dispatcher STARTED, which is the only reliable signal for a reaper. Age is not — a long
-    // lane and a stale one look identical from outside, and one legitimately ran 29 minutes.
-    this.jobs.registerProcess(jobId, started);
-    // The owned handle now describes THIS attempt. Never compare its CPU with the previous lane's.
+    if (started.brokerExecutionId === undefined) {
+      // Locally owned fallback/pre-D1 path: the MCP process owns and reaps this exact process tree.
+      this.jobs.registerProcess(jobId, started);
+    }
+    // Attempt-scoped CPU baselines never cross a lane boundary or an ownership boundary.
     this.processCpu.delete(jobId);
+    this.brokerCpu.delete(jobId);
 
     // The attempt promise is made total here, once, so neither branch below has to repeat it and
     // no rejection can escape into the walk.
@@ -2315,7 +2381,184 @@ export class McpDispatchServer {
     // never rejects, so the killed child's late settlement needs no further handler — it resolves
     // into a value nobody reads.
     started.kill();
+    if (started.waitForKill !== undefined) await started.waitForKill();
     return { run: emptyRun(), abandoned: true };
+  }
+
+  /** Broker client containment: an injected client may throw, production never should. */
+  private async brokerRequest(request: LaneExecutionStartRequest | { action: "status" | "cancel"; executionId: string }): Promise<LaneExecutionClientResult> {
+    const client = this.deps.laneExecutionClient;
+    if (client === undefined) {
+      return { ok: false, kind: "unavailable", status: null, message: "lane execution broker client is unavailable" };
+    }
+    try {
+      return await client.request(request);
+    } catch {
+      return { ok: false, kind: "unavailable", status: null, message: "lane execution broker client failed" };
+    }
+  }
+
+  private brokerSnapshotMatches(
+    snapshot: LaneExecutionSnapshot,
+    jobId: string,
+    laneId: string,
+    executionId: string,
+  ): boolean {
+    return snapshot.executionId === executionId && snapshot.jobId === jobId && snapshot.laneId === laneId;
+  }
+
+  private brokerRun(snapshot: LaneExecutionSnapshot): LaneRunResult {
+    return {
+      code: snapshot.code ?? null,
+      stdout: snapshot.stdout ?? "",
+      stderr: snapshot.stderr ?? "",
+      timedOut: snapshot.timedOut ?? snapshot.status === "timed_out",
+    };
+  }
+
+  /** Wait for a started/possibly-started daemon execution without ever duplicating it locally. */
+  private async waitBrokerLane(
+    jobId: string,
+    lane: DispatchLane,
+    invoke: NonNullable<DispatchLane["invoke"]>,
+    opts: WalkOptions,
+    startedAt: number,
+    startRequest: LaneExecutionStartRequest,
+    initial: LaneExecutionClientResult,
+  ): Promise<LaneAttemptOutcome> {
+    let response = initial;
+    let startConfirmed = initial.ok;
+
+    for (;;) {
+      if (response.ok) {
+        const snapshot = response.execution;
+        if (!this.brokerSnapshotMatches(snapshot, jobId, lane.id, startRequest.executionId)) {
+          // A malformed/mismatched 2xx is uncertainty, not permission to spawn another process.
+          await pollTimer(BROKER_STATUS_POLL_MS);
+          response = await this.brokerRequest({ action: "status", executionId: startRequest.executionId });
+          continue;
+        }
+        startConfirmed = true;
+        if (snapshot.status === "running") {
+          this.liveBrokerSnapshots.set(jobId, snapshot);
+          // Running snapshots update output/launch diagnostics only; terminal snapshots are settled
+          // by the ordinary walk below, never by the restart-only collector.
+          this.jobs.applyBrokerSnapshot(jobId, snapshot);
+          await pollTimer(BROKER_STATUS_POLL_MS);
+          response = await this.brokerRequest({ action: "status", executionId: startRequest.executionId });
+          continue;
+        }
+
+        this.liveBrokerSnapshots.delete(jobId);
+        this.brokerCpu.delete(jobId);
+        return this.settleSpawnedRun(jobId, lane, invoke, opts, startedAt, this.brokerRun(snapshot));
+      }
+
+      if (!startConfirmed) {
+        if (response.kind === "rejected" && response.status !== null) {
+          // The daemon answered the start and did not create this execution.
+          this.jobs.clearBrokerExecution(jobId);
+          return failedOutcome(response.message);
+        }
+        // Transport/invalid-response after START is ambiguous. Re-send the SAME idempotent start;
+        // never fall back locally after a start may have reached the daemon.
+        await pollTimer(BROKER_STATUS_POLL_MS);
+        response = await this.brokerRequest(startRequest);
+        continue;
+      }
+
+      if (response.kind === "rejected") {
+        this.jobs.clearBrokerExecution(jobId);
+        this.liveBrokerSnapshots.delete(jobId);
+        this.brokerCpu.delete(jobId);
+        return failedOutcome(
+          response.status === 404
+            ? "the relay daemon lost the brokered lane execution before it returned a terminal result"
+            : response.message,
+        );
+      }
+
+      // A live execution plus temporary transport/protocol uncertainty stays alive and is polled.
+      await pollTimer(BROKER_STATUS_POLL_MS);
+      response = await this.brokerRequest({ action: "status", executionId: startRequest.executionId });
+    }
+  }
+
+  /** Idempotently cancel one broker attempt before the walk advances to another rung. */
+  private async stopBrokerLane(executionId: string): Promise<void> {
+    for (;;) {
+      const response = await this.brokerRequest({ action: "cancel", executionId });
+      if (response.ok) return;
+      if (response.kind === "rejected" && ((response.status === 404 && response.message === UNKNOWN_LANE_EXECUTION_MESSAGE) || response.status === 503)) return;
+      await pollTimer(BROKER_STATUS_POLL_MS);
+    }
+  }
+
+  /**
+   * Try daemon ownership. null = no broker client (legacy/embed); {fallback} = broker unavailable
+   * BEFORE any start request, so a local spawn is safe; otherwise return the daemon-owned handle.
+   */
+  private async tryStartBrokerLane(
+    jobId: string,
+    lane: DispatchLane,
+    task: string,
+    opts: WalkOptions,
+    invoke: NonNullable<DispatchLane["invoke"]>,
+  ): Promise<StartedLaneHandle | { fallback: string } | null> {
+    if (this.deps.laneExecutionClient === undefined) return null;
+
+    let executionId = createLaneExecutionId();
+    // Preflight is intentionally a STATUS for a random id. If it cannot reach/understand a broker,
+    // no start request has been sent yet and local fallback cannot duplicate work.
+    for (let collision = 0; collision < 3; collision += 1) {
+      const probe = await this.brokerRequest({ action: "status", executionId });
+      if (!probe.ok && probe.kind === "rejected" && probe.status === 404 && probe.message === UNKNOWN_LANE_EXECUTION_MESSAGE) break;
+      if (!probe.ok) return { fallback: probe.message };
+      executionId = createLaneExecutionId();
+      if (collision === 2) return { fallback: "could not allocate a unique daemon execution id" };
+    }
+
+    const startRequest: LaneExecutionStartRequest = {
+      action: "start",
+      executionId,
+      jobId,
+      laneId: lane.id,
+      task,
+      cwd: opts.cwd,
+      timeoutMs: opts.timeoutMs,
+      depth: opts.depth,
+      ...(opts.tier === undefined ? {} : { tier: opts.tier }),
+      ...(opts.readOnly ? { readOnly: true, callerRoot: this.cwd() } : {}),
+      host: opts.host,
+    };
+
+    // WAL ordering: persist the opaque daemon execution id BEFORE sending the idempotent start.
+    this.jobs.noteBrokerExecution(jobId, executionId);
+    this.jobs.noteExecutionOwner(jobId, "relay-daemon");
+    const startedAt = this.now();
+    const initial = await this.brokerRequest(startRequest);
+
+    if (!initial.ok && initial.kind === "rejected" && initial.status !== null) {
+      // Reachable broker refused before creating an execution. A transient 503 is safe to fall back
+      // locally because the route itself says no broker owns the id; other refusals are lane failure.
+      this.jobs.clearBrokerExecution(jobId);
+      if (initial.status === 503) return { fallback: initial.message };
+      return {
+        result: Promise.resolve(failedOutcome(initial.message)),
+        kill: () => {},
+      };
+    }
+
+    let cancelPromise: Promise<void> | undefined;
+    const result = this.waitBrokerLane(jobId, lane, invoke, opts, startedAt, startRequest, initial);
+    return {
+      result,
+      brokerExecutionId: executionId,
+      kill: () => {
+        cancelPromise ??= this.stopBrokerLane(executionId);
+      },
+      waitForKill: () => cancelPromise ?? Promise.resolve(),
+    };
   }
 
   /**
@@ -2327,14 +2570,14 @@ export class McpDispatchServer {
    * Only a bad working directory is a `refusal`, because that is the caller's own error and every
    * remaining lane would hit it identically.
    */
-  private startLane(
+  private async startLane(
     jobId: string,
     lane: DispatchLane,
     task: string,
     opts: WalkOptions,
     /** The invocation to spawn instead of `lane.invoke` — a read-only binding of it. */
     invokeOverride?: LaneInvocation,
-  ): { result: Promise<LaneAttemptOutcome>; kill: () => void; pids?: () => number[] } | { refusal: string } {
+  ): Promise<StartedLaneHandle | { refusal: string }> {
     if (opts.mode === "answer" && lane.kind === "relay") {
       // ⚠ Skips the whole cwd/invoke/spawn path on purpose: a direct HTTP call to this relay's own
       // /v1/messages needs no working directory and no harness. `lane.invoke` may still be present
@@ -2390,6 +2633,14 @@ export class McpDispatchServer {
         result: Promise.resolve(failedOutcome(`Lane "${lane.id}" cannot be run from here: ${why}.`)),
         kill: () => {},
       };
+    }
+
+    const broker = await this.tryStartBrokerLane(jobId, lane, task, opts, declared);
+    if (broker !== null && !("fallback" in broker)) return broker;
+    if (broker !== null && "fallback" in broker) {
+      // Preflight failed BEFORE any start request, so local ownership is safe but intentionally
+      // visible: this attempt will die with the MCP host if it exits.
+      this.jobs.noteExecutionOwner(jobId, "local-fallback");
     }
 
     // The launcher's own corrections, recorded on the job so the reply names them.

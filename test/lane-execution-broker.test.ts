@@ -3,6 +3,7 @@ import {
   LANE_EXECUTION_SCHEMA,
   LaneExecutionBroker,
   parseLaneExecutionBrokerRequest,
+  type LaneExecutionActivity,
   type LaneExecutionLaunchHandle,
   type LaneExecutionRunResult,
   type LaneExecutionStartRequest,
@@ -151,6 +152,37 @@ describe("LaneExecutionBroker", () => {
     expect(JSON.stringify(status)).not.toContain("pid");
   });
 
+  it("never samples slow process activity on start or cancel acknowledgements", async () => {
+    const run = deferred<LaneExecutionRunResult>();
+    let activityReads = 0;
+    const broker = new LaneExecutionBroker(() => ({
+      result: run.promise,
+      cancel: () => {},
+      activity: () => {
+        activityReads += 1;
+        return new Promise<LaneExecutionActivity>(() => {});
+      },
+    }));
+
+    const started = await Promise.race([
+      broker.handle(start()),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("start waited on process activity")), 100),
+      ),
+    ]);
+    expect(started).toMatchObject({ ok: true, execution: { status: "running" } });
+    expect(activityReads).toBe(0);
+
+    const cancelled = await Promise.race([
+      broker.handle({ action: "cancel", executionId: start().executionId }),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("cancel waited on process activity")), 100),
+      ),
+    ]);
+    expect(cancelled).toMatchObject({ ok: true, execution: { status: "cancelled" } });
+    expect(activityReads).toBe(0);
+  });
+
   it("reports injected activity while running without exposing process ids or task text", async () => {
     const run = deferred<LaneExecutionRunResult>();
     const handle: LaneExecutionLaunchHandle = {
@@ -203,6 +235,27 @@ describe("LaneExecutionBroker", () => {
     await Promise.resolve();
     expect(await broker.handle({ action: "status", executionId: start().executionId }))
       .toMatchObject({ ok: true, execution: { status: "cancelled", stdout: "partial" } });
+  });
+
+  it("daemon shutdown cancels every still-running broker process tree", async () => {
+    const a = deferred<LaneExecutionRunResult>();
+    const b = deferred<LaneExecutionRunResult>();
+    const cancelled: string[] = [];
+    const broker = new LaneExecutionBroker((request) => ({
+      result: request.executionId.endsWith("aaaa") ? a.promise : b.promise,
+      cancel: () => cancelled.push(request.executionId),
+    }), () => 500);
+
+    await broker.handle(start({ executionId: "exec-0000000000000000000000000000aaaa" }));
+    await broker.handle(start({ executionId: "exec-0000000000000000000000000000bbbb" }));
+    broker.shutdown();
+
+    expect(cancelled.sort()).toEqual([
+      "exec-0000000000000000000000000000aaaa",
+      "exec-0000000000000000000000000000bbbb",
+    ]);
+    expect(await broker.handle({ action: "status", executionId: "exec-0000000000000000000000000000aaaa" }))
+      .toMatchObject({ ok: true, execution: { status: "cancelled", endedAt: 500 } });
   });
 
   it("never prunes a cancelled execution while its child handle is still unsettled", async () => {

@@ -84,7 +84,7 @@ function fakeBroker(
 }
 
 async function withProxy<T>(
-  broker: LaneExecutionBrokerPort | undefined,
+  broker: LaneExecutionBrokerPort | null | undefined,
   fn: (base: string) => Promise<T>,
 ): Promise<T> {
   const proxy = createProxy(cfg(), {
@@ -154,8 +154,23 @@ describe("POST /mcp/lane-execution", () => {
     expect(calls).toEqual([]);
   });
 
-  it("fails closed when no broker is installed", async () => {
+  it("installs the configured daemon broker by default", async () => {
     await withProxy(undefined, async (base) => {
+      const response = await post(base, {
+        action: "status",
+        executionId: "exec-00112233445566778899aabbccddeeff",
+      });
+      // An installed empty broker knows the protocol but not this execution. If the broker were
+      // absent, this exact request would be 503 instead.
+      expect(response.status).toBe(404);
+      expect(await response.json()).toMatchObject({
+        error: { message: "unknown lane execution id" },
+      });
+    });
+  });
+
+  it("fails closed when no broker is installed", async () => {
+    await withProxy(null, async (base) => {
       const response = await post(base, startBody());
       expect(response.status).toBe(503);
       expect(await response.json()).toMatchObject({

@@ -79,23 +79,18 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
 - **M1 remains evidence-blocked.** Its first required input is one raw archived AGY success
   envelope; neither the repository nor available connected context contains one, so no parser is
   being written from an assumed schema.
-- **D1 restart-safe execution is through the pre-switchover substrate.** The token-gated
-  daemon broker/store, strict MCP broker client, opaque journal execution reference, shared daemon
-  dispatch-view builder, recursion-depth transport, and configured daemon launcher are merged.
-  The launcher reuses the same cwd/read-only/AGY/env/activity/CPU/process-tree semantics as the
-  local MCP launcher, but production MCP dispatch still owns its lanes locally.
-- **D1 restart reconciliation is the current implementation step.** Broker-backed orphan rows are
-  atomically claimed by one replacement MCP process; reachable broker state can keep the job
-  running or deliver its original terminal result, a reachable 404 is definitive, and transport
-  uncertainty never becomes a fabricated death. Explicit cancel goes to the daemon owner while MCP
-  shutdown leaves daemon-owned work alone. After this lands, the remaining step is the actual
-  production ownership switchover plus the destructive Windows parent-death regression.
+- **D1 restart-safe execution is implemented end to end.** The relay daemon installs the configured
+  lane broker by default and owns fresh spawned MCP agent attempts. The MCP process journals an
+  opaque execution id before the idempotent start, never falls back locally after a start may have
+  reached the daemon, and labels the pre-start local fallback as non-restart-safe. A replacement
+  MCP process atomically claims the journal row, observes or collects the same daemon execution, and
+  routes explicit cancellation back to the daemon; ordinary MCP shutdown leaves daemon-owned work
+  running. The Windows process-boundary regression kills only the original MCP parent and verifies
+  that the lane survives, can be collected by a replacement MCP, and can be cancelled there.
   See `docs/history/mcp-restart-safe-lane-execution-design-2026-09-20.md`.
-- **Immediate next after recovery lands.** Install the configured broker in the daemon and make
-  agent-mode MCP attempts use it with local fallback only when broker start is unavailable; then
-  prove on Windows that killing the original MCP parent leaves the lane alive and a replacement MCP
-  collects/cancels it. Separately open: repository CI enforcement, Route B's vendor blocker,
-  owner-driven Codex/Code-tab checks, D2/D5, and M1 when first-party AGY evidence becomes available.
+- **Immediate next after D1.** D2/D5 remain design work; M1 remains blocked on a first-party AGY
+  success envelope. Separately open: repository CI enforcement, Route B's vendor blocker, and the
+  owner-driven Codex/Code-tab checks.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 

@@ -25,6 +25,7 @@
  * `lane-manifest.ts` rule); each row is validated field by field and one bad row is dropped alone.
  */
 import { safeReadJsonSync, transactionalUpdateJsonSync } from "../storage/json-store.js";
+import { MCP_PERSISTENCE_LOCK } from "./persistence-lock.js";
 import { relayStatePath } from "../state-paths.js";
 import type { LaneJob, LaneAttempt, LaneProcessReport, JobStatus } from "./lane-runner.js";
 
@@ -173,7 +174,7 @@ export function createJobArchive(path: string = jobArchivePath()): JobArchive {
           };
           return transaction.committed;
         },
-        { validator: isJobArchiveFile, strict: true },
+        { validator: isJobArchiveFile, strict: true, lock: MCP_PERSISTENCE_LOCK },
       );
       const committed = transaction.committed;
       if (!ok || committed === null) return false;
@@ -304,6 +305,7 @@ export function isArchivedJob(value: unknown): value is ArchivedJob {
     optStrings("launch") &&
     (value["process"] === undefined || isProcessReport(value["process"])) &&
     (value["dispatchSource"] === undefined || value["dispatchSource"] === "daemon" || value["dispatchSource"] === "fallback") &&
+    (value["executionOwner"] === undefined || value["executionOwner"] === "relay-daemon" || value["executionOwner"] === "local-fallback") &&
     (value["relay"] === undefined || isRecord(value["relay"])) &&
     (value["readOnly"] === undefined || isRecord(value["readOnly"]))
   );

@@ -315,6 +315,11 @@ export interface LaneJob {
   /** Set when the job's dispatch view came from a fallback rather than the live daemon. */
   dispatchSource?: "daemon" | "fallback";
   /**
+   * Who owns the currently-running agent process tree. Absent preserves the pre-D1/local shape for
+   * embeds and answer-mode jobs. `local-fallback` is explicit because it does NOT survive MCP exit.
+   */
+  executionOwner?: "relay-daemon" | "local-fallback";
+  /**
    * What this dispatcher started for this job, and what became of it — written once, when the job
    * reaches a terminal state. See `LaneProcessReport`.
    */
@@ -1365,6 +1370,8 @@ export class LaneJobStore {
     const kill = this.kills.get(id);
     this.kills.delete(id);
     this.owned.delete(id);
+    const brokerOwned = this.brokerExecutions.has(id);
+    this.brokerExecutions.delete(id);
     if (!job) {
       this.journal.clear(id);
       return;
@@ -1373,6 +1380,13 @@ export class LaneJobStore {
     delete job.activity;
     delete job.liveness;
     const pids = readOwnedPids(handle);
+    if (brokerOwned) {
+      // The daemon owns this process tree and the broker result is already terminal. Never signal
+      // it from MCP or invent pid ownership here; just archive the job and clear the journal row.
+      job.process = { pids: [], survivors: [], terminated: false };
+      if (this.archive.record(job)) this.journal.clear(id);
+      return;
+    }
     if (kill === undefined) {
       // Nothing of ours ran for this job. Reported rather than omitted, so "no owned process" and
       // "we forgot to look" cannot read the same way.
@@ -1451,6 +1465,7 @@ export class LaneJobStore {
     // note below clears its persisted reference; the next brokered attempt writes a fresh id before
     // start. This also makes a crash between attempts degrade honestly to the local killed path.
     this.brokerExecutions.delete(id);
+    delete job.executionOwner;
     // A different MCP process can answer status for this running job from the shared journal.
     // Keep the lane identity current there too; liveness itself stays process-local so the journal
     // is not rewritten every 15 seconds.
@@ -1506,6 +1521,33 @@ export class LaneJobStore {
     return this.brokerExecutions.get(id);
   }
 
+  /** Record which execution boundary owns the current attempt. */
+  noteExecutionOwner(id: string, owner: LaneJob["executionOwner"]): void {
+    const job = this.jobs.get(id);
+    if (job === undefined || job.status !== "running") return;
+    if (owner === undefined) delete job.executionOwner;
+    else job.executionOwner = owner;
+  }
+
+  /**
+   * Clear an attempt-scoped daemon execution after it is definitively terminal and the walk will
+   * continue. The job itself stays running; the journal row is rewritten without broker metadata.
+   */
+  clearBrokerExecution(id: string): void {
+    const job = this.jobs.get(id);
+    if (job === undefined || job.status !== "running") return;
+    this.brokerExecutions.delete(id);
+    if (job.executionOwner === "relay-daemon") delete job.executionOwner;
+    this.journal.note({
+      jobId: job.id,
+      laneId: job.laneId,
+      ...(job.spec === undefined ? {} : { spec: job.spec }),
+      cwd: job.cwd,
+      startedAt: job.startedAt,
+      ...(job.label === undefined ? {} : { label: job.label }),
+    });
+  }
+
   /**
    * Bind a live job to the daemon execution that now owns its process tree, and persist the opaque
    * reference before the broker start request is sent. Used by the later ownership switchover.
@@ -1541,6 +1583,7 @@ export class LaneJobStore {
       error: undefined,
       attempts: [],
       restored: true,
+      executionOwner: "relay-daemon",
       ...(row.label === undefined ? {} : { label: row.label }),
     };
     this.jobs.set(job.id, job);
@@ -1728,11 +1771,11 @@ export class LaneJobStore {
    * Passing the asking job's own id excludes it, so this answers "how many OTHER jobs are running
    * this lane right now" — the question a skip check actually needs.
    *
-   * ⚠ Per-process by construction, and that is the whole design, not a limitation to work around:
-   * the daemon never spawns a lane, so the only process that ever knows a `cli` rung's process is
-   * running is the one that spawned it. Two host sessions each running their own `llm-relay mcp`
-   * can together exceed a rung's `maxConcurrent` — this bounds one host's own concurrency, and
-   * `docs/reference.md` says so rather than implying a machine-wide guarantee this cannot make.
+   * ⚠ Per MCP SERVER PROCESS by design. D1 moves the physical child into the daemon, but this
+   * admission policy still counts the jobs THIS MCP store owns or recovered. Another simultaneously
+   * live MCP process is not folded into the number, so two host sessions can together exceed a
+   * rung's `maxConcurrent`. This preserves the documented per-host cap rather than silently turning
+   * it into a machine-wide semaphore.
    */
   inFlight(laneId: string, excludeJobId?: string): number {
     let count = 0;

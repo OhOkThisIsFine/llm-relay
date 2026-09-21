@@ -1745,12 +1745,12 @@ uncapped one only when something is actually running. `llm-relay dispatch` shows
 <n>` from config alone; that CLI process is not the one that would spawn a job for this rung, so it
 has no live count to add. Absent means unbounded — the pre-existing behaviour, byte for byte.
 
-⚠ **The count is per MCP SERVER PROCESS, not per machine.** The daemon never spawns a lane, so the
-only process that ever knows one of this rung's jobs is running is the `llm-relay mcp` process that
-spawned it — each host session (Claude Code, Codex, a second terminal) runs its own. Two host
-sessions can therefore each run up to `maxConcurrent` jobs against the same rung at the same time,
-for up to `2 × maxConcurrent` together; this is the stated limit of what one process can observe,
-not a claim about the rung's real-world concurrency everywhere it might be dispatched from.
+⚠ **The count is per MCP SERVER PROCESS, not per machine.** D1 changed who owns the physical
+process tree, not this admission policy: the originating MCP job store counts the jobs it owns or
+has recovered, while another simultaneously-live MCP process maintains its own count. The daemon's
+broker does not turn `maxConcurrent` into a global semaphore. Two host sessions can therefore each
+run up to `maxConcurrent` jobs against the same rung at the same time; this is a per-host limit,
+not a claim about machine-wide concurrency.
 
 #### Rung capability (`capability`) and the budget extension
 

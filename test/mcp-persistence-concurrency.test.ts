@@ -153,6 +153,36 @@ describe("cross-process MCP persistence", () => {
     }
   });
 
+  it("waits through contention longer than the generic 5s lock budget instead of losing a journal row", async () => {
+    const { dir, cleanup } = tempDir();
+    const workers: Worker[] = [];
+    try {
+      const journalPath = join(dir, "mcp-jobs.json");
+      const ready = join(dir, "ready-long-lock");
+      workers.push(spawnWorker(["hold-lock-timed", journalPath, ready, "6000"]));
+      await waitForFiles([ready], workers);
+
+      const started = Date.now();
+      createJobJournal(journalPath).note({
+        jobId: "job-after-long-contention",
+        laneId: "lane-a",
+        cwd: process.cwd(),
+        startedAt: 1,
+      });
+      const elapsed = Date.now() - started;
+      await Promise.all(workers.map(waitForExit));
+
+      expect(elapsed).toBeGreaterThanOrEqual(5_000);
+      const journal = JSON.parse(readFileSync(journalPath, "utf8")) as {
+        jobs: Array<{ jobId: string }>;
+      };
+      expect(journal.jobs.map((row) => row.jobId)).toContain("job-after-long-contention");
+    } finally {
+      stopWorkers(workers);
+      cleanup();
+    }
+  }, 20_000);
+
   it("ignores an abandoned unpublished claim directory", () => {
     const { dir, cleanup } = tempDir();
     try {
