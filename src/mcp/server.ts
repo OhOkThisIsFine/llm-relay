@@ -1842,12 +1842,14 @@ export class McpDispatchServer {
           prefix: row.startingTree.prefix,
           entries: new Map(row.startingTree.entries),
         };
-        const current = await this.readTree(row.cwd);
+        // Keep broker orphan claiming independent of git IO. dispatch_cancel waits on
+        // brokerStartup, so replacement control must not inherit a slow git-status read.
+        // A later liveness/tree read establishes activityLastSeen; final tree-delta collection
+        // still compares against this persisted starting snapshot.
         this.trees.set(row.jobId, {
           cwd: row.cwd,
           before,
           scope: row.startingTree.scope,
-          ...(current === null ? {} : { activityLastSeen: current }),
         });
       }
 
