@@ -110,46 +110,48 @@ describe("cross-process MCP persistence", () => {
     }
   });
 
-  it("preserves every distinct journal and archive row from real concurrent MCP processes", async () => {
-    const { dir, cleanup } = tempDir();
-    const workers: Worker[] = [];
-    try {
-      const journalPath = join(dir, "mcp-jobs.json");
-      const archivePath = join(dir, "mcp-job-archive.json");
-      const start = join(dir, "start");
-      const release = join(dir, "release");
-      const ids = ["job-concurrent-a", "job-concurrent-b", "job-concurrent-c", "job-concurrent-d"];
-      const ready = ids.map((id) => join(dir, `ready-${id}`));
-      const done = ids.map((id) => join(dir, `done-${id}`));
-      for (let i = 0; i < ids.length; i += 1) {
-        workers.push(
-          spawnWorker([
-            "mcp",
-            journalPath,
-            archivePath,
-            ids[i] as string,
-            ready[i] as string,
-            start,
-            done[i] as string,
-            release,
-          ]),
-        );
+  it("preserves every distinct journal and archive row across repeated real concurrent MCP rounds", async () => {
+    for (let round = 0; round < 5; round += 1) {
+      const { dir, cleanup } = tempDir();
+      const workers: Worker[] = [];
+      try {
+        const journalPath = join(dir, "mcp-jobs.json");
+        const archivePath = join(dir, "mcp-job-archive.json");
+        const start = join(dir, "start");
+        const release = join(dir, "release");
+        const ids = ["a", "b", "c", "d"].map((suffix) => `job-concurrent-${round}-${suffix}`);
+        const ready = ids.map((id) => join(dir, `ready-${id}`));
+        const done = ids.map((id) => join(dir, `done-${id}`));
+        for (let i = 0; i < ids.length; i += 1) {
+          workers.push(
+            spawnWorker([
+              "mcp",
+              journalPath,
+              archivePath,
+              ids[i] as string,
+              ready[i] as string,
+              start,
+              done[i] as string,
+              release,
+            ]),
+          );
+        }
+
+        await waitForFiles(ready, workers);
+        writeFileSync(start, "go");
+        await waitForFiles(done, workers);
+
+        const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { jobs: Array<{ jobId: string }> };
+        const archive = JSON.parse(readFileSync(archivePath, "utf8")) as { jobs: Array<{ id: string }> };
+        expect(new Set(journal.jobs.map((row) => row.jobId))).toEqual(new Set(ids));
+        expect(new Set(archive.jobs.map((row) => row.id))).toEqual(new Set(ids));
+
+        writeFileSync(release, "done");
+        await Promise.all(workers.map(waitForExit));
+      } finally {
+        stopWorkers(workers);
+        cleanup();
       }
-
-      await waitForFiles(ready, workers);
-      writeFileSync(start, "go");
-      await waitForFiles(done, workers);
-
-      const journal = JSON.parse(readFileSync(journalPath, "utf8")) as { jobs: Array<{ jobId: string }> };
-      const archive = JSON.parse(readFileSync(archivePath, "utf8")) as { jobs: Array<{ id: string }> };
-      expect(new Set(journal.jobs.map((row) => row.jobId))).toEqual(new Set(ids));
-      expect(new Set(archive.jobs.map((row) => row.id))).toEqual(new Set(ids));
-
-      writeFileSync(release, "done");
-      await Promise.all(workers.map(waitForExit));
-    } finally {
-      stopWorkers(workers);
-      cleanup();
     }
   });
 
