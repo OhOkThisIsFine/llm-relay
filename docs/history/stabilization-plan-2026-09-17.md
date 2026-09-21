@@ -510,8 +510,7 @@ the owner these questions.
   operator-declared prices again unless the owner raises it.
 
 ### D5 Major development-dependency upgrades
-`typescript` 5.9 → 7.0 (also a RUNTIME dependency for `delegate-gate`) and three more remain.
-None is a defect today.
+Three additional major-upgrade laps from the original inventory remain. None is a defect today.
 Recommendation: one upgrade per lap, each with the full gate and the package baseline measured
 again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
 
@@ -588,8 +587,39 @@ again. Not cheap-model work: a major bump fails in ways a brief cannot predict.
   `dashboardRawBytes=391229` with unchanged JS (367804) and CSS `22174`. Package measurement:
   `packBytes=1208855`, `unpackedBytes=5968835`, `packageEntries=460`, all below the existing
   ceilings.
-- **Next D5 lap.** TypeScript 5.9 → 7.0 in a dedicated runtime/tooling lap; do not combine it with
-  another major because `typescript` is shipped as a runtime dependency for `delegate-gate`.
+- **Next D5 lap (historical plan).** TypeScript 5.9 → 7.0 in a dedicated runtime/tooling
+  lap; do not combine it with another major because `typescript` is shipped as a runtime
+  dependency for `delegate-gate`.
+
+#### D5-e DONE (2026-09-20) TypeScript 7 native compiler
+- **Shipped compiler.** The repository's build and all three typecheck surfaces now run the native
+  TypeScript 7.0.2 compiler via an explicit `@typescript/native = npm:typescript@^7.0.2` alias.
+  Package scripts invoke `node node_modules/@typescript/native/bin/tsc` directly so package-manager
+  bin-link ordering cannot silently select a different compiler.
+- **Runtime API stays classic on purpose.** `delegate-gate` imports the in-process TypeScript
+  Compiler API at runtime. TypeScript 7.0 explicitly ships no stable replacement API, so the root
+  runtime dependency remains `typescript ^5.7.2` (resolved 5.9.3). This also remains within
+  typescript-eslint 8's supported peer range and Madge 8's `^5.4.4` optional peer.
+- **Rejected transition.** The TypeScript team's `@typescript/typescript6` compatibility package
+  was tested as the root API slot, but clean `npm ci` correctly refused it because Madge 8 still
+  requires `typescript ^5.4.4`. No `--legacy-peer-deps`, forced peer override, or unmaintained
+  Madge fork was accepted merely to make the graph install.
+- **Config migration.** Base `tsconfig.json` now declares `types: ["node"]` explicitly because
+  TypeScript 6/7 no longer implicitly loads every visible `@types` package by default. The existing
+  explicit NodeNext/Bundler module settings already avoid the removed 6.0 options.
+- **Measured identities.** After clean install: `import "typescript"` reports 5.9.3; the native
+  alias manifest and direct launcher report 7.0.2; npm's current `.bin/tsc` also resolves to 7.0.2,
+  though the scripts do not rely on that incidental link.
+- **Proof.** Native TS7 emits server JavaScript and declarations; 4,490 core tests and all 46
+  dashboard tests pass; all delegate-gate AST regressions pass on the retained runtime API; the
+  Windows process-boundary suite passes; packed-dashboard smoke passes. Dashboard bytes are
+  unchanged from D5-d. Package measurement is `packBytes=1208872`,
+  `unpackedBytes=5970011`, `packageEntries=460`, all below the existing ceilings.
+- **Future API transition.** Revisit the runtime Compiler API only when TypeScript's new native API
+  is stable and this repo's API-consuming peers support it. TypeScript 7.0 itself cannot complete
+  that replacement because it deliberately has no stable in-process API.
+- **Next D5 lap.** Re-survey the three remaining major development dependencies from the original
+  inventory, then upgrade one at a time with the same full-gate and package-baseline discipline.
 
 ### D6 A lane's capability must come from the synced capability data (owner correction, 2026-09-17)
 - **Owner statement.** "The capability value is supposed to be set by data scraped from
