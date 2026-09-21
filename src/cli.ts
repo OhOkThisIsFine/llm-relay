@@ -802,14 +802,18 @@ export function ensureEnvFileLoaded(): void {
   loadEnvFile();
 }
 
-export function loadOrExit(): Config {
-  ensureEnvFileLoaded();
-  const configPath = resolveConfigPath();
-  const overrides: ConfigOverrides = {
+export function configOverridesFromCli(): ConfigOverrides {
+  return {
     routeDefault: argValue("--default", "-d"),
     mode: argValue("--mode", "-m"),
     listen: argValue("--listen", "-l"),
   };
+}
+
+export function loadOrExit(): Config {
+  ensureEnvFileLoaded();
+  const configPath = resolveConfigPath();
+  const overrides = configOverridesFromCli();
   try {
     const cfg = loadConfig(configPath, overrides);
     for (const w of cfg.warnings ?? []) {
@@ -964,6 +968,13 @@ export function onListenError(
 
 export function runProxy() {
   const cfg = loadOrExit();
+  // Preserve the exact CLI policy this daemon started with. Re-reading process.argv later is
+  // avoidable ambiguity, and dropping --listen/--mode/--default during reload would silently
+  // change the operator's effective config.
+  const startupOverrides = configOverridesFromCli();
+  const reloadConfig = cfg.sourcePath
+    ? () => loadConfig(cfg.sourcePath!, startupOverrides)
+    : undefined;
   const catalog = new ModelCatalog();
   let accountingStore: AccountingStore | undefined;
   let accountingStoreClosed = false;
@@ -1014,6 +1025,17 @@ export function runProxy() {
     relayVersion: currentVersion(),
     // The projector aggregates every labeled attribution by default; query filters narrow it.
     dashboardAttributionPolicy: "include_all_labeled",
+    ...(reloadConfig
+      ? {
+          reloadConfig,
+          onReloaded: (reloaded: Config) => {
+            for (const warning of reloaded.warnings ?? []) {
+              process.stderr.write(`llm-relay: ⚠ ${warning}\n`);
+            }
+            return warmAndValidate(reloaded, catalog);
+          },
+        }
+      : {}),
     onStop: () => shutdown("POST /stop"),
   });
   server.once("close", closeAccountingStore);
