@@ -174,6 +174,7 @@ describe("D1 broker-backed MCP restart recovery", () => {
       expect(text).toContain("status: running");
       expect(text).toContain("walk-verdict: no-idle-stop");
       expect(text).toContain("relay-in-flight");
+      expect(text).toContain("process tree is owned by the relay daemon");
       expect(text).not.toContain("killed");
 
       // Host/MCP shutdown must not cancel/clear daemon-owned work.
@@ -215,6 +216,40 @@ describe("D1 broker-backed MCP restart recovery", () => {
       expect(text).toContain("answer survived the MCP restart");
       expect(text).toContain("completed");
       expect(createJobJournal(path).orphans().find((row) => row.jobId === seeded.jobId)).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("preserves the existing content-empty failure classifier on a recovered exit-0 result", async () => {
+    const { path, cleanup } = tempJournalPath();
+    try {
+      const seeded = seed(path);
+      const client = brokerClient(() => ({
+        ok: true,
+        execution: brokerSnapshot(seeded.jobId, seeded.laneId, {
+          status: "completed",
+          endedAt: 2_000,
+          code: 0,
+          stdout: "#",
+          stderr: "",
+          timedOut: false,
+          stdoutBytes: 1,
+        }),
+      }));
+      const out: Array<{ id?: number; result?: { content?: Array<{ text?: string }>; isError?: boolean } }> = [];
+      const server = serverFor(path, client, (chunk) => out.push(JSON.parse(chunk)));
+      await server.ingest(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 20,
+          method: "tools/call",
+          params: { name: "dispatch_result", arguments: { jobId: seeded.jobId } },
+        }) + "\n",
+      );
+      const result = out.find((message) => message.id === 20)?.result;
+      expect(result?.content?.[0]?.text).toContain("NO output");
+      expect(result?.isError).toBe(true);
     } finally {
       cleanup();
     }
@@ -272,6 +307,8 @@ describe("D1 broker-backed MCP restart recovery", () => {
       );
       const result = out.find((message) => message.id === 4)?.result;
       expect(result?.content?.[0]?.text).toContain("killed");
+      expect(result?.content?.[0]?.text).toContain("could no longer be recovered");
+      expect(result?.content?.[0]?.text).not.toContain("process is gone");
       expect(result?.isError).toBe(true);
     } finally {
       cleanup();
