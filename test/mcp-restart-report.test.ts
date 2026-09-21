@@ -344,7 +344,9 @@ describe("D1 broker-backed MCP restart recovery", () => {
         }) + "\n",
       );
       expect(out.find((message) => message.id === 5)?.result?.content?.[0]?.text).toContain("cancelled");
-      expect(actions).toContain("cancel");
+      // Cancellation is the first broker operation after orphan claiming: no status/liveness probe
+      // may delay it with process-CPU or git IO.
+      expect(actions).toEqual(["cancel"]);
     } finally {
       cleanup();
     }
