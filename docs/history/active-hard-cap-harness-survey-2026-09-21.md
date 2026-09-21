@@ -202,6 +202,16 @@ bug reports cluster around richer histories and subagent/tool event handling.
 
 ## Gate to Phase 5.2
 
-Phase 5.2 may begin when at least one harness has passed the live protocol above and is marked
-**verified resumable**. AGY should be attempted first. The substrate should still model harness
-support generically so Claude/Codex/OpenCode can be added independently later.
+A harness is **verified resumable** only after BOTH live measurements pass:
+
+1. its single-job `measure-<harness>-continuation.mjs` exact-ID interruption/resume probe;
+2. `node scripts/measure-continuation-isolation.mjs <harness>`, which runs two exact-resume probes
+   concurrently in the same working directory and requires distinct canonical identities.
+
+The isolation runner never chooses a latest session; it merely launches the exact-ID probes in a
+shared cwd and proves neither crosses into the other's conversation. This pins the concurrency
+condition from the continuation design before any production continuation state exists.
+
+Phase 5.2 may begin when at least one harness satisfies both checks. AGY remains the preferred first
+candidate. The substrate should still model harness support generically so Claude/Codex/OpenCode can
+be added independently later.
