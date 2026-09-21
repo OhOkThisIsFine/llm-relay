@@ -131,6 +131,47 @@ describe("createLaneExecutionClient", () => {
     }
   });
 
+  it("rejects contradictory terminal status/result pairs at the wire boundary", async () => {
+    for (const execution of [
+      runningExecution({
+        status: "completed",
+        endedAt: 200,
+        code: 1,
+        stdout: "no",
+        stderr: "",
+        timedOut: false,
+      }),
+      runningExecution({
+        status: "failed",
+        endedAt: 200,
+        code: 0,
+        stdout: "contradiction",
+        stderr: "",
+        timedOut: false,
+      }),
+      runningExecution({
+        status: "timed_out",
+        endedAt: 200,
+        code: null,
+        stdout: "",
+        stderr: "",
+        timedOut: false,
+      }),
+    ]) {
+      const client = createLaneExecutionClient(cfg, {
+        authorization,
+        fetch: (async () =>
+          new Response(JSON.stringify({ execution }), { status: 200 })) as typeof fetch,
+      });
+      const result = await client.request({
+        action: "status",
+        executionId: "exec-00112233445566778899aabbccddeeff",
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.kind).toBe("invalid-response");
+    }
+  });
+
   it("never turns malformed success JSON into an execution result", async () => {
     for (const payload of [
       { execution: { ...runningExecution(), schema: "future.v2" } },
