@@ -624,71 +624,34 @@ function describeJob(job: LaneJob, now: number): string {
   // the caller follows walk-verdict rather than inferring "stuck" from historical duration.
   const usually = runningTimeToAnswer(job);
   if (usually !== null) head.push(usually);
-  // And what the running attempt has produced, so a caller can see a SILENT lane for what it is
-  // rather than reading `running` for nine minutes (`LaneActivity`).
+  // Also expose current output diagnostics for spawned attempts.
   const output = describeActivity(job, now);
   if (output !== null) head.push(output);
-  // ⚠ Only when there is something to say. Every ordinary job reaps cleanly, and a line on all of
-  // them would be noise that trains the reader to skip the one that matters. A SURVIVOR is the case
-  // `docs/backlog.md` measured — nothing short of a process enumeration finds those — so it is
-  // named here with the pid, beside the job id that owned it.
+  // Survivor reporting is exceptional; omit the line for ordinary successful cleanup.
   if (job.process?.survivors.length) {
     head.push(
       `owned processes STILL RUNNING after ${job.id} ended: ${job.process.survivors.join(", ")} ` +
         "(relay-started, not reaped)",
     );
   }
-  // ⚠ The lanes already tried belong HERE, not only on the final answer. A poll of a running walk
-  // has to say which lanes it has already spent — otherwise `dispatch_status` reports one lane
-  // name and the operator cannot tell a walk on its third lane from one that never moved.
+  // Running polls include settled attempts so a caller can see how far the walk has progressed.
   const walked = describeAttempts(job);
   return walked ? `${head.join("\n")}\n\n${walked}` : head.join("\n");
 }
 
-/**
- * What a caller is told when the walk tried every lane it had and none of them answered.
- *
- * ⚠ **This IS the last rung of the ladder.** The owner's request ends *"until finally reaching the
- * base agent's own subagents"*, and the relay cannot start the caller's subagent — it decides
- * ORDER, the host executes, which is the standing boundary this project keeps everywhere else. So
- * the final fallback is an ANSWER, and the text carries the whole instruction: what to do now, and
- * what NOT to do. Without the second half a caller retries `dispatch` for the same task, which is
- * the loop this feature exists to end.
- *
- * Pinned by `test/dispatch-lane-walk.test.ts` on its CLAIMS rather than its wording — reword it
- * freely, but change the assertion deliberately instead of deleting it. (This said
- * `test/mcp-server.test.ts` until an independent closeout audit caught it on 2026-09-08; the
- * assertions never lived there. A citation that sends the reader to the wrong file is the exact
- * failure the repository's cite-symbols-not-line-numbers rule exists to avoid.)
- */
+/** Final advice only when the walk actually tried every selectable lane and none answered. */
 export const LANE_LADDER_EXHAUSTED_ADVICE =
   "Every dispatch lane has now been tried for this task and none of them answered. "
   + "Do NOT call dispatch again for this task — it would pick the same lanes. "
   + "Do the work in this session instead, with your own subagent if you have one.";
 
-/**
- * What a caller is told when lanes REMAIN untried — the walk stopped at its own `maxLanes` bound.
- *
- * ⚠ This exists because the advice above was firing on a walk that had not exhausted anything
- * (found by adversarial review, 2026-09-06). Both of its sentences were then false: lanes remained,
- * and "it would pick the same lanes" is wrong precisely because the walk has just DEMOTED every
- * lane it tried, so the next dispatch reorders around them. Telling an autonomous caller to stop
- * delegating, on a false premise, abandons capacity that was never contacted.
- */
+/** Advice when selectable lanes remain untried, such as after a `maxLanes` cutoff. */
 export const LANE_LADDER_PARTIAL_ADVICE =
   "Lanes remain untried: this dispatch stopped at its maxLanes bound. Call dispatch again to "
   + "reach them — the lanes above are now demoted, so it will pick different ones — or do the "
   + "work in this session.";
 
-/**
- * What a caller is told when the walk STOPPED an idle lane and nothing answered after.
- *
- * ⚠ The stopped lane did not fail on its own: the walk stopped it because it showed no activity the
- * relay could see. So "every dispatch lane has now been tried" is false there, and would end the
- * caller's use of dispatch for a task the lane might still finish
- * (`docs/history/dispatch-giveup-diagnosis-2026-09-10.md` §5). A NAMED lane is never stopped for idleness,
- * so this names the call that lets it run to its own timeout.
- */
+/** Advice when the walk idle-stopped a lane; a forced retry can let it run to its own timeout. */
 export function laneStoppedAdvice(laneId: string): string {
   return (
     `The walk stopped lane "${laneId}" because it showed no activity for a while — it did not fail ` +
@@ -697,24 +660,12 @@ export function laneStoppedAdvice(laneId: string): string {
   );
 }
 
-/**
- * What a caller is told when it NAMED the lane or the model and that one lane did not answer. Only
- * that lane ran, so "every dispatch lane has now been tried" would be false — measured 2026-09-10 on
- * jobs 0023 and 0024, which each ran one forced lane and were told to stop delegating.
- */
+/** Advice when the caller forced one lane/model, so the rest of the ladder was intentionally untouched. */
 export const FORCED_LANE_ADVICE =
   "Only the lane you named was tried, and it did not answer. Call dispatch without lane or model to "
   + "let the walk try the other lanes, or do the work in this session.";
 
-/**
- * The advice that ends a reply in which no lane answered — the one place that chooses it, so a new
- * case cannot be handled in one renderer and missed in another.
- *
- * ⚠ Order matters: with the walk off, no advice at all (the documented byte-for-byte revert); a
- * forced lane next, because it ran alone on purpose; then a lane the walk stopped while it still
- * worked, because that lane is the likeliest to answer; then lanes left untried; and only when every
- * lane ran and failed on its own, the advice to stop delegating this task.
- */
+/** Choose terminal no-answer advice from walk scope, forced-target state, and settled attempts. */
 function terminalAdvice(job: LaneJob): string {
   if (job.walkEnabled !== true) return "";
   if (job.forcedLane === true) return `\n\n${FORCED_LANE_ADVICE}`;
@@ -724,14 +675,7 @@ function terminalAdvice(job: LaneJob): string {
   return `\n\n${LANE_LADDER_EXHAUSTED_ADVICE}`;
 }
 
-/**
- * Render the lanes a walk tried, oldest first, so both a poll and the final answer show what it
- * cost to get here.
- *
- * ⚠ Empty string for a walk that has tried nothing yet. A bare "lanes tried:" header with no lanes
- * under it reads as a walk that tried and found nothing, which is the opposite of the truth for a
- * walk still on its first lane — or for one the caller cancelled before any lane settled.
- */
+/** Render settled walk attempts; omit the section when nothing settled and no lanes were skipped. */
 function describeAttempts(job: LaneJob): string {
   if (job.attempts.length === 0 && !job.lanesNotTried) return "";
   const lines = job.attempts.map((a, i) => {
@@ -798,9 +742,7 @@ function jobAnswerBody(job: LaneJob, now: number): string {
     }${exhausted}`;
   }
   if (isContentEmpty(body)) {
-    // ⚠ Exit 0 (or HTTP 200) with content-empty output is a KNOWN lane failure mode (agy discards
-    // long answers; a free model sometimes answers a lone `#`), and it must not read as a
-    // successful empty answer. Say so rather than returning nothing.
+    // Content-empty output is a lane failure even when process/HTTP status says success.
     const tail = job.stderr.trim().slice(-1500);
     return `${header}\n\nThe lane returned NO output. Treat this as a lane failure and retry, or pick another lane.${
       tail ? `\n\nstderr tail:\n${tail}` : ""
@@ -2631,12 +2573,7 @@ export class McpDispatchServer {
     if (captured.adHoc) return;
     const job = this.jobs.get(jobId);
     if (!job) return;
-    // ⚠ A caller cancellation is never lane evidence. That guarantee used to come from narrowing
-    // the JOB's status through `isReportableJobStatus`; with a walk the job stays `running`
-    // BETWEEN lanes, so that test no longer describes the attempt being reported. The guarantee
-    // moved into the TYPE instead, where it is stronger: `DispatchLaneStatus` has no `cancelled`
-    // member, so no caller can pass one. This check remains for the walk's own race — a
-    // cancellation landing while an attempt was in flight.
+    // Cancellation is never lane evidence; keep the race guard even though the attempt type excludes it.
     if (job.status === "cancelled") return;
     const report: DispatchedTelemetryReport = {
       jobId: job.id,
@@ -2647,9 +2584,7 @@ export class McpDispatchServer {
       // The mode the lane RAN in, which keys its stats window. A `cli` lane asked for answer mode
       // spawns its harness exactly as in agent mode, so only a `relay` lane ever runs in answer mode.
       mode: captured.requestedMode === "answer" && captured.kind === "relay" ? "answer" : "agent",
-      // ⚠ THIS ATTEMPT's wall clock, not the walk's. The daemon's lane statistics and its routing
-      // memory are both per lane, so charging a third lane's answer with the two abandoned budgets
-      // ahead of it would make every late lane look slow.
+      // Lane telemetry records this attempt's duration, never the enclosing walk's duration.
       wallClockMs: Math.max(0, attempt.wallClockMs),
       exitCode: attempt.exitCode,
       status: attempt.status,
@@ -2725,14 +2660,7 @@ export class McpDispatchServer {
     }
 
     if (!response.ok) {
-      // ⚠ This READ HEADERS ON A FAILURE, which reverses the rule stated here until 2026-09-10, and
-      // the reversal is deliberate rather than an oversight. The old rule — status and a bounded
-      // body excerpt only — was written to keep a PROVIDER's arbitrary headers out of a
-      // relay-authored message. `readRelayAnnouncements` is a closed allow-list of five names the
-      // relay itself writes, so it carries none of that risk, and the measured cost of the rule was
-      // a failure the caller could not act on: `relay answered HTTP 504` names the LANE as the
-      // failure while the 504 came from the relay's OWN `/v1/messages`, and a pool exhaustion and a
-      // relay-side timeout call for opposite responses.
+      // Read only relay-owned announcement headers on failures; arbitrary upstream headers stay hidden.
       const bodyText = await response.text().catch(() => "");
       const relay = readRelayAnnouncements(response.headers);
       // The model this dispatch asked for is the one relay-side fact the caller already holds, so
