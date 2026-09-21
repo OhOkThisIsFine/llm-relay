@@ -1,0 +1,32 @@
+name: Resurvey original D5 dependencies
+
+on:
+  push:
+    branches: ["d5/resurvey-remaining"]
+
+permissions:
+  contents: read
+
+jobs:
+  outdated:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Recreate pre-D5 package state
+        shell: bash
+        run: |
+          mkdir old
+          git show be0805a9a4389bdb06113de14798ceb7e3cf31b0:package.json > old/package.json
+          git show be0805a9a4389bdb06113de14798ceb7e3cf31b0:package-lock.json > old/package-lock.json
+          cd old
+          npm ci --ignore-scripts
+      - name: Top-level outdated report
+        shell: bash
+        run: |
+          cd old
+          npm outdated --json --depth=0 || true
