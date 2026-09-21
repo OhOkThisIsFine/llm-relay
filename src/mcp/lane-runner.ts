@@ -315,6 +315,11 @@ export interface LaneJob {
   /** Set when the job's dispatch view came from a fallback rather than the live daemon. */
   dispatchSource?: "daemon" | "fallback";
   /**
+   * Who owns the currently-running agent process tree. Absent preserves the pre-D1/local shape for
+   * embeds and answer-mode jobs. `local-fallback` is explicit because it does NOT survive MCP exit.
+   */
+  executionOwner?: "relay-daemon" | "local-fallback";
+  /**
    * What this dispatcher started for this job, and what became of it — written once, when the job
    * reaches a terminal state. See `LaneProcessReport`.
    */
