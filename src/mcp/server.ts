@@ -667,6 +667,8 @@ function describeJob(job: LaneJob, now: number): string {
   if (job.error) head.push(`error: ${job.error}`);
   head.push(...relayProvenanceLines(job));
   if (job.dispatchSource === "fallback") head.push("dispatch-source: local-fallback (daemon unreachable)");
+  if (job.executionOwner === "relay-daemon") head.push("execution-owner: relay-daemon (survives MCP host restart)");
+  if (job.executionOwner === "local-fallback") head.push("execution-owner: local-fallback (does NOT survive MCP host restart)");
   if (job.restored === true) {
     head.push(
       job.status === "running"
