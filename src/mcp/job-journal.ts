@@ -108,6 +108,12 @@ export interface JobJournal {
   claimBrokerOrphan?(jobId: string): JournalRow | undefined;
   /** Remove a job that reached a terminal state, or one that never started. */
   clear(jobId: string): void;
+  /**
+   * Remove one startup orphan after its terminal adoption has been durably recorded.
+   * The removal is conditional on the exact row identity observed at startup, so it cannot erase
+   * a same-id row another process subsequently published.
+   */
+  clearOrphan?(row: JournalRow): void;
   /** Rows present at STARTUP whose owner is gone — i.e. jobs a previous process died holding. */
   orphans(): JournalRow[];
   /**
@@ -126,6 +132,7 @@ export const nullJobJournal: JobJournal = {
   noteBrokerExecution: () => {},
   claimBrokerOrphan: () => undefined,
   clear: () => {},
+  clearOrphan: () => {},
   orphans: () => [],
   foreign: () => undefined,
   foreignRows: () => [],
@@ -212,13 +219,16 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
   };
 
   /**
-   * Rewrite the file as: every row another live process owns, plus this journal's own rows.
+   * Rewrite the file as: every row this journal does NOT own, plus this journal's current rows.
    *
-   * The whole read/merge/rewrite now runs under the shared JSON transaction lock. The previous
-   * merge-before-write narrowed the race but could still have two processes read the same snapshot
-   * and overwrite each other's new row. Lock acquisition is the mutation order; this journal's
-   * rows win same-id conflicts for this mutation, and clear preserves a same-id row another live
-   * owner published after us.
+   * Foreign rows are preserved WITHOUT a liveness probe. An unrelated mutation must never double
+   * as garbage collection for another MCP process: a false-negative liveness read would erase a
+   * live job, and a genuinely dead owner's row is exactly the recovery evidence a replacement MCP
+   * process still needs. Dead-row cleanup happens only after explicit orphan adoption.
+   *
+   * The whole read/merge/rewrite runs under the shared JSON transaction lock. Lock acquisition is
+   * the mutation order; this journal's rows win same-id conflicts for this mutation, and clear
+   * preserves a same-id row another owner published after us.
    */
   const persist = (): void => {
     try {
@@ -228,7 +238,8 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
           const merged = new Map<string, JournalRow>();
           for (const value of diskFile?.jobs ?? []) {
             const row = readJournalRow(value);
-            if (row !== null && ownedElsewhere(row)) merged.set(row.jobId, row);
+            const ownedHere = row?.owner?.pid === pid && row.owner.instance === instance;
+            if (row !== null && !ownedHere) merged.set(row.jobId, row);
           }
           for (const row of rows.values()) merged.set(row.jobId, row);
           return { version: JOB_JOURNAL_VERSION, jobs: [...merged.values()] };
@@ -331,6 +342,33 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
       if (!rows.delete(jobId)) return;
       persist();
     },
+    clearOrphan(orphan) {
+      readOnce();
+      const startup = startupOrphans.find((row) => sameJournalRowIdentity(row, orphan));
+      if (startup === undefined) return;
+      try {
+        const committed = transactionalUpdateJsonSync<JournalFile>(
+          path,
+          (diskFile) => {
+            const kept: JournalRow[] = [];
+            for (const value of diskFile?.jobs ?? []) {
+              const row = readJournalRow(value);
+              if (row === null) continue;
+              if (sameJournalRowIdentity(row, startup)) continue;
+              kept.push(row);
+            }
+            return { version: JOB_JOURNAL_VERSION, jobs: kept };
+          },
+          { validator: isJournalFile, strict: true, lock: MCP_PERSISTENCE_LOCK },
+        );
+        if (committed) {
+          startupOrphans = startupOrphans.filter((row) => !sameJournalRowIdentity(row, startup));
+        }
+      } catch {
+        // Best-effort, like other journal mutations. A failed acknowledgement deliberately leaves
+        // the orphan row in place so a later process can recover it again.
+      }
+    },
     orphans() {
       readOnce();
       // A row this process wrote for a job it still holds is not an orphan; only rows that were
@@ -347,6 +385,23 @@ export function createJobJournal(path: string = jobJournalPath(), options: JobJo
       return (readDisk() ?? []).filter((row) => !rows.has(row.jobId) && ownedElsewhere(row));
     },
   };
+}
+
+function sameJournalRowIdentity(a: JournalRow, b: JournalRow): boolean {
+  const sameOwner =
+    a.owner === undefined && b.owner === undefined
+      ? true
+      : a.owner !== undefined &&
+        b.owner !== undefined &&
+        a.owner.pid === b.owner.pid &&
+        a.owner.instance === b.owner.instance;
+  return (
+    sameOwner &&
+    a.jobId === b.jobId &&
+    a.laneId === b.laneId &&
+    a.cwd === b.cwd &&
+    a.startedAt === b.startedAt
+  );
 }
 
 function isJournalFile(value: unknown): value is JournalFile {
