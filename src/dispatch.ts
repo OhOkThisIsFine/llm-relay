@@ -337,19 +337,7 @@ function normalizeTtl(ttlMs: unknown): number {
   return Math.min(MAX_EXHAUSTED_MS, Math.max(0, ttlMs));
 }
 
-/**
- * Clamp an ABSOLUTE cooldown deadline into the window this relay is willing to hold one for —
- * the sibling of `normalizeTtl` above, which does the same for a DURATION.
- *
- * Both write sites had their own copy: the persistence restore and the quota probe's
- * `markExhaustedKey`. They differed only in that the restore path had already rejected a past
- * deadline one line earlier, so its copy omitted the floor — which makes the floor a no-op there
- * and the two expressions the same rule (owner ruling 2026-09-06, the surviving half of SEM-06).
- *
- * ⚠ The ceiling is not cosmetic. The report route accepts a vendor-stated cooldown, and an
- * unclamped one parks a lane for longer than this relay will ever admit is reasonable; the floor
- * stops a deadline already in the past from being stored as a live cooldown.
- */
+/** Clamp an absolute cooldown deadline to the same bounded window used for duration-based cooldowns. */
 function clampExhaustedDeadline(untilMs: number, now: number): number {
   return Math.min(Math.max(now, untilMs), now + MAX_EXHAUSTED_MS);
 }
@@ -710,25 +698,8 @@ export function normalizeCliCommand(command: string, platform: NodeJS.Platform =
 }
 
 /**
- * Where the windowless-console launcher lives, if the operator has installed one.
- *
- * Not shipped by this package or by any of its installers (verified: no `lane-launch.ps1` exists
- * anywhere under this repository) — it is a hand-maintained artifact documented in CLAUDE.md's AGY
- * lane notes and `docs/agy-popup-fix-2026-09-07.md`. So absence is the ORDINARY case on a fresh
- * machine and on every non-Windows host, not a misconfiguration to warn about. Resolved through the
- * same config-kind XDG base every other operator-authored artifact under this directory uses
- * (`state-paths.ts`), so an XDG override on the config side moves this alongside `config.json`
- * itself — matching where every hand-authored `cli` ladder rung already points its own `-File`
- * argument. (`state-paths.ts` stays the one module naming the XDG variables directly, per
- * `test/state-paths.test.ts` — this reaches them only through `relayStatePath`.)
- *
- * Deliberately the ONE impure seam in this module (the `buildDispatch`/`platform` precedent): every
- * function below it stays pure over a caller-resolved `launcherPath: string | null`. ⚠ Guarded like
- * `winenv.ts`/`os-keyring.ts`/`lane-runner.ts`'s default spawner: under vitest, a caller that omits
- * `exists` gets `null` unconditionally rather than the real filesystem — a suite must never depend
- * on whether THIS machine happens to have the launcher installed (it does), which is exactly what
- * broke `routes/admin.ts` and `cli.ts`'s own call sites (neither injects a seam) before this guard
- * existed. A test that wants the real check injects `exists` itself, same as every seam above it.
+ * Resolve the optional operator-installed Windows windowless-console launcher. It is not shipped by
+ * llm-relay; absence is normal. Tests do not inspect the real filesystem unless they inject a seam.
  */
 export function resolveLaneLauncherPath(
   platform: NodeJS.Platform = process.platform,
@@ -757,25 +728,8 @@ function isAlreadyLaneLaunched(command: string, args: readonly string[]): boolea
 }
 
 /**
- * Wrap a lane invocation through the windowless-console launcher, so the console-subsystem process
- * this relay spawns — and every descendant IT spawns after it starts — cannot allocate a visible
- * console and steal the desktop's foreground the way `docs/agy-popup-fix-2026-09-07.md` measured.
- *
- * ⚠ The `execFile` call in `mcp/lane-runner.ts` — `windowsHide: true` — covers only the IMMEDIATE child;
- * that document's own finding is that a console-subsystem descendant spawned later — a detached
- * updater probe, an IDE-detection helper, a nested MCP client — is unaffected by a flag the
- * relay set on a process two generations up, and allocates its own new, VISIBLE console. That is
- * exactly the shape `routing.cliLane`'s transposition left open: every hand-authored `cli` ladder
- * rung already wraps itself with `pwsh -File lane-launch.ps1` in its own configured `command`/`args`,
- * but the SEPARATE `routing.cliLane` template — the fallback this module itself synthesizes when a
- * relay-kind rung must be reached by shelling out (see `transposeToCli`) — has no per-rung config
- * entry an operator would think to wrap the same way, so it never was. Applying the wrap HERE, once,
- * to whatever `toLane` ends up with covers both shapes uniformly: a ladder rung a future config adds
- * without remembering the convention, and every `routing.cliLane` transposition alike.
- *
- * `launcherPath` is null on every non-Windows host and on a Windows host with nothing installed
- * (`resolveLaneLauncherPath`), in which case this returns `invoke` UNCHANGED — byte-identical to
- * this fix's absence, so an operator who has not installed the launcher sees no behaviour change.
+ * Wrap an invocation with the optional Windows windowless-console launcher so descendants cannot
+ * allocate a visible console. Already-wrapped invocations and non-Windows platforms are unchanged.
  */
 function wrapForWindowsConsoleSafety(
   invoke: { command: string; args: string[] },
@@ -1083,22 +1037,14 @@ function toLane(
     }
   }
   if (rung.kind === "relay" && rung.spec && opts.requester === "mcp" && reachableWithoutRelay(rung.spec, cfg)) {
-    // ⚠ The MCP server runs lanes itself and has no `Agent` tool, so a PASS-THROUGH rung — one that
-    // forwards the caller's own Anthropic credential — can never run there. Agent mode had no
-    // command to run (its error said "no cliLane template configured", which was false), and
-    // answer mode posted the relay's placeholder key straight to Anthropic (HTTP 401). Measured
-    // 2026-09-10: 0 of 21 runs, and as the last lane its 0-second failure headed the reply of every
-    // walk that ran out of lanes. Unreachable, with the true reason; an explicit `lane` override
-    // still reaches it and shows this reason.
+    // MCP executes lanes itself and cannot run a pass-through rung that depends on the caller's
+    // native Anthropic credential. Keep it listed but mark it unreachable.
     lane.spec = rung.spec;
     lane.unreachable = mcpPassThroughReason(rung.spec);
   } else if (rung.kind === "relay" && rung.spec) {
     lane.spec = rung.spec;
-    // ⚠ This used to ask only `host === "bypassed"`, so a STATED `unknown` fell through with
-    // `routed` and a headless caller — a cron job, a CI step, `run-headless.ps1` — was handed a
-    // `target:` spec to address as a subagent it does not have; `--next-command` then refused
-    // with exit 2 and left it nothing to run. That is the closed-vocabulary defect class
-    // CLAUDE.md documents: an unhandled member falling through to the STRONGER claim.
+    // Only hosts explicitly able to address subagents receive a target spec; unknown/bypassed hosts
+    // use a runnable transposition when available.
     if (canAddressAsSubagent(host)) {
       lane.requiresDirective = !offloadRule(cfg, client).enabled;
     } else if (mustTransposeEveryRung(host) || !reachableWithoutRelay(rung.spec, cfg)) {
