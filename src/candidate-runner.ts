@@ -1426,21 +1426,8 @@ interface StatusVerdict {
 }
 
 /**
- * The statuses this relay has a specific opinion about — SEM-04 in the 2026-09-05 duplication
- * catalog, REFINE ("outcome-class table only") in the adversarial verification.
- *
- * `classifyStatus` and `carriesEligibilityFact` each carried their own membership list, and the
- * two lists were the same seven statuses written twice. They read this table now, so a status
- * cannot be retriable in one and eligibility-bearing in neither.
- *
- * ⚠ It is deliberately NOT the whole classification. HTTP status is an unbounded integer domain,
- * not a closed union, so the two RANGE rules — under 400, and 500 and above — stay in
- * `statusVerdict` below where a table cannot express them.
- *
- * ⚠ Membership here is policy. Do not add or move a row as part of a mechanical change; every
- * entry is a decision about failover, and `CLAUDE.md` records why 402 sits with the retriable
- * statuses rather than the client ones (on the free providers this proxy fronts it means
- * depleted credits, not a malformed request).
+ * Explicit HTTP-status policy shared by outcome classification and eligibility-fact parsing. Range
+ * rules for generic success/5xx statuses remain in `statusVerdict`.
  */
 export const STATUS_VERDICT_TABLE: Readonly<Record<number, StatusVerdict>> = Object.freeze({
   400: { outcome: "retriable", carriesEligibilityFact: true },
@@ -2002,14 +1989,8 @@ export function observeAttemptHeaders(
 }
 
 /**
- * Which provenances name a failure the RELAY authored — a mapping refusal, a dialect-rescue
- * destructive refusal, a malformed final wire the relay's own mapper produced. The breaker's
- * `PROVENANCE_REACHES_HEALTH_PATH` declines to charge exactly these, and the ledger must not blame
- * the provider for them either (contract review DR-003, 2026-09-04): until then a relay-authored
- * refusal carrying `failure: "http"` fell through an unconditional `return "provider_error"`.
- * A total table, never an `else` — a new provenance is a compile error here, not a silent
- * `provider_error`. `ProxyAccountingFailureKind` itself is declared ONCE, in `accounting-state.ts`;
- * this file used to carry a second identical declaration.
+ * Provenances authored by the relay rather than the provider. These must not be charged to provider
+ * health/accounting. Exhaustive over `OutcomeProvenance`.
  */
 const RELAY_AUTHORED_PROVENANCE = {
   "upstream": false,
@@ -2059,13 +2040,7 @@ export function completeAttemptSuccess(
   status: number,
 ): void {
   if (attempt.completed) return;
-  // A success retracts the CONDITIONS on this cell — but a fact filtered to a cost class is
-  // retracted only by a success INSIDE that class. Measured 2026-09-04: a success on a FREE Zen
-  // deployment retracted the accepted `subscription-required` fact filtered to `paid`, 837 min
-  // early, and re-admitted the paid SKUs it excluded. The class comes from the SAME resolver the
-  // walk orders by (`h.costClassOf`), so cost has one definition here rather than a fifth one
-  // re-derived per route; a caller with no resolver passes `undefined`, and a filtered fact then
-  // survives (a success of unknown class disproves nothing about a subset).
+  // Retract cost-class-scoped conditions only when the success is known to be in the same class.
   const costClass = h.costClassOf?.(attempt.resolvedAttempt);
   const completedAt = Date.now();
   const result = h.breaker.completeAttempt(attempt.handle, {
