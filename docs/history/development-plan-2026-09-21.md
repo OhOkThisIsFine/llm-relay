@@ -80,22 +80,18 @@ both status checks:
 The ruleset has no bypass actors and does not require the branch to be rebased to the latest
 `main` before merge.
 
-## Phase 3 — establish the next release checkpoint
+## Phase 3 — establish the next release checkpoint — completed 2026-09-21
 
-**Audit status — 2026-09-21:** the subsystem review and automated D1/D2/status re-verification are
-complete; see [`release-readiness-audit-2026-09-21.md`](release-readiness-audit-2026-09-21.md).
-The phase remains open until v0.86.0 is published. The tag-triggered publish workflow performs the
-clean packed-artifact install smoke immediately before `npm publish`.
+**Completed:** v0.86.0 was tagged at `9e30cac` and publish run 167 succeeded. The publish
+workflow verified that the tag is contained in `main`, matched `package.json`, built successfully,
+passed the clean packed-artifact install/asset smoke, passed `npm run check`, and completed
+`npm publish --access public`.
 
-**Release-gate follow-up:** Windows CI run 758 exposed a transient `EPERM` at the final atomic
-`rename(tmp, target)` after the transaction lock had already serialized the writer. The candidate
-now retries only transient Windows replacement errors for a bounded ~1 s without releasing the lock
-or unlinking the destination. Phase 3 cannot advance to tagging until both protected checks pass
-with that repair.
-
-The published package is v0.85.0, while `main` contains a large subsequent body of work including
-restart-safe daemon ownership, config hot reload, liveness/status changes, persistence changes,
-capability derivation and the D5 toolchain upgrades.
+The release gate itself found and forced repair of a transient Windows atomic replacement failure:
+`rename(tmp, target)` could return `EPERM` after the transaction lock had serialized the writer.
+The final source retries only transient Windows replacement errors for a bounded interval while
+retaining the same temp file and lock; PR #66 and post-merge main CI both passed
+`windows-process-boundary` and `check`.
 
 Do not begin hard-cap continuation before this delta has a stable release boundary.
 
@@ -230,7 +226,7 @@ tested. Unsupported harnesses keep the current timeout semantics.
 |---|---|---|---|
 | 1 | Persistence-concurrency investigation/fix | source correctness | **complete** |
 | 2 | Required CI checks on `main` | repository admin | **complete** |
-| 3 | Release-readiness audit and release | verification/release | current architecture published |
+| 3 | Release-readiness audit and release | verification/release | **complete — v0.86.0 published** |
 | 4 | M1 and live/vendor/operator blockers | evidence/operations | close as inputs become available |
 | 5 | Continuation harness survey | design/evidence | exact-resume matrix exists |
 | 6 | Continuation substrate | source | no behavior change, gate green |
