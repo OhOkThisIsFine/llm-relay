@@ -182,6 +182,40 @@ describe("cross-process MCP persistence", () => {
     }
   });
 
+  it("explicit orphan acknowledgement removes the exact adopted dead row", () => {
+    const { dir, cleanup } = tempDir();
+    try {
+      const path = join(dir, "mcp-jobs.json");
+      createJobJournal(path, { pid: 111_111, isAlive: () => false }).note({
+        jobId: "job-dead",
+        laneId: "lane-dead",
+        cwd: "C:/tree",
+        startedAt: 1,
+      });
+      createJobJournal(path, { pid: 333_333, isAlive: () => true }).note({
+        jobId: "job-live",
+        laneId: "lane-live",
+        cwd: "C:/tree",
+        startedAt: 2,
+      });
+
+      const replacement = createJobJournal(path, {
+        pid: 222_222,
+        isAlive: (pid) => pid === 333_333,
+      });
+      const orphan = replacement.orphans().find((row) => row.jobId === "job-dead");
+      expect(orphan).toBeDefined();
+      replacement.clearOrphan?.(orphan!);
+
+      const stored = JSON.parse(readFileSync(path, "utf8")) as {
+        jobs: Array<{ jobId: string }>;
+      };
+      expect(stored.jobs.map((row) => row.jobId)).toEqual(["job-live"]);
+    } finally {
+      cleanup();
+    }
+  });
+
   it("orphan acknowledgement cannot erase a same-id row republished by another owner", () => {
     const { dir, cleanup } = tempDir();
     try {
