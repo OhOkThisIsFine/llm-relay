@@ -1865,6 +1865,11 @@ export class McpDispatchServer {
    * temporarily unreachable. Never converts transport failure or malformed success JSON into death.
    */
   private async refreshBrokerJob(jobId: string): Promise<boolean> {
+    const job = this.jobs.get(jobId);
+    // Fresh broker attempts are owned by runWalk's watcher. Only a restart-adopted job may be
+    // terminalized directly from a status snapshot; otherwise a failed first lane could bypass the
+    // remaining walk simply because the caller polled at the wrong instant.
+    if (job !== undefined && job.restored !== true) return false;
     const executionId = this.jobs.brokerExecution(jobId);
     if (executionId === undefined) return false;
 
