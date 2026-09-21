@@ -171,6 +171,25 @@ describe("D1 fresh-dispatch ownership switchover", () => {
     });
   });
 
+  it("falls back safely when an older daemon returns a generic route 404", async () => {
+    const h = new BrokerHarness((request) => {
+      expect(request.action).toBe("status");
+      return {
+        ok: false,
+        kind: "rejected",
+        status: 404,
+        message: "POST /mcp/lane-execution is not a route",
+      };
+    });
+
+    const result = await h.tool("dispatch", { task: "do the work" });
+    expect(result.isError).toBe(false);
+    expect(result.text).toContain("local answer");
+    expect(result.text).toContain("execution-owner: local-fallback");
+    expect(h.localCalls).toHaveLength(1);
+    expect(h.requests.every((request) => request.action !== "start")).toBe(true);
+  });
+
   it("falls back locally only when broker preflight fails before any start request", async () => {
     const h = new BrokerHarness((request) => {
       expect(request.action).toBe("status");
