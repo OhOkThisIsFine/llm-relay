@@ -25,6 +25,7 @@ import { buildLaneEnv } from "../lane-launch-env.js";
 export { buildLaneEnv, laneCredentialEnvNames } from "../lane-launch-env.js";
 import {
   createLaneActivityTag,
+  LANE_ACTIVITY_HEADER,
   withLaneActivityHeader,
 } from "../lane-activity.js";
 import { DEFAULT_MCP_BLOCKING_WAIT_MS, DEFAULT_MCP_MAX_WAIT_MS, EFFORT_LEVELS, type EffortLevel } from "../config-types.js";
