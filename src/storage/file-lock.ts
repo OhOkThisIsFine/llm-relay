@@ -11,6 +11,11 @@ export interface FileLockOptions {
   readonly timeoutMs?: number | undefined;
   /** Process-liveness seam used by tests; defaults to process.kill(pid, 0). */
   readonly isAlive?: ((pid: number) => boolean) | undefined;
+  /**
+   * Test/instrumentation seam invoked after a rename reports contention and before the stable lock
+   * path is inspected. Production callers leave this unset.
+   */
+  readonly onContention?: (() => void) | undefined;
 }
 
 interface LockOwner {
@@ -136,9 +141,21 @@ export function withFileLockSync<T>(
         break;
       } catch (err) {
         // POSIX commonly reports ENOTEMPTY and Windows commonly reports EEXIST/EPERM when the
-        // destination directory already exists. The filesystem state, not that platform-specific
-        // spelling, decides whether this was ordinary contention.
-        if (!existsSync(lockPath)) throw err;
+        // destination directory already exists. The holder may release the lock between this
+        // failed rename and our inspection below. That is ordinary contention, not a transaction
+        // failure: retry instead of propagating the stale rename error.
+        options.onContention?.();
+        const code = errorCode(err);
+        const contentionError =
+          code === "EEXIST" || code === "ENOTEMPTY" || code === "EPERM" || code === "EACCES";
+        if (!existsSync(lockPath)) {
+          if (!contentionError) throw err;
+          if (Date.now() - startedAt >= timeoutMs) {
+            throw new Error(`Timed out acquiring file lock for ${targetPath}`);
+          }
+          sleepSync(retryMs);
+          continue;
+        }
 
         const observed = readOwner(lockPath);
         if (observed !== null && reclaimDeadLock(lockPath, observed, isAlive)) continue;
