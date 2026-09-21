@@ -153,6 +153,74 @@ describe("cross-process MCP persistence", () => {
     }
   });
 
+  it("an unrelated write preserves a foreign row even when liveness says its owner is dead", () => {
+    const { dir, cleanup } = tempDir();
+    try {
+      const path = join(dir, "mcp-jobs.json");
+      createJobJournal(path, { pid: 111_111, isAlive: () => true }).note({
+        jobId: "job-foreign",
+        laneId: "lane-foreign",
+        cwd: "C:/tree",
+        startedAt: 1,
+      });
+
+      createJobJournal(path, { pid: 222_222, isAlive: () => false }).note({
+        jobId: "job-local",
+        laneId: "lane-local",
+        cwd: "C:/tree",
+        startedAt: 2,
+      });
+
+      const stored = JSON.parse(readFileSync(path, "utf8")) as {
+        jobs: Array<{ jobId: string }>;
+      };
+      expect(new Set(stored.jobs.map((row) => row.jobId))).toEqual(
+        new Set(["job-foreign", "job-local"]),
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("orphan acknowledgement cannot erase a same-id row republished by another owner", () => {
+    const { dir, cleanup } = tempDir();
+    try {
+      const path = join(dir, "mcp-jobs.json");
+      createJobJournal(path, { pid: 111_111, isAlive: () => false }).note({
+        jobId: "job-reused",
+        laneId: "lane-old",
+        cwd: "C:/tree",
+        startedAt: 1,
+      });
+
+      const replacement = createJobJournal(path, { pid: 222_222, isAlive: () => false });
+      const orphan = replacement.orphans().find((row) => row.jobId === "job-reused");
+      expect(orphan).toBeDefined();
+
+      createJobJournal(path, { pid: 333_333, isAlive: () => true }).note({
+        jobId: "job-reused",
+        laneId: "lane-new",
+        cwd: "C:/tree",
+        startedAt: 2,
+      });
+
+      replacement.clearOrphan?.(orphan!);
+
+      const stored = JSON.parse(readFileSync(path, "utf8")) as {
+        jobs: Array<{ jobId: string; laneId: string; startedAt: number; owner?: { pid: number } }>;
+      };
+      expect(stored.jobs).toHaveLength(1);
+      expect(stored.jobs[0]).toMatchObject({
+        jobId: "job-reused",
+        laneId: "lane-new",
+        startedAt: 2,
+        owner: { pid: 333_333 },
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
   it("waits through contention longer than the generic 5s lock budget instead of losing a journal row", async () => {
     const { dir, cleanup } = tempDir();
     const workers: Worker[] = [];
@@ -359,6 +427,68 @@ describe("cross-process MCP persistence", () => {
     } finally {
       cleanup();
     }
+  });
+
+  it("archives a killed startup orphan before acknowledging its journal row", () => {
+    const calls: string[] = [];
+    const orphan = {
+      jobId: "job-orphan",
+      laneId: "lane",
+      cwd: "C:/tree",
+      startedAt: 1,
+    };
+    const journal: JobJournal = {
+      note: () => {},
+      clear: () => {},
+      clearOrphan: () => calls.push("clear-orphan"),
+      orphans: () => [orphan],
+      foreign: () => undefined,
+      foreignRows: () => [],
+    };
+    const archive: JobArchive = {
+      record: () => {
+        calls.push("archive");
+        return true;
+      },
+      restore: () => ({ jobs: [], lastSeq: 0 }),
+      flush: () => {},
+      lookup: () => undefined,
+      all: () => [],
+    };
+
+    new LaneJobStore(journal, archive, () => "unused");
+    expect(calls).toEqual(["archive", "clear-orphan"]);
+  });
+
+  it("leaves a startup orphan journaled when its killed report cannot be archived", () => {
+    const calls: string[] = [];
+    const orphan = {
+      jobId: "job-orphan",
+      laneId: "lane",
+      cwd: "C:/tree",
+      startedAt: 1,
+    };
+    const journal: JobJournal = {
+      note: () => {},
+      clear: () => {},
+      clearOrphan: () => calls.push("clear-orphan"),
+      orphans: () => [orphan],
+      foreign: () => undefined,
+      foreignRows: () => [],
+    };
+    const archive: JobArchive = {
+      record: () => {
+        calls.push("archive-failed");
+        return false;
+      },
+      restore: () => ({ jobs: [], lastSeq: 0 }),
+      flush: () => {},
+      lookup: () => undefined,
+      all: () => [],
+    };
+
+    new LaneJobStore(journal, archive, () => "unused");
+    expect(calls).toEqual(["archive-failed"]);
   });
 
   it("archives a terminal job before clearing its running journal row", () => {
