@@ -1,4 +1,4 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { createJobArchive } from "../../src/mcp/job-archive.js";
 import { createJobJournal } from "../../src/mcp/job-journal.js";
 import type { LaneJob } from "../../src/mcp/lane-runner.js";
