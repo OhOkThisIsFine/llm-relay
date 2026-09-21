@@ -111,10 +111,16 @@ Entry point for any agent picking up llm-relay, on any provider. Read this befor
   and Windows gates pass. The dashboard shrank to 388,654 raw bytes; package measurement is
   1,208,601 packed bytes, 5,966,259 unpacked bytes, and 460 entries, all within the existing
   ceilings.
-- **Immediate next in D5.** Upgrade jsdom 26 → 30 alone and run the full gate before touching
-  Tailwind 4 or TypeScript 7. M1 remains blocked on a first-party AGY success envelope.
-  Separately open: repository CI enforcement, Route B's vendor blocker, and the owner-driven
-  Codex/Code-tab checks.
+- **D5-c jsdom 30 is green.** jsdom moved from `^26.1.0` to `^30.1.0`. The repo
+  uses it only as the dashboard Vitest DOM environment, not through direct API imports. Its newer
+  Node floor is satisfied by CI's Node 22.23.2 without changing the product runtime engine.
+  All 4,490 core tests and 46 dashboard tests pass, including focus/accessibility coverage; Windows
+  process-boundary and packed-dashboard smoke also pass. Dashboard output is byte-identical to
+  D5-b; package measurement is 1,208,600 packed bytes, 5,966,259 unpacked bytes, and 460 entries.
+- **Immediate next in D5.** Upgrade Tailwind 3 → 4 as its own migration lap. Keep TypeScript 7
+  separate because it is also a runtime dependency of `delegate-gate`. M1 remains blocked on a
+  first-party AGY success envelope. Separately open: repository CI enforcement, Route B's vendor
+  blocker, and the owner-driven Codex/Code-tab checks.
 
 ### 0.1 Prior lap (2026-09-17, v0.82.2)
 
