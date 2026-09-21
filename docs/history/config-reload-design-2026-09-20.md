@@ -6,6 +6,11 @@ Add an admitted `POST /reload` that re-runs the same config load policy the daem
 
 This is D2 from `stabilization-plan-2026-09-17.md`.
 
+**Implementation status:** implemented end to end on 2026-09-20. `src/config-reload.ts` owns
+the pure transaction; `POST /reload` is the admitted server surface; `llm-relay reload` is the
+control client; and `test/config-reload-process.test.ts` proves one real daemon PID serves the
+accepted value B and retains B after a later restart-only candidate is refused.
+
 ## Required properties
 
 1. `POST /reload` is a control route: exact listener Host, exact Origin when present, `content-type: application/json`, and the existing control capability are required.
@@ -16,7 +21,7 @@ This is D2 from `stabilization-plan-2026-09-17.md`.
 6. Existing in-flight requests keep the targets/options they already resolved. New requests see the committed config.
 7. A successful reload replaces the recorded source mtime and warnings, so `configStaleness()` immediately returns current and a later edit can be reported once again.
 8. Dynamic pools are materialized on the candidate before commit and warmed again after commit. A reload never exposes the unmaterialized intermediate routing state.
-9. The response and logs contain paths/status only, never credential values, task text, or config contents.
+9. Restart-refusal/error output contains paths/status only, never credential values, task text, or a serialized candidate. A successful response may carry the validated `loadConfig` warning strings that startup already exposes.
 
 ## Ownership model
 
@@ -38,7 +43,7 @@ Other objects snapshot config during `createProxy` and therefore make their inpu
 - `destructiveMatcher` snapshots `repair.destructiveTools`.
 - `StickySessionManager` snapshots sticky enablement/TTL/capacity and owns live pin state.
 - hedge settings and max-in-flight are resolved once.
-- latency/probation/pacing currently receive settings snapshots; D2 must change those server-side dependencies to read the current `cfg.routing.*` value on each evaluation before those fields are declared reloadable.
+- latency/probation/pacing formerly received settings snapshots; D2 now injects getter properties backed by the live `cfg.routing.*` values, and each evaluator reads its dependency object on every evaluation.
 
 The listener socket itself owns `host`/`port`.
 
@@ -74,11 +79,11 @@ Provider names are an identity boundary for catalog, breaker, probe, and account
 | `stallTimeoutMs` | reloadable | copied into newly resolved targets |
 | `firstByteTimeoutMs` | reloadable | copied into newly resolved targets |
 | `maxConcurrent` | reloadable | request admission/evidence reads current provider config |
-| `limits` (including credential/model hard limits) | reloadable | quota/pacing/hard-cap evaluators read current `cfg` |
+| `limits` (provider/model and each unchanged credential slot's nested limits) | reloadable | quota/pacing/hard-cap evaluators read current `cfg` |
 | `base` | restart-only | changing provider identity under the same cache/breaker/catalog key can attach old evidence to a different backend |
 | `kind` | restart-only | changes protocol and catalog semantics under existing provider-keyed state |
 | `authEnv` | restart-only in D2 | credential identity/config is shared with catalog/probe state; reload support can be designed separately |
-| `credentials` | restart-only in D2 | same reason as `authEnv` |
+| `credentials` identity | restart-only in D2 | label/authEnv/enabled/model scope identify the slot; when that identity is unchanged, only the nested `limits` policy may reload |
 | `credentialMode` | restart-only in D2 | part of provider/credential identity policy |
 | `authHeader` | restart-only in D2 | part of provider authentication shape |
 | `tierType` | restart-only in D2 | affects cost classification and dynamic discovery membership; changing it requires a catalog/state reconciliation design |
@@ -239,21 +244,26 @@ Start the real daemon on an isolated config and control token:
 
 ## Implementation packets
 
-### D2-a — reload transaction module
+### D2-a — DONE — reload transaction module
 
-Add the reload matrix, diff, prepare/apply helpers, and unit tests. No route yet.
+`src/config-reload.ts` implements the restart-path diff and synchronous in-place apply transaction,
+with focused unit coverage.
 
-### D2-b — live routing settings
+### D2-b — DONE — live routing settings
 
-Make latency/probation/pacing read their settings from current `cfg` rather than startup snapshots. Pin with focused tests. Hedge/sticky remain restart-only.
+Latency/probation/pacing receive live getters backed by current `cfg`; hedge/sticky remain
+restart-only.
 
-### D2-c — admitted route
+### D2-c — DONE — admitted route
 
-Add `POST /reload` to `CONTROL_ROUTES`, inject the loader and catalog-backed prepare step, reset staleness state, and add route/integration tests.
+`POST /reload` is in `CONTROL_ROUTES`; the daemon injects its startup-equivalent loader,
+materializes dynamic pools before commit, resets staleness after success, and fails closed for
+invalid/restart-only candidates.
 
-### D2-d — CLI and docs
+### D2-d — DONE — CLI, docs and process proof
 
-Add `llm-relay reload`, update the staleness notice/reference/help/HANDOFF/backlog, and run the process-level proof plus full gate.
+`llm-relay reload` uses the installed control capability, the stale-config notice points at it,
+and the real-process regression proves accepted reload plus atomic restart-only refusal.
 
 ## Non-goals
 
