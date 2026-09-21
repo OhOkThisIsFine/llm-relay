@@ -229,6 +229,12 @@ export type ConfigReloadApplyResult =
   | { ok: true; changed: string[] }
   | { ok: false; requiresRestart: string[] };
 
+/** Result returned by the daemon's injected reload transaction to the HTTP adapter. */
+export type ConfigReloadAttemptResult =
+  | { ok: true; changed: string[]; warnings: string[] }
+  | { ok: false; status: 400; message: string }
+  | { ok: false; status: 409; message: string; requiresRestart: string[] };
+
 /**
  * Atomically apply a normalized candidate to the existing Config identity.
  *
