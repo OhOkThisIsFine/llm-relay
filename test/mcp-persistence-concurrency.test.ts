@@ -110,6 +110,33 @@ describe("cross-process MCP persistence", () => {
     }
   });
 
+  it("never treats an existing unreadable transaction source as an empty file", () => {
+    const { dir, cleanup } = tempDir();
+    try {
+      const path = join(dir, "rows.json");
+      writeFileSync(path, "{ definitely not valid json");
+
+      expect(() =>
+        transactionalUpdateJsonSync<{ version: 1; rows: string[] }>(
+          path,
+          (current) => ({ version: 1, rows: [...(current?.rows ?? []), "replacement"] }),
+          {
+            strict: true,
+            validator: (value): value is { version: 1; rows: string[] } =>
+              typeof value === "object" &&
+              value !== null &&
+              (value as { version?: unknown }).version === 1 &&
+              Array.isArray((value as { rows?: unknown }).rows),
+          },
+        ),
+      ).toThrow();
+
+      expect(readFileSync(path, "utf8")).toBe("{ definitely not valid json");
+    } finally {
+      cleanup();
+    }
+  });
+
   it("preserves every distinct journal and archive row from real concurrent MCP processes", async () => {
     const { dir, cleanup } = tempDir();
     const workers: Worker[] = [];
