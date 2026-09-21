@@ -82,6 +82,11 @@ The ruleset has no bypass actors and does not require the branch to be rebased t
 
 ## Phase 3 — establish the next release checkpoint
 
+**Audit status — 2026-09-21:** the subsystem review and automated D1/D2/status re-verification are
+complete; see [`release-readiness-audit-2026-09-21.md`](release-readiness-audit-2026-09-21.md).
+The phase remains open until v0.86.0 is published. The tag-triggered publish workflow performs the
+clean packed-artifact install smoke immediately before `npm publish`.
+
 The published package is v0.85.0, while `main` contains a large subsequent body of work including
 restart-safe daemon ownership, config hot reload, liveness/status changes, persistence changes,
 capability derivation and the D5 toolchain upgrades.
