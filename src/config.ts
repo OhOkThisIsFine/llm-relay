@@ -1063,7 +1063,7 @@ export interface ConfigStalenessReport {
  * so every surface says exactly the same thing rather than each hand-copying its own wording.
  */
 export const CONFIG_STALENESS_NOTICE =
-  "config changed on disk since the relay loaded it — restart required (llm-relay stop, then start)";
+  'config changed on disk since the relay loaded it — run "llm-relay reload"; a restart is required if the changed fields are not reloadable';
 
 /**
  * Does the config file on disk still match what this process loaded? Pure over its inputs aside
