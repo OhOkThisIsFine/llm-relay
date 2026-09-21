@@ -212,20 +212,25 @@ relay starts, so a restart does not send it back into a wall it already knows. E
 re-learnable, so the file is cache-kind and safe to delete. Written on a short debounce (at most
 two seconds behind) and flushed on a graceful shutdown; a hard kill can lose that last window.
 
-**The relay does not hot-reload `config.json`.** An edit takes effect only on the next start, and
-the relay says so rather than leaving you to wonder why nothing changed: `GET /telemetry` carries
-`version` with the package version loaded by that daemon, plus
-`config: { path, loadedAt, changedOnDisk, diskMtime }`, comparing the file's mtime when this
-process loaded it against its mtime right now. When a config-reading command talks to a running
-relay (`routing show|get`, `config show|get`, `offload status`), it compares that running version
-with the installed package and prints
+**The relay can hot-reload the config fields whose runtime owners already read the live
+`Config` identity.** After editing `config.json`, run `llm-relay reload`. The command calls the
+control-token-admitted `POST /reload`, re-runs the daemon's original `loadConfig` policy with the
+same startup CLI overrides, and applies the accepted candidate atomically. Routing/pool policy,
+provider timeout/concurrency/limit policy, credential nested `limits`, validation/reshaper policy,
+and request-time budgets are reloadable. Listener host/port, logger policy, destructive-tool
+matching, provider/credential identity and wire/auth shape, sticky/hedge policy, `dispatchWalk`,
+and `routing.mcp` require a restart. If any restart-only field changed, the server returns 409 with
+only the field paths and applies **none** of the otherwise reloadable changes.
+
+`GET /telemetry` still carries `version` plus
+`config: { path, loadedAt, changedOnDisk, diskMtime }`. When a config-reading command talks to a
+running relay (`routing show|get`, `config show|get`, `offload status`), it compares that running
+version with the installed package and prints
 `the running relay is v<x>; the installed package is v<y> — restart the relay to load it` on stderr
-when they differ. When the relay reports `changedOnDisk: true`, the command also prints the config notice —
-`config changed on disk since the relay loaded it — restart required (llm-relay stop, then start)`
-— while its own stdout output is unaffected. The daemon
-also logs the same fact once to its own log/stderr, the first time `GET /telemetry` observes the
-change, so an operator watching the log sees it without running a command. Restart with
-`llm-relay stop` (see [CLI reference](#cli-reference)) followed by starting the relay again.
+when they differ. When the relay reports `changedOnDisk: true`, the command prints
+`config changed on disk since the relay loaded it — run "llm-relay reload"; a restart is required if the changed fields are not reloadable`.
+A successful reload replaces the daemon's loaded mtime, so telemetry immediately returns to
+`changedOnDisk: false`. The daemon logs a later disk change once again.
 
 ### Where state actually lives
 
@@ -2395,11 +2400,14 @@ and `keys` diagnostics have always refused to echo argv for that reason.
 | `llm-relay candidates [-p <name>]` | Compare deployment × credential-slot targets |
 | `llm-relay eligibility [<propose\|accept\|reject> ...]` | Review or record backend eligibility refusals; `reject` records that no durable fact should be learned |
 | `llm-relay dispatch [lane] [options]` | Choose the next dispatch lane |
+| `llm-relay reload` | Atomically apply reload-safe config changes through admitted `POST /reload`; exits 1 and names restart-only field paths when a restart is required |
 | `llm-relay stop` | Stop the running relay through the admitted `POST /stop` (requires the control token); runs the same shutdown path as a console `SIGTERM` |
 | `llm-relay help` / `llm-relay version` | Help / version |
 
-Config editors validate the complete JSON before writing and need a proxy restart; the offload
-toggle, cooldown clear, and dispatch queries talk to a running proxy and apply immediately.
+Config editors validate the complete JSON before writing. Run `llm-relay reload` afterward to
+apply the reload-safe subset without replacing the daemon; a 409 names fields that still require a
+restart. The offload toggle, cooldown clear, and dispatch queries already talk to the running proxy
+and apply immediately.
 
 ```bash
 llm-relay pools set medium nim/z-ai/glm-5.2 openrouter/openai/gpt-5.2-codex
