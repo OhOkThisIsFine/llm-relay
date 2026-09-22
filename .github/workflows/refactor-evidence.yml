@@ -1,0 +1,57 @@
+name: Refactor evidence
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'scripts/refactor/**'
+      - '.github/workflows/refactor-evidence.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refactor-evidence-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  runtime-baseline:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build:server
+      - name: Isolated runtime measurements
+        run: node scripts/refactor/runtime-baseline.mjs
+
+  dependency-contracts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.13.0
+      - name: SQLite contract and journal comparison at proposed runtime floor
+        run: node scripts/refactor/sqlite-probe.mjs
+      - name: Clean isolated SDK and schema installation
+        run: npm install --prefix scripts/refactor/sdk-probe --ignore-scripts --no-audit --no-fund
+      - name: MCP wire and schema contracts
+        run: node scripts/refactor/sdk-probe/probe.mjs
