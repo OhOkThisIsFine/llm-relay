@@ -273,12 +273,16 @@ async function probe(candidate) {
         test.release = () => { if (!res.destroyed) res.end(wire(protocol, events.slice(cut))); };
       } else {
         // Deliberately fragment a UTF-8 sequence and a JSON/SSE frame at the transport boundary.
-        const bytes = Buffer.from(wire(protocol, events)); const offset = bytes.indexOf(Buffer.from('π')) + 1;
-        assert(offset > 0); res.write(bytes.subarray(0, offset)); await delay(1); res.end(bytes.subarray(offset));
+        const bytes = Buffer.from(wire(protocol, events));
+        if (test.fragmented === false) res.end(bytes);
+        else {
+          const offset = bytes.indexOf(Buffer.from('π')) + 1;
+          assert(offset > 0); res.write(bytes.subarray(0, offset)); await delay(1); res.end(bytes.subarray(offset));
+        }
       }
     } catch (error) { test.infrastructureError = String(error); if (!res.destroyed) res.destroy(); }
   });
-  const report = { version: 1, candidate, node: process.version, platform: process.platform, scope: 'synthetic fidelity screen; not full R1 acceptance', identity: null, results: [] };
+  const report = { version: 2, candidate, node: process.version, platform: process.platform, scope: 'synthetic fidelity screen; not full R1 acceptance', identity: null, results: [] };
   try {
     const upstreamBase = await listen(upstream);
     gateway = await startCandidate(candidate, upstreamBase, dir); report.identity = gateway.identity;
@@ -290,18 +294,26 @@ async function probe(candidate) {
     };
     const check = async (name, test, action) => {
       active = { calls: [], ...test };
-      try { await action(active); assert.equal(active.infrastructureError, undefined); report.results.push({ name, passed: true, egresses: active.calls.length }); }
-      catch (error) { report.results.push({ name, passed: false, egresses: active.calls.length, error: String(error).slice(0, 1600), infrastructureError: active.infrastructureError }); }
+      const details = () => ({ egresses: active.calls.length,
+        upstream: active.calls.map((call) => ({ protocol: call.protocol, stream: call.body.stream === true })),
+        ...(active.observed ? { observed: active.observed } : {}),
+      });
+      try { await action(active); assert.equal(active.infrastructureError, undefined); report.results.push({ name, passed: true, ...details() }); }
+      catch (error) { report.results.push({ name, passed: false, ...details(), error: String(error).slice(0, 1600), infrastructureError: active.infrastructureError }); }
       finally { active.release?.(); active = undefined; }
     };
     for (const provider of Object.keys(MODEL)) for (const front of Object.keys(FRONT_PATH)) {
-      for (const stream of [false, true]) await check(`${front} -> ${provider}: ${stream ? 'streamed' : 'buffered'} tool cycle`, {}, async (test) => {
+      for (const [stream, fragmented] of [[false, false], [true, false], [true, true]]) await check(`${front} -> ${provider}: ${stream ? (fragmented ? 'fragmented stream' : 'whole stream') : 'buffered'} tool cycle`, { fragmented }, async (test) => {
         const response = await post(front, requestBody(front, model(provider), stream)); const text = await boundedText(response);
-        assert.equal(response.status, 200, text.slice(0, 1000)); assert.equal(test.calls.length, 1);
+        test.observed = { status: response.status, servedBy: response.headers.get('x-llm-relay-served-by'), attempts: response.headers.get('x-llm-relay-pool-attempts') };
+        assert.equal(response.status, 200, text.slice(0, 1000));
         const call = test.calls[0]; assertHistory(call.protocol, call.body);
         assert(!JSON.stringify(call.headers).includes('fixture-caller-key'), 'Caller credential leaked');
         assert(JSON.stringify(call.headers).includes(KEY), 'Configured credential was not used');
-        assertTools(stream ? toolsFromStream(front, parseSse(text)) : toolsFromBody(front, JSON.parse(text)));
+        const tools = stream ? toolsFromStream(front, parseSse(text)) : toolsFromBody(front, JSON.parse(text));
+        test.observed.toolIdentityPreserved = JSON.stringify(tools) === JSON.stringify([{ id: NEXT, name: TOOL, args: ARGS }]);
+        assertTools(tools);
+        assert.equal(test.calls.length, 1, 'Valid fixture must not trigger another egress');
         if (stream) {
           const events = parseSse(text);
           const terminal = front === 'chat' ? events.filter((e) => e === '[DONE]') : events.filter((e) => e.type === (front === 'messages' ? 'message_stop' : 'response.completed'));
@@ -329,12 +341,18 @@ async function probe(candidate) {
       });
     }
     for (const [front, provider] of [['messages', 'anthropic'], ['chat', 'openai']]) {
-      await check(`${front}: native opaque fields and cache usage`, { opaque: true }, async (test) => {
-        const body = requestBody(front, model(provider)); body.vendor_extension = OPAQUE;
+      for (const property of ['opaque request', 'opaque response', 'identity and cache usage']) await check(`${front}: native ${property}`, { opaque: property === 'opaque response' }, async (test) => {
+        const body = requestBody(front, model(provider)); if (property === 'opaque request') body.vendor_extension = OPAQUE;
         const response = await post(front, body); const text = await boundedText(response); assert.equal(response.status, 200, text.slice(0, 1000));
         const reply = JSON.parse(text); assert.equal(test.calls.length, 1); assert.equal(test.calls[0].protocol, front);
-        assert.deepEqual(test.calls[0].body.vendor_extension, OPAQUE); assert.deepEqual(reply.vendor_extension, OPAQUE);
-        const original = responseBody(front); assert.equal(reply.id, original.id); assert.deepEqual(reply.usage, original.usage); assertTools(toolsFromBody(front, reply));
+        if (property === 'opaque request') assert.deepEqual(test.calls[0].body.vendor_extension, OPAQUE, 'Native request extension must reach upstream');
+        else if (property === 'opaque response') assert.deepEqual(reply.vendor_extension, OPAQUE, 'Native response extension must reach client');
+        else {
+          const original = responseBody(front); assert.equal(reply.id, original.id, 'Native response identity must be preserved');
+          // Compare provided usage fields; a gateway may add further honest breakdown fields.
+          for (const [key, value] of Object.entries(original.usage)) assert.deepEqual(reply.usage?.[key], value, `Usage distinction changed: ${key}`);
+        }
+        assertTools(toolsFromBody(front, reply));
       });
     }
     // No multi-candidate failover claim: this checks whether an adapter can leave retries to its caller.
