@@ -10,10 +10,11 @@
 ## Open
 
 - **Architecture refactor: single-owner request routing and dispatch.**
-  Follow [`architecture-refactor-plan.md`](architecture-refactor-plan.md), starting with R0 baseline/
-  lock-race verification and R1 dependency decisions. Optimize the finished architecture rather
-  than diff size; preserve product guarantees, not duplicated implementations. The plan is not yet
-  implemented and does not claim the reported lock race has been independently reverified.
+  Follow [`architecture-refactor-plan.md`](architecture-refactor-plan.md). The R0 stale-lock race
+  is reproduced and fixed; complete the remaining contract/performance baselines and R1 executable
+  dependency comparisons before the ownership cutovers. Initial evidence and upgrade requirements:
+  [`history/refactor-r0-2026-09-21.md`](history/refactor-r0-2026-09-21.md). Optimize the finished
+  architecture rather than diff size; preserve product guarantees, not duplicated implementations.
   **Property:** all API fronts share one request-execution lifecycle; the daemon owns each complete
   dispatch job; transactional job state has one mutation authority; maintained MCP/schema machinery
   replaces commodity handwritten code; migration is verified and superseded runtime paths are deleted.
