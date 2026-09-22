@@ -2,18 +2,22 @@
 
 Entry point for any agent picking up llm-relay. Read this before `CLAUDE.md`.
 
-## 0. Current state — 2026-09-21
+## 0. Current state — 2026-09-22
 
-The repository is on the published v0.86.0 baseline. An architecture-first refactor is planned,
-not implemented; live continuation verification remains evidence-gated.
+The architecture refactor has begun with the R0 legacy-storage safety fix, executable runtime
+baselines and R1 infrastructure proofs. The target request, dispatch and SQLite ownership changes
+are not implemented; live continuation remains evidence-gated.
 
-- Published package version: **0.86.0**.
-- `main` contains the architecture published in **v0.86.0**.
-- Current `main` (`fad96b7`, PR #70) CI run **782** is green:
-  - 4,510 core tests passed, 4 skipped;
-  - 46 dashboard tests passed;
-  - 57 targeted Windows process-boundary/concurrency tests passed;
-  - build, typecheck, package checks and packed-dashboard smoke passed.
+- Published package version: **0.86.0**. This refactor work is not a new published release.
+- Starting `main` baseline: `3f5d88a` (merged architecture plan, PR #73), CI run **790** green.
+- R0 replaces unsafe recursive stale-lock deletion with generation-specific owner retirement.
+  The source checkpoint `5737286` passed CI run **791**, including the full Linux gate and targeted
+  Windows suite. Lock evidence and the upgrade boundary are in
+  [`docs/history/refactor-r0-2026-09-21.md`](docs/history/refactor-r0-2026-09-21.md).
+- Runtime and SDK/schema/SQLite probes pass on Linux and Windows at checkpoint `e49ea16`
+  (refactor evidence run **3**, ordinary CI run **795**). Decisions, measurements and remaining gates:
+  [`docs/history/refactor-baselines-and-dependencies-2026-09-22.md`](docs/history/refactor-baselines-and-dependencies-2026-09-22.md).
+  Production dependencies and the Node engine range have not changed.
 - D1 restart-safe daemon-owned lane execution is implemented.
 - D2 transactional config hot reload is implemented.
 - Public dispatch/liveness state is explicit rather than inferred from circumstantial clues.
@@ -25,17 +29,27 @@ not implemented; live continuation verification remains evidence-gated.
 - D5 dependency modernization is complete: Vitest 5, Vite 8, jsdom 30, Tailwind 4, native
   TypeScript 7 compilation, jest-dom 7 and lucide-react 1. Node declarations intentionally remain
   on the Node 22 line while Node 22 is supported.
-- Repository-wide documentation/comment reconciliation is complete. PR #70 refreshed the live docs,
-  removed stale restart/reload/continuation claims, and trimmed implementation comments to durable
-  invariants. Its `src/**/*.ts` diff was comment-only; no runtime behavior changed.
+- PR #70 refreshed live documentation and trimmed implementation comments. The separate follow-up
+  documentation PR #72 was not included in this refactor packet.
 
 ### Immediate next — architecture refactor
 
-Follow [`docs/architecture-refactor-plan.md`](docs/architecture-refactor-plan.md). The owner has
-clarified that finished-system simplicity takes priority over refactor size. Start with R0 baseline/
-reported lock-race verification and R1 dependency decisions, then implement one request lifecycle
-and daemon ownership of complete dispatch jobs. The plan includes migration, deletion and acceptance
-criteria; none of those changes is represented as shipped here.
+Follow [`docs/architecture-refactor-plan.md`](docs/architecture-refactor-plan.md). Finished-system
+simplicity takes priority over refactor size. Execute the remaining R1 translation/gateway comparison
+(llm-bridge control, LiteLLM and Bifrost candidates) and calibrate paired performance budgets from
+the new R0 probe before R2. The current compact contract map protects unreviewed tests by default;
+review each affected assertion before replacing its owning implementation.
+
+The tested infrastructure direction is official MCP server SDK v2, Zod definitions with Ajv consumers,
+and worker-isolated `node:sqlite` using DELETE/EXTRA. These are decisions for implementation, not
+installed runtime changes. Node 22.13 is a tested minimum API level, not an operational patch
+recommendation; its SQLite API is experimental. Full host/schema/install and storage-cutover gates
+remain. Do not claim R0/R1 or the service refactor complete from the probes alone.
+
+**Upgrade boundary:** drain and stop every old daemon, MCP and writing CLI process before running
+this lock version. A legacy `owner.json` lock is never reclaimed automatically. Only after all
+writers are confirmed stopped, remove a confirmed-stale `.lock` directory, not its protected state
+JSON, and restart writers on one version. Do not mix versions during stale-lock recovery.
 
 Offline refactor work does not wait for harness quota. Keep the continuation measurements below,
 but implement continuation only after the daemon-owned job boundary is stable and the harness has
@@ -91,6 +105,8 @@ design records.
 | `docs/README.md` | Documentation index |
 | `docs/backlog.md` | Current unmet properties |
 | `docs/architecture-refactor-plan.md` | Target architecture, implementation sequence and acceptance criteria |
+| `docs/history/refactor-baselines-and-dependencies-2026-09-22.md` | Runtime measurements, contract map and tested infrastructure choices |
+| `docs/history/refactor-r0-2026-09-21.md` | Initial R0 lock evidence and upgrade boundary |
 | `docs/history/development-plan-2026-09-21.md` | Earlier continuation preparation sequence |
 | `CLAUDE.md` | Architecture map, invariants, responsibility table and gotchas |
 | `docs/architecture.md` | Human-facing codebase overview |
@@ -111,7 +127,8 @@ npm run gate
 
 `npm run gate` builds first, then runs both typechecks, the core test suite, dashboard checks and
 package checks. CI additionally has the targeted `windows-process-boundary` job for process,
-persistence, spawning or lifecycle semantics.
+persistence, spawning or lifecycle semantics. The separate refactor evidence workflow runs the
+synthetic baseline and dependency probes; it does not replace this gate.
 
 Important rules:
 

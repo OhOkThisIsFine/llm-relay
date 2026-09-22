@@ -1,0 +1,10 @@
+{
+  "name": "relay-refactor-sdk-probe",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "ajv": "8.17.1",
+    "zod": "4.3.6"
+  }
+}
