@@ -1,0 +1,49 @@
+name: Gateway comparison
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'scripts/refactor/gateway-*'
+      - 'test/refactor-gateway-*.test.ts'
+      - '.github/workflows/gateway-contracts.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gateway-comparison-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    strategy:
+      fail-fast: false
+      matrix:
+        candidate: [relay, litellm, bifrost]
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Verify positive and negative fixture controls
+        run: |
+          node scripts/refactor/gateway-contracts.mjs --self-test
+          node scripts/refactor/gateway-boundaries.mjs --self-test
+      - if: matrix.candidate == 'relay'
+        run: npm ci --ignore-scripts
+      - if: matrix.candidate == 'relay'
+        run: npm run build:server
+      # Per-contract incompatibilities are evidence, not a CI infrastructure failure.
+      # A green job does not qualify a gateway: inspect allContractsPassed and each result.
+      - name: Measure candidate contracts against synthetic providers
+        run: node scripts/refactor/gateway-contracts.mjs ${{ matrix.candidate }}
+      - name: Verify native bypasses and single-wire providers
+        run: node scripts/refactor/gateway-boundaries.mjs ${{ matrix.candidate }}
+      - name: Verify documented Chat-only bridge override
+        if: matrix.candidate == 'litellm'
+        run: node scripts/refactor/gateway-boundaries.mjs litellm --chat-bridge
