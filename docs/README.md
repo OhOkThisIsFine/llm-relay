@@ -12,6 +12,7 @@ Start with the row that matches what you want to do.
 | The convictions that settle a design question | [`project-philosophy.md`](project-philosophy.md) |
 | What is still open | [`backlog.md`](backlog.md) |
 | What development should happen next | [`history/development-plan-2026-09-21.md`](history/development-plan-2026-09-21.md) |
+| Agent engineering rules and the complete source map | [`../CLAUDE.md`](../CLAUDE.md), after [`../HANDOFF.md`](../HANDOFF.md) |
 
 ## Subject documents
 
@@ -41,5 +42,5 @@ Each of these covers one subject in depth. Read one when you work on that subjec
 - [`history/`](history/) — dated records: design notes, audits, plans and lap closeouts. These are
   evidence/history rather than the live user reference. Read [`history/README.md`](history/README.md)
   first.
-- [`../CLAUDE.md`](../CLAUDE.md) — the full source map, written for an AI coding assistant. It
-  states the reason behind each rule. Read [`architecture.md`](architecture.md) first.
+- [`../CLAUDE.md`](../CLAUDE.md) — durable agent rules, a compact complete source map and subsystem
+  cautions. Current status and open work remain in the handoff and backlog, not this guide.
