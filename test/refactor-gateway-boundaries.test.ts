@@ -9,6 +9,6 @@ describe("gateway boundary fixture oracles", () => {
     const result = execFileSync(process.execPath, [probe, "--self-test"], {
       encoding: "utf8", timeout: 10_000, windowsHide: true,
     });
-    expect(JSON.parse(result)).toEqual({ selfTest: true, assertions: 20 });
+    expect(JSON.parse(result)).toEqual({ selfTest: true, assertions: 32 });
   });
 });

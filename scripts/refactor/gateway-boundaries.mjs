@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { execFile, fork } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,6 +23,20 @@ const EXTENSION = { nested: [null, { value: 'preserve-🧪' }] };
 const self = fileURLToPath(import.meta.url);
 const exec = promisify(execFile);
 const provider = (wire) => wire === 'messages' ? 'anthropic' : 'openai';
+// Relay/LiteLLM OpenAI bases include the API version; Bifrost and Anthropic bases do not.
+function apiBase(candidate, wire, upstream) {
+  return upstream + (candidate !== 'bifrost' && wire !== 'messages' ? '/v1' : '');
+}
+function hasAnswer(output) {
+  const contains = (value) => typeof value === 'string' ? value.includes(TEXT)
+    : value !== null && typeof value === 'object' && Object.values(value).some(contains);
+  try { return contains(JSON.parse(output)); } catch {}
+  return output.split(/\r?\n\r?\n/).some((frame) => {
+    const data = frame.split(/\r?\n/).filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trimStart()).join('\n');
+    if (!data || data === '[DONE]') return false;
+    return contains(JSON.parse(data));
+  });
+}
 const cleanEnv = (dir) => ({ ...Object.fromEntries(['PATH', 'Path', 'SystemRoot', 'WINDIR', 'ComSpec', 'PATHEXT', 'TEMP', 'TMP', 'TMPDIR'].filter((key) => process.env[key] !== undefined).map((key) => [key, process.env[key]])), HOME: dir, USERPROFILE: dir, XDG_CONFIG_HOME: dir, XDG_CACHE_HOME: dir, XDG_STATE_HOME: dir });
 async function listen(server) { server.listen(0, '127.0.0.1'); await once(server, 'listening'); return `http://127.0.0.1:${server.address().port}`; }
 async function stop(server) { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); }
@@ -71,7 +85,7 @@ async function relayChild(wire) {
   const { createProxy } = await import('../../dist/server.js');
   const { ModelCatalog } = await import('../../dist/catalog.js');
   const server = createProxy({ host: '127.0.0.1', port: 0,
-    providers: { fixture: { base: process.env.BOUNDARY_UPSTREAM, kind: wire === 'messages' ? 'anthropic' : 'openai', ...(wire === 'messages' ? {} : { wire }), authEnv: 'BOUNDARY_KEY', authHeader: wire === 'messages' ? 'x-api-key' : 'authorization', credentialMode: 'contained', timeoutMs: 10000 } },
+    providers: { fixture: { base: apiBase('relay', wire, process.env.BOUNDARY_UPSTREAM), kind: wire === 'messages' ? 'anthropic' : 'openai', ...(wire === 'messages' ? {} : { wire }), authEnv: 'BOUNDARY_KEY', authHeader: wire === 'messages' ? 'x-api-key' : 'authorization', credentialMode: 'contained', timeoutMs: 10000 } },
     routing: { default: `fixture/${MODELS[wire]}`, tiers: {}, benchmarkSort: false }, mode: 'detect', repair: { maxAttempts: 2, destructiveTools: [] }, log: { level: 'silent', file: null },
   }, { catalog: new ModelCatalog({ cachePath: null }) });
   process.send({ base: await listen(server) });
@@ -95,10 +109,10 @@ async function candidateStart(candidate, wire, upstream, dir) {
   const port = new URL(base).port; const name = `boundary-${randomUUID()}`;
   const auth = wire === 'messages' ? { 'x-api-key': KEY, 'anthropic-version': '2023-06-01' } : { authorization: `Bearer ${KEY}` };
   const config = candidate === 'litellm' ? {
-    model_list: [{ model_name: 'fixture', litellm_params: { model: `${provider(wire)}/${MODELS[wire]}`, api_base: upstream + '/v1', api_key: KEY, max_retries: 0 } }],
+    model_list: [{ model_name: 'fixture', litellm_params: { model: `${provider(wire)}/${MODELS[wire]}`, api_base: apiBase(candidate, wire, upstream), api_key: KEY, max_retries: 0 } }],
     general_settings: { pass_through_endpoints: [{ path: '/native' + PATHS[wire], target: upstream + PATHS[wire], auth: false, forward_headers: false, methods: ['POST'], headers: { ...auth, 'content-type': 'application/json' } }] },
     litellm_settings: { telemetry: false, drop_params: false, num_retries: 0 }, router_settings: { num_retries: 0, fallbacks: [], disable_cooldowns: true },
-  } : { providers: { [provider(wire)]: { keys: [{ name: 'fixture', value: KEY, models: ['*'], weight: 1 }], network_config: { base_url: upstream + '/v1', allow_private_network: true, max_retries: 0, default_request_timeout_in_seconds: 10 } } }, config_store: { enabled: false }, logs_store: { enabled: false } };
+  } : { providers: { [provider(wire)]: { keys: [{ name: 'fixture', value: KEY, models: ['*'], weight: 1 }], network_config: { base_url: apiBase(candidate, wire, upstream), allow_private_network: true, max_retries: 0, default_request_timeout_in_seconds: 10 } } }, config_store: { enabled: false }, logs_store: { enabled: false } };
   writeFileSync(join(dir, 'config.json'), JSON.stringify(config)); chmodSync(dir, 0o777);
   try {
     await docker('run', '--detach', '--name', name, '--network', 'host', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--volume', `${dir}:${candidate === 'litellm' ? '/probe' : '/app/data'}`, '--env', 'DO_NOT_TRACK=1', '--env', 'APP_HOST=127.0.0.1', '--env', `APP_PORT=${port}`, image.Id, ...(candidate === 'litellm' ? ['--config', '/probe/config.json', '--host', '127.0.0.1', '--port', port, '--num_workers', '1'] : []));
@@ -109,7 +123,7 @@ async function candidateStart(candidate, wire, upstream, dir) {
 }
 async function probe(candidate) {
   assert(['relay', 'litellm', 'bifrost'].includes(candidate), 'Choose relay, litellm or bifrost');
-  const report = { version: 1, candidate, node: process.version, platform: process.platform, results: [], identities: [], auxiliaryEgresses: 0, infrastructureErrors: [] };
+  const report = { version: 2, candidate, node: process.version, platform: process.platform, results: [], identities: [], auxiliaryEgresses: 0, infrastructureErrors: [] };
   for (const wire of Object.keys(PATHS)) {
     const dir = mkdtempSync(join(tmpdir(), 'relay-boundary-')); const cases = new Map(); let gateway;
     const upstream = createServer(async (req, res) => {
@@ -152,7 +166,7 @@ async function probe(candidate) {
             if (native) {
               if (behavior === 'stream') assert.equal(output, streamParts(wire).join(''), 'Native SSE changed');
               else assertNative(JSON.parse(output), test.expected);
-            } else assert(output.includes(TEXT), 'Translated answer missing');
+            } else assert(hasAnswer(output), 'Translated answer missing');
           }
           assertWire(test.calls, PATHS[wire]); assertCredentials(test.calls[0].headers);
           if (native) assert.deepEqual(test.calls[0].body.vendor_extension, EXTENSION, 'Native request extension lost');
@@ -183,6 +197,14 @@ function selfTest() {
     assert.throws(() => assertWire([{ path: '/wrong' }], PATHS[wire])); assertions++;
     assert.throws(() => assertWire([{ path: PATHS[wire] }, { path: PATHS[wire] }], PATHS[wire])); assertions++;
   }
+  for (const candidate of ['relay', 'litellm', 'bifrost']) for (const wire of Object.keys(PATHS)) {
+    const base = apiBase(candidate, wire, 'http://127.0.0.1');
+    const suffix = candidate === 'bifrost' || wire === 'messages' ? PATHS[wire] : PATHS[wire].slice(3);
+    assert.equal(base + suffix, 'http://127.0.0.1' + PATHS[wire]); assertions++;
+  }
+  assert(hasAnswer(JSON.stringify({ text: TEXT }).replace('π', '\\u03c0'))); assertions++;
+  assert(hasAnswer('data: ' + JSON.stringify({ delta: TEXT }).replace('π', '\\u03c0') + '\n\n')); assertions++;
+  assert.equal(hasAnswer('data: {"delta":"wrong"}\n\n'), false); assertions++;
   assert.throws(() => assertCredentials({ authorization: 'Bearer synthetic-caller-key' })); assertions++;
   assertCredentials({ authorization: `Bearer ${KEY}` }); assertions++;
   console.log(JSON.stringify({ selfTest: true, assertions }));
