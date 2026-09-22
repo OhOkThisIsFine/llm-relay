@@ -98,7 +98,7 @@ consistent with the repo's existing philosophy.
 All of the drift found that day was fixed in the same cycle:
 
 - CLAUDE.md's architecture table gained the then-missing rows (`src/kernel/`,
-  `src/routes/admin.ts`, `src/control-authorization.ts`, `src/self-update.ts`),
+  `src/routes/admin.ts`, `src/control-authorization.ts`, `src/request-log.ts`, `src/self-update.ts`),
   and a follow-up sweep on 2026-08-22 added every remaining uncovered module plus
   `test/architecture-map.test.ts`, which fails when any `src/` file lacks a table row.
 - CLAUDE.md "What this is" was re-centered on the traffic-control-plane mission.
