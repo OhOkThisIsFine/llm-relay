@@ -1,7 +1,9 @@
 # Refactor evidence probes
 
 Offline, synthetic fixtures for R0/R1 of the [architecture refactor](../../docs/architecture-refactor-plan.md).
-These are test programs, not a second implementation or shipped runtime dependencies.
+These are test programs, not a second implementation or shipped runtime dependencies. The
+[dated checkpoint](../../docs/history/refactor-baselines-and-dependencies-2026-09-22.md) records
+measurements, infrastructure choices and the remaining comparison gates.
 
 - `runtime-baseline.mjs`: build the server first, then run with Node. Three separate relay process
   starts; 30 warm nonstreamed requests per HTTP front; 1/8 MiB streams with a throttled reader;
