@@ -8,7 +8,7 @@ import { join } from "node:path";
  *
  * Prefer XDG, but retain an existing legacy artifact when its XDG counterpart is absent.
  * An existing XDG artifact wins even if a legacy copy remains. Resolution never moves,
- * copies or deletes state, so enabling XDG does not hide existing credentials.
+ * copies or deletes state; a legacy-only artifact remains accessible after enabling XDG.
  *
  * This module does not isolate tests. Callers must guard real state access under vitest;
  * the injectable seams let path-policy tests run without touching real state or environment.
