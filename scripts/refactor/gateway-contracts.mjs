@@ -44,6 +44,13 @@ function refreshEgressResult(result, test) {
   }
 }
 
+function assertUsagePreserved(actual, expected, path = 'usage') {
+  if (expected !== null && typeof expected === 'object' && !Array.isArray(expected)) {
+    assert(actual !== null && typeof actual === 'object' && !Array.isArray(actual), `Missing usage object: ${path}`);
+    for (const [key, value] of Object.entries(expected)) assertUsagePreserved(actual[key], value, `${path}.${key}`);
+  } else assert.deepEqual(actual, expected, `Usage distinction changed: ${path}`);
+}
+
 function requestBody(front, model, stream = false, history = true) {
   const common = { model, stream };
   if (front === 'messages') return { ...common, max_tokens: 128, tools: [{ name: TOOL, input_schema: PARAMETERS }], messages: [
@@ -321,7 +328,7 @@ async function probe(candidate) {
       if (!res.destroyed) res.destroy();
     }
   });
-  const report = { version: 3, candidate, node: process.version, platform: process.platform, scope: 'synthetic fidelity screen; not full R1 acceptance', identity: null, results: [] };
+  const report = { version: 4, candidate, node: process.version, platform: process.platform, scope: 'synthetic fidelity screen; not full R1 acceptance', identity: null, results: [] };
   try {
     const upstreamBase = await listen(upstream);
     gateway = await startCandidate(candidate, upstreamBase, dir); report.identity = gateway.identity;
@@ -389,8 +396,9 @@ async function probe(candidate) {
         else if (property === 'opaque response') assert.deepEqual(reply.vendor_extension, OPAQUE, 'Native response extension must reach client');
         else {
           const original = responseBody(front); assert.equal(reply.id, original.id, 'Native response identity must be preserved');
-          // Compare provided usage fields; a gateway may add further honest breakdown fields.
-          for (const [key, value] of Object.entries(original.usage)) assert.deepEqual(reply.usage?.[key], value, `Usage distinction changed: ${key}`);
+          // Additions are evidence for provenance review, not proof that an existing value was lost.
+          test.observed = { nativeUsage: reply.usage, nativeResponseId: reply.id };
+          assertUsagePreserved(reply.usage, original.usage);
         }
         assertTools(toolsFromBody(front, reply));
       });
@@ -437,6 +445,9 @@ function selfTest() {
   refreshEgressResult(late, { calls: [{ protocol: 'chat', body: {} }, { protocol: 'chat', body: {} }] });
   assert.equal(late.passed, false); assertions++;
   const lost = { passed: true }; refreshEgressResult(lost, { calls: [] }); assert.equal(lost.passed, false); assertions++;
+  assertUsagePreserved({ details: { cached_tokens: 11, added_field: 0 } }, { details: { cached_tokens: 11 } }); assertions++;
+  assert.throws(() => assertUsagePreserved({ details: { cached_tokens: 12 } }, { details: { cached_tokens: 11 } })); assertions++;
+  assert.throws(() => assertUsagePreserved({}, { details: { cached_tokens: 11 } })); assertions++;
   console.log(JSON.stringify({ selfTest: true, assertions }));
 }
 

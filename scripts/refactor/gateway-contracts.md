@@ -30,7 +30,7 @@ The program prints one JSON result record. `allContractsPassed` reports compatib
 screen. Individual assertion failures are recorded and testing continues: a green comparison job
 means it generated evidence, not that a candidate passed. Setup/mock-server failures fail the job.
 Inspect unexpected endpoints and zero-egress errors for fixture/configuration mistakes before
-calling a failed assertion a dependency defect. The 30 positive/negative oracle checks run separately
+calling a failed assertion a dependency defect. The 33 positive/negative oracle checks run separately
 and are also exercised by the normal test gate.
 
 The fixture is deliberately small and bounded. It does not measure backpressure memory ceilings,
@@ -46,3 +46,11 @@ zero correlated egresses and cannot pass. The bounded case registry retains comp
 candidate shutdown, so late retries are attributed to their original task and fail its count check.
 A whole-stream control distinguishes transport fragmentation from tool-call reconstruction failures.
 Native request extensions, response extensions and identity/cache usage are separate assertions.
+
+The usage check recursively preserves every provided field and value, while recording the actual
+native usage object for provenance review. Extra breakdown keys do not by themselves mean that
+reported usage was lost. Whether an added zero represents known zero rather than unknown remains
+a separate accounting-provenance question; this screen does not certify all added fields.
+
+Results and the remaining selection boundary are recorded in
+[the R1 gateway evidence checkpoint](../../docs/history/refactor-r1-gateway-2026-09-22.md).
