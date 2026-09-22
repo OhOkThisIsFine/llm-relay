@@ -81,6 +81,7 @@ jobs:
           test/lane-runner.test.ts
           test/mcp-lane-launch.test.ts
           test/mcp-persistence-concurrency.test.ts
+          test/file-lock.test.ts
           test/mcp-broker-process-boundary.test.ts
           test/lane-process-lifecycle.test.ts
           test/process-cpu.test.ts

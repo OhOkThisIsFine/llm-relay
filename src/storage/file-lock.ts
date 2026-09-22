@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /**
@@ -19,17 +20,17 @@ export interface FileLockOptions {
 }
 
 interface LockOwner {
-  version: 1;
+  version: 2;
   pid: number;
   instance: string;
   acquiredAt: number;
 }
 
-const LOCK_VERSION = 1;
+const LOCK_VERSION = 2;
 const DEFAULT_RETRY_MS = 10;
 const DEFAULT_TIMEOUT_MS = 5_000;
 const sleeper = new Int32Array(new SharedArrayBuffer(4));
-let lockInstanceCounter = 0;
+const INSTANCE_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 function sleepSync(ms: number): void {
   Atomics.wait(sleeper, 0, 0, ms);
@@ -40,7 +41,8 @@ function defaultIsAlive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
+    // Only ESRCH establishes that the process is absent; uncertainty must not steal a lock.
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
   }
 }
 
@@ -56,16 +58,23 @@ function isLockOwner(value: unknown): value is LockOwner {
     Number.isSafeInteger(value["pid"]) &&
     value["pid"] > 0 &&
     typeof value["instance"] === "string" &&
-    value["instance"].length > 0 &&
+    INSTANCE_PATTERN.test(value["instance"]) &&
     typeof value["acquiredAt"] === "number" &&
     Number.isFinite(value["acquiredAt"])
   );
 }
 
+function ownerFilename(instance: string): string {
+  return `owner-${instance}.json`;
+}
+
 function readOwner(lockPath: string): LockOwner | null {
   try {
-    const parsed: unknown = JSON.parse(readFileSync(join(lockPath, "owner.json"), "utf8"));
-    return isLockOwner(parsed) ? parsed : null;
+    const files = readdirSync(lockPath);
+    const file = files[0];
+    if (files.length !== 1 || file === undefined) return null;
+    const parsed: unknown = JSON.parse(readFileSync(join(lockPath, file), "utf8"));
+    return isLockOwner(parsed) && file === ownerFilename(parsed.instance) ? parsed : null;
   } catch {
     return null;
   }
@@ -75,22 +84,39 @@ function errorCode(err: unknown): string | undefined {
   return isRecord(err) && typeof err["code"] === "string" ? err["code"] : undefined;
 }
 
-/**
- * Reclaim only a lock whose SAME observed owner is still present and whose pid is dead.
- *
- * A pid can be reused, so a reused live pid delays recovery rather than risking theft from a live
- * holder. That is the same safe direction as the MCP job journal's owner check.
- */
+/** Never recursively remove the reusable lock path: a successor may already own it. */
+function removeEmptyLock(lockPath: string): boolean {
+  try {
+    rmdirSync(lockPath);
+    return true;
+  } catch (err) {
+    const code = errorCode(err);
+    if (code === "ENOENT") return !existsSync(lockPath);
+    if (code === "ENOTEMPTY" || code === "EEXIST" || code === "EPERM" || code === "EACCES" || code === "EBUSY") return false;
+    throw err;
+  }
+}
+
 function reclaimDeadLock(lockPath: string, observed: LockOwner, isAlive: (pid: number) => boolean): boolean {
   if (isAlive(observed.pid)) return false;
   const current = readOwner(lockPath);
   if (current === null || current.pid !== observed.pid || current.instance !== observed.instance) return false;
   try {
-    rmSync(lockPath, { recursive: true });
-    return true;
+    // Another reclaimer can replace the directory after readOwner. This generation-specific
+    // unlink cannot remove its successor's marker; rmdir can remove only an empty directory.
+    unlinkSync(join(lockPath, ownerFilename(observed.instance)));
   } catch (err) {
-    return errorCode(err) === "ENOENT";
+    if (errorCode(err) === "ENOENT") return false;
+    throw err;
   }
+  return removeEmptyLock(lockPath);
+}
+
+function acquisitionTimeout(targetPath: string, lockPath: string): Error {
+  const legacy = existsSync(join(lockPath, "owner.json"));
+  return new Error(`Timed out acquiring file lock for ${targetPath}` + (legacy
+    ? "; legacy lock present. Stop all relay/MCP writers, confirm the lock is stale, remove only its .lock directory, then restart with one version."
+    : ""));
 }
 
 /**
@@ -99,8 +125,8 @@ function reclaimDeadLock(lockPath: string, observed: LockOwner, isAlive: (pid: n
  * A fully-populated claim directory is published to the stable lock path by one atomic rename, so
  * the stable path never has an ownerless acquisition window. The owner record lets a later process
  * recover a lock left by a process that died inside the critical section. An unreadable/malformed
- * owner is never stolen automatically: uncertainty fails closed instead of risking two writers
- * entering together.
+ * or legacy owner is never stolen automatically. Empty directories left after retiring a marker
+ * are safe to remove; a published live claim is always nonempty.
  */
 export function withFileLockSync<T>(
   targetPath: string,
@@ -112,22 +138,21 @@ export function withFileLockSync<T>(
   const timeoutMs = Math.max(retryMs, Math.floor(options.timeoutMs ?? DEFAULT_TIMEOUT_MS));
   const isAlive = options.isAlive ?? defaultIsAlive;
   const startedAt = Date.now();
-  lockInstanceCounter += 1;
   const owner: LockOwner = {
     version: LOCK_VERSION,
     pid: process.pid,
-    instance: `${process.pid}-${startedAt.toString(36)}-${lockInstanceCounter.toString(36)}`,
+    instance: randomUUID(),
     acquiredAt: startedAt,
   };
   const claimPath = `${lockPath}.${owner.instance}.claim`;
-  const claimOwnerPath = join(claimPath, "owner.json");
+  const claimOwnerPath = join(claimPath, ownerFilename(owner.instance));
 
   mkdirSync(dirname(targetPath), { recursive: true });
 
   // Build the complete lock off to the side, then publish it with ONE directory rename. The stable
   // lock path is therefore never visible without a valid owner record: a process killed before the
   // rename leaves only its uniquely-named claim directory, which does not block another writer.
-  mkdirSync(claimPath);
+  mkdirSync(claimPath, { mode: 0o700 });
   try {
     writeFileSync(claimOwnerPath, JSON.stringify(owner) + "\n", {
       encoding: "utf8",
@@ -136,6 +161,7 @@ export function withFileLockSync<T>(
     });
 
     for (;;) {
+      if (Date.now() - startedAt >= timeoutMs) throw acquisitionTimeout(targetPath, lockPath);
       try {
         renameSync(claimPath, lockPath);
         break;
@@ -150,19 +176,16 @@ export function withFileLockSync<T>(
           code === "EEXIST" || code === "ENOTEMPTY" || code === "EPERM" || code === "EACCES";
         if (!existsSync(lockPath)) {
           if (!contentionError) throw err;
-          if (Date.now() - startedAt >= timeoutMs) {
-            throw new Error(`Timed out acquiring file lock for ${targetPath}`);
-          }
           sleepSync(retryMs);
           continue;
         }
 
         const observed = readOwner(lockPath);
         if (observed !== null && reclaimDeadLock(lockPath, observed, isAlive)) continue;
+        // A process can die between retiring its marker and rmdir. Windows may refuse to rename
+        // over that empty directory, so finish the safe cleanup rather than leave it wedged.
+        if (observed === null && removeEmptyLock(lockPath)) continue;
 
-        if (Date.now() - startedAt >= timeoutMs) {
-          throw new Error(`Timed out acquiring file lock for ${targetPath}`);
-        }
         sleepSync(retryMs);
       }
     }
@@ -180,6 +203,7 @@ export function withFileLockSync<T>(
     if (current === null || current.pid !== owner.pid || current.instance !== owner.instance) {
       throw new Error(`File lock ownership changed for ${targetPath}`);
     }
-    rmSync(lockPath, { recursive: true });
+    unlinkSync(join(lockPath, ownerFilename(owner.instance)));
+    removeEmptyLock(lockPath);
   }
 }
