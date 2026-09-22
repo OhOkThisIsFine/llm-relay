@@ -1,7 +1,9 @@
 # Gateway contract comparison
 
 Executable R1 evidence for the [architecture refactor](../../docs/architecture-refactor-plan.md).
-No production dependencies or parallel request service are added.
+No production dependencies or parallel request service are added. The
+[implementation decision record](../../docs/history/refactor-r1-decisions-2026-09-22.md) contains
+the selected boundary, later native-wire results and the confirmed Responses acceptance gap.
 
 ```sh
 node scripts/refactor/gateway-contracts.mjs --self-test
