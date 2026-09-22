@@ -1,293 +1,214 @@
-# Architecture refactor plan
+# Architecture refactor plan — adopt full-agent dispatch
 
-**Status:** implementation plan; no runtime changes are represented as complete.  
-**Direction:** accepted by the owner in the architectural review on 2026-09-21; the detailed implementation choices and acceptance conditions are recorded here.  
-**Reviewed baseline:** `078b9a939f65178f73466b2d296b4f9eb6d373a0` (`main`, package version `0.86.0`). Reconcile intervening changes before implementation.
+**Updated:** 2026-09-22. **Status:** implementation plan, not an installed replacement.
+**Reviewed relay baseline:** `cf6d16bbf9d35cb35a232e633a1d2836f17d941d`, package `0.86.0`.
 
-## 1. Objective and authority
+## 1. Decision and authority
 
-Build the smallest coherent system that accomplishes llm-relay's actual goals: reliable personal traffic routing, transparent accounting and decisions, useful agent dispatch, and straightforward local installation.
+Build one complete delegation service for Claude Desktop, Codex Desktop, and other local MCP hosts. A host submits an objective and context; a worker inspects the workspace, uses tools, edits files, runs tests, iterates, and returns a result. The host can observe, answer required questions, cancel, and continue the same work. The user must not shuttle model responses or execute the worker's individual tool calls.
 
-**Minimize the complexity of the finished system, not the size of the diff.** A substantial replacement is preferable to a small patch that preserves duplicated ownership. Prefer maintained libraries when they remove more maintenance responsibility than they introduce. Neither existing code nor a low dependency count receives special protection.
+**Adopt `opencode-mcp` + a persistent OpenCode server + the standard LiteLLM proxy.** Keep llm-relay only for installation, configuration, migration, and short host instructions that upstream does not already supply. If upstream packaging makes that shell unnecessary, retire it too.
 
-This clarifies the minimal-mechanism rubric in [project-goals.md](project-goals.md). It does not relax credential containment, loopback admission, protocol fidelity, accounting provenance, destructive-tool safeguards, or process-lifetime correctness. Those protect the product rather than its present topology.
+This follows the owner's September 22 clarification: smooth full-agent dispatch is the purpose; preserving every existing relay feature is not. Repair is not essential. Finished-system maintenance burden matters more than refactor size or dependency count. AX is explicitly excluded for now.
 
-This plan supersedes the *target ownership and implementation sequence* of the earlier [D1 design](history/mcp-restart-safe-lane-execution-design-2026-09-20.md) and the relevant parts of the [development sequence](history/development-plan-2026-09-21.md). Their measurements remain evidence; do not rewrite them as though the new architecture already exists. The [hard-cap continuation evidence gate](history/active-hard-cap-harness-survey-2026-09-21.md) remains binding.
+This document replaces the September 21 custom-service plan and supersedes the R1 decision to retain custom request execution. **Do not implement the former R2 RequestService, R3 bespoke SQLite job store, or R4 DispatchService first.** R0's lock fix remains valid for the existing runtime. R0/R1 measurements and gateway failures remain historical evidence, not a mandate to reproduce the old architecture or repair every retiring path. The previous plan is retained in [git history](https://github.com/OhOkThisIsFine/llm-relay/blob/cf6d16bbf9d35cb35a232e633a1d2836f17d941d/docs/architecture-refactor-plan.md).
 
-### Scope
+For replacement design, this plan and the dated amendment in [project-goals.md](project-goals.md) take precedence over conflicting legacy topology, repair, health-policy, and storage prescriptions in the agent guide or historical records. While old code remains deployed, do not weaken its safeguards under the guise of preparation. Changes to actual access, spending, retention, and supported destinations must be disclosed before cutover.
 
-Replace duplicated request orchestration, MCP-owned dispatch supervision, multi-process job-file coordination, handwritten MCP protocol plumbing, and repeated structural contract definitions. Evaluate translation/gateway replacements before committing to a new implementation around the old translators.
-
-Do not introduce microservices, Redis, a general workflow platform, a universal message representation without demonstrated need, a plugin framework for hypothetical users, or new prompt-retention guarantees. This is one local application with two application services, not an enterprise platform.
-
-## 2. Target architecture: one owner per decision
+## 2. Selected architecture
 
 ```text
-External HTTP clients             MCP hosts / CLI callers
-         |                                  |
-HTTP protocol adapters              Thin command adapters
-         |                          (official MCP SDK for MCP)
-         |                                  |
-         +-------------- relay daemon ------+
-                         |                  |
-                  RequestService     DispatchService
-                         ^                  |
-                         |---- answer mode -+
-                         |                  |
-                provider adapters    lane process runner
-                         |                  |
-                    providers          agent harnesses
-
-Shared, explicit dependencies:
-  validated config snapshots; credentials; routing evidence;
-  accounting; SQLite job store; read-only status projections
+Claude Desktop / Codex Desktop / another local MCP host
+                         |
+           local stdio connection in each host
+                         |
+              opencode-mcp (upstream)
+                         |
+                 authenticated HTTP
+                         |
+           one independently managed OpenCode server
+          sessions + full agent/tool loop + permissions
+                         |
+             standard LiteLLM proxy, single instance
+           configured endpoints + ordinary retry/fallback
+                         |
+                  approved model endpoints
 ```
 
-The two services are modules in the same application. The diagram does not require another server, another package, or another framework. Names below describe responsibilities; do not create empty interfaces and directories merely to match the diagram.
+This is one user workflow, not separate answer-only and coding products. OpenCode is the delegated worker, not a replacement desktop interface. Its Build agent supplies the execution loop and tools; LiteLLM supplies that worker's model calls. The connection between OpenCode and LiteLLM is already documented upstream. [S1, S3]
 
-| Responsibility | Sole owner | What adapters must not do |
+| Responsibility | Selected owner | llm-relay's remaining role |
 |---|---|---|
-| Provider candidate execution | RequestService | Reimplement retry, hedge, commit, or finalization policy |
-| Whole dispatch job and lane walk | DispatchService in the daemon | Supervise jobs in each MCP/CLI process |
-| A live child process tree | Lane runner called by DispatchService | Adopt a persisted PID or launch a competing fallback |
-| Job persistence and migrations | SQLite job store, mutated through the daemon | Maintain per-host journals or a second terminal archive |
-| Protocol translation | Selected provider/front adapters | Decide routing or health policy |
-| Configuration meaning | Shared normalization and semantic validation | Resolve contradictory defaults independently |
-| Status and accounting presentation | Projections of authoritative outcomes | Infer execution decisions from output silence or elapsed time |
+| MCP tools, task submission, observation, input and result formatting | `AlaeddineMessadi/opencode-mcp` | Install and configure the upstream bridge; no second MCP server by default |
+| Agent reasoning/tool loop, coding tools, conversations and follow-up | OpenCode | Configure approved workspaces, models and tool access |
+| Provider transport, model aliases, ordinary request retry/fallback and usage facilities | Standard Python LiteLLM proxy | Supply native LiteLLM configuration, not a routing wrapper |
+| Long-lived service processes | Existing operating-system service facilities | Small install/start/stop/health scripts, not a job supervisor |
+| Sessions and job handles | OpenCode storage and the bridge's upstream task store | Locate, protect and back up those stores; no third job database |
+| Host integration | Native MCP configuration and short host instructions | Preserve user settings and make the same workflow discoverable in both hosts |
 
-Keep evidence-based routing functions and the useful attempt lifecycle kernel. Reuse existing credential, process, repair, and accounting behavior where it passes the new contracts. File size and class count are not acceptance criteria.
+### Why this combination
 
-## 3. RequestService
+The bridge's released v3.0.0 documents asynchronous delegation, stored job handles, explicit input-required states and session follow-up. Its implementation submits through OpenCode's asynchronous API rather than making the parent host execute tools. Its source also distinguishes an observation timeout from cancellation. These are directly relevant capabilities, not a requirement to pass every old relay test. [S2]
 
-### One execution lifecycle
+The standard LiteLLM proxy is chosen instead of the LiteLLM Agent Control Plane bundle. The latter contains an OpenCode runtime but uses its own gateway service and a broader platform; the reviewed initial MCP sub-agent call waits for output with a five-minute limit. Adopt the direct bridge and standard gateway without that extra agent-platform layer. Bifrost and ACP runtimes remain alternatives only for a demonstrated unmet requirement, not parallel implementations. No AX, Kubernetes, generic workflow engine, or new agent framework belongs in this migration. [S8]
 
-Replace the orchestration loops in `src/routes/messages.ts` and `src/routes/openai-front.ts` with one service that owns candidate offers, credential selection, provider egress, deadlines, hedging, stream commitment, retry eligibility, cancellation, and finalization.
+**Evidence boundary:** the bridge review baseline is v3.0.0, not a promise that every later release is compatible. Upstream documentation, selected source and release evidence support this choice; the combined stack has not been qualified in the owner's desktop applications. Pin an actual tested OpenCode/LiteLLM/bridge/runtime version set in A1. Do not copy an old probe's dependency versions or use floating `latest` at normal startup.
 
-A request captures a validated configuration generation and one routing instant. Provider attempts receive stable identities. Every actual egress is accounted once, and every started attempt reaches one terminal outcome. A rejected candidate is not a provider failure. A duplicate completion cannot update health or accounting twice.
+## 3. One complete host workflow
 
-Make the lifecycle explicit: preparation; provider execution before commitment; committed response; terminal outcome. Distinguish client cancellation, relay-abandoned hedge losers, deadline expiry, upstream failure, and local mapper failure. Build on the existing lifecycle enforcement rather than adding a generic state-machine framework by default.
+Use the upstream `essential` tool profile initially. It retains delegation, observation and required-input workflows without exposing the full administration catalog. It is not a sandbox or a reduced-capability worker: OpenCode still executes the complete task under its configured permissions. Do not add a renaming proxy merely to preserve old tool names. [S2]
 
-Protocol adapters supply request preparation, response inspection, and output encoding. They do not control the candidate walk. Keep original protocol content available for compatible pass-through; do not normalize away opaque blocks, tool identities, cache-usage distinctions, or vendor fields merely to satisfy an internal type.
+| User action | Integration behavior |
+|---|---|
+| Delegate | Supply the objective, relevant context, absolute workspace, permitted scope and acceptance criteria; start a dedicated OpenCode session/job with the configured Build agent and model alias |
+| Check or wait | Use upstream job/status tools and bounded waits; execution progresses without polling |
+| Return after a host restart | Rediscover the stored job/session and observe the existing work; do not resubmit the objective |
+| Answer required input | Present the worker's question or permission request and forward the user's response through the upstream tools |
+| Continue | Submit a follow-up in the same known session, after checking whether another turn is active |
+| Cancel | Use the explicit upstream job/session cancellation operation; stopping observation is not cancellation |
+| Review | Return the worker's summary, test outcome and workspace changes; the parent can inspect artifacts without performing the worker's tool loop |
 
-### Streams and repair
+The host must pass relevant decisions and files or accessible references. The worker does not inherit the parent's entire conversation, attachments, cloud connectors or secrets. Configure required external MCP tools on OpenCode once, and disclose unavailable tools before delegation. Disable recursive exposure of the dispatcher inside its own worker. For non-coding work, qualify the required external tools in the same full-agent workflow rather than substituting a text-only call. [S3, S4]
 
-The service owns the irreversible commitment decision. Before that boundary a failed attempt may be replaced; afterwards the relay must not splice another model's answer into the committed response. The adapter must not expose irreversible content before the service records commitment. Pin the exact existing wire boundary with fixtures rather than redefining it casually.
+Short host instructions must teach submission, handle retention, bounded waiting, input handling and follow-up. Test whether each desktop actually follows that workflow. A protocol handshake is not user-experience acceptance. The bridge does not promise notifications that wake an idle assistant; native MCP Tasks are optional, and ordinary fire/check/wait tools are the baseline. A user may return and ask for status, but should not need to copy job IDs manually. If normal interaction loses handles or strands completed work, fix that focused integration issue before cutover. Do not solve it with an invented notification guarantee. [S2, S7]
 
-Retain backpressure, bounded buffering, disconnect propagation, first-byte/stall/crawl distinctions, and prompt cancellation of losing attempts. A request with streaming enabled must not become a fully buffered response just because orchestration moved.
+## 4. Installation and configuration
 
-Keep tool validation and bounded form repair in the pipeline, with the existing destructive-call boundary. A successful reshaper response is not permission to invent intent. Local mapping failures must not be reported as provider health failures.
+### Local-first, Windows-first qualification
 
-### Internal callers and projections
+Run OpenCode natively on the workstation so it sees the intended repository paths and installed development tools. Install the bridge in a pinned Node environment and LiteLLM in an isolated Python environment. Keep OpenCode and LiteLLM independent of desktop/MCP process lifetime. Use per-user OS service facilities; qualify Windows first, then other platforms actually claimed by the release. Do not introduce a cross-platform process-monitoring framework or require containers merely for packaging.
 
-Answer-mode dispatch calls RequestService directly through a bounded response-consumer interface. It must not construct a fake HTTP request/response object or make a self-HTTP request just to obtain routing behavior. External HTTP response writers and internal result collectors share the execution decisions, not necessarily their buffers or message representations.
+The setup command should install or validate the version set, create private configuration, register the two services, verify authenticated readiness, and add the local MCP entry to both hosts. It must preserve unrelated host settings, report missing prerequisites, and support stop, restart, diagnostics and removal. It is an interactive install/update step, not work hidden in package postinstall or desktop tool startup. If native LiteLLM installation fails qualification, evaluate its supported container deployment as a bounded packaging correction before changing architecture.
 
-Produce one typed outcome/decision record from which health, usage, headers, logs, and dashboard summaries are derived. Use direct typed calls; a distributed event bus or event-sourcing subsystem is unnecessary. Retain metadata-only logging and unknown/provenance distinctions. A relay-lane dispatch must not count the provider traffic again as separate lane spend.
+Use one OpenCode instance for this dispatch installation and one shared bridge store for its same-user hosts. Set `OPENCODE_AUTO_SERVE=false`: the reviewed bridge terminates an OpenCode child it auto-started when that MCP process closes. Attach development TUIs to the managed server rather than starting competing servers against its storage. [S2]
 
-## 4. DispatchService: daemon-owned jobs, not daemon-owned fragments
+Both HTTP services bind to loopback and require authentication. Provider keys belong in the gateway's private configuration/environment, not prompts or ordinary worker shell environments. The bridge receives only its OpenCode connection credentials. Do not expose a LAN listener, public tunnel, or cloud-brokered remote MCP connector to make a local desktop configuration work. Claude Desktop's local MCP mechanism is distinct from remote connectors, which connect from Anthropic's infrastructure. [S7]
 
-### Ownership and lifetime
+### Native configuration, not a new configuration framework
 
-Move task state, lane selection, concurrency reservations, activity evaluation, failover, cancellation, and result retention into the daemon. MCP and executing CLI commands submit, wait, inspect, and cancel. Preserve genuinely advisory CLI commands as reads; do not turn them into execution implicitly.
+LiteLLM's `model_list` owns endpoint identities, gateway aliases and approved fallbacks. OpenCode owns worker/tool settings and the model metadata it actually requires. The bridge owns its supported connection and tool-profile settings. A small setup routine can populate the required overlap and check alias agreement; do not invent another universal schema or use two-way synchronization.
 
-A host disconnect only ends that caller's wait. An accepted job continues. Explicit job cancellation is separate from cancelling a protocol request or abandoning a poll. Document this distinction in tool descriptions and test both paths.
+Use the documented OpenAI-compatible OpenCode-to-LiteLLM provider as the default wire. Do not require the new service to reproduce three old inbound protocol fronts when only this worker connection is used. Declare actual tool support, context/output limits and modalities from verified endpoint information; a listing alone does not establish those capabilities. The upstream guide specifically requires OpenCode-side modality declarations for image-bearing requests. Preserve task-bearing inputs, and use narrow documented compatibility settings rather than global silent parameter dropping. [S1, S5]
 
-Keep the complete task and remaining walk state in daemon memory, bounded for the duration of the job. This allows the whole walk to continue across MCP restarts without introducing full prompt persistence. Release task-bearing memory after completion according to a defined short retention policy.
+Configure the default and auxiliary OpenCode agents, including summarization/title/compaction models where applicable, to use approved routes. Review OpenCode's effective configuration: `OPENCODE_CONFIG` is not isolation from project configuration, which can override it. Qualify supported precedence/override settings and approve project plugins and MCP servers before running untrusted project configuration. [S3, S4]
 
-A daemon restart is different: persisted metadata and completed results remain readable, but unfinished jobs are reported as interrupted/unknown as appropriate, never silently reconstructed or rerun. A durable row alone is not proof that a process exists or that it is safe to resume.
+Start with one gateway process and file-backed route configuration; Redis and PostgreSQL are not baseline requirements merely to proxy this installation. Do not advertise persistent virtual-key budgets or historical spend from this minimal configuration. If an existing explicit spending constraint needs durable state, use LiteLLM's supported persistence facilities or a verified provider-side control before enabling that destination; otherwise leave it disabled pending an explicit owner decision. Never replace a required cap with a volatile counter or silently remove it. Do not build another ledger to avoid adopting an upstream database. [S5, S6]
 
-### Job, attempt, and execution identity
+### Endpoint access is a migration requirement
 
-Retain three distinct identities:
+Inventory actual destinations and authentication methods before switching. A model API credential, a desktop subscription and a native coding-agent login are not interchangeable. OpenCode using a model does not mean it runs the native Claude/Codex/Antigravity harness or inherits that harness's quota.
 
-- **Job:** the caller's request and its final result.
-- **Lane attempt:** one selection from the job's ladder.
-- **Execution incarnation:** the particular process running that attempt.
+For each used destination, record: routable through the selected stack, supported upstream native integration required, or explicitly retired with owner agreement. Preserve any necessary native-agent capability through an existing supported integration only when that need is demonstrated; do not silently discard it or prebuild a second general dispatcher. Do not copy consumer tokens into LiteLLM, fabricate session identities, or promise that changing the worker fixes a vendor access restriction. A1 must resolve required destinations before calling the replacement sufficient.
 
-Initially an attempt has one incarnation. Additional incarnations are used only when a verified continuation feature actually needs them; do not build unused resumability infrastructure in advance.
+## 5. Execution, safety and state semantics
 
-Exactly one owner may reserve/start an attempt. Apply lane concurrency across all callers, before asynchronous launch. Preserve current skip/admission behavior unless an explicitly documented product change replaces it; do not add a general queue as a side effect of centralization.
+### Retry and continuation
 
-Do not advance to another lane while the previous process tree might still be running. Cancellation requests, confirmed termination, and terminal job outcomes are different states. If termination cannot be established, report stopping/unavailable and retain ownership instead of claiming cancellation succeeded and launching more work. Reuse and strengthen the cross-platform process-boundary tests.
+LiteLLM owns configured endpoint selection and ordinary model-request retry/fallback. OpenCode owns the agent/tool loop and conversation. Review their actual retry settings together: they may both retry at different layers, so record and test the combined request bound rather than claim retries exist in only one process. The bridge and setup shell must not add a third retrying dispatcher.
 
-### Submission, retries, and admission
+A failed model request may fall back within the approved endpoint set. An uncertain task submission must not cause automatic resubmission of the whole task. Do not replay a file edit or external action merely because an observation failed. Do not enable hedging or automatic whole-job migration between workers in the first release. Follow-up uses the worker's saved session, not replay of a synthesized transcript.
 
-Use an opaque submission key for transport retries. The same key and payload returns the same job; the same key with a different payload is a conflict. Include all execution-relevant options in the private comparison, not only task text. Retain bounded deduplication metadata independently of output pruning and state the retention window. Do not claim indefinite exactly-once execution.
+| Event | Supported target behavior |
+|---|---|
+| Parent tool wait expires or MCP disconnects | OpenCode continues; a later observation retrieves the existing work |
+| Parent desktop restarts | Stored handles allow rediscovery against the same worker and credential scope |
+| OpenCode process dies or the machine restarts | Preserve available history/results; report interrupted/unknown work honestly; do not promise automatic completion or replay |
+| Explicit cancellation | Request cancellation of the selected dedicated session; qualify actual cessation of tools and effects, not only the acknowledgement |
+| Follow-up after a completed turn | Continue that same session with its retained context |
+| Harness hard limit or gateway outage | Use supported upstream behavior; universal hard-cap continuation is deferred, not a replacement gate |
 
-The MCP adapter must not substitute a session-local JSON-RPC request ID for this key. An explicit optional key can support retries across host reconnects; an unknown submission outcome must be reconciled, not blindly resubmitted under a fresh identity.
+The reviewed bridge expires job records 24 hours after creation. `OPENCODE_TASK_STORE` selects a directory; do not assume it configures retention. OpenCode session history is separate. Verify rediscovery for intended task durations and explain what remains after handle expiry. Upstream retained sessions are not proof of durable active execution across a worker crash. [S2]
 
-Use the existing authenticated local control boundary. The daemon resolves configured lane IDs and applies allowed roots, read-only restrictions, depth limits, credential containment, and current admission policy. Caller-supplied commands, environment maps, executable paths, or PIDs are not a broker API.
+### Workspace and permissions
 
-All clients share one daemon for a canonical installation/configuration state root. Concurrent startup attempts must converge using the existing service lifetime and an OS-backed exclusivity mechanism, not another homegrown stale-lock protocol. A listener alone is insufficient when two different ports address the same state root: reject conflicting ownership. Readiness must verify the expected authenticated daemon, not just an occupied port.
+A full agent needs effective tools, not blanket approval. Configure an appropriate Build-agent policy for the approved workspace: routine edits/tests can be permitted while publishing, destructive operations and broader access require the intended approval. Prove both an allowed multistep task and a denied or input-required action. Do not carry forward tool-call repair as a prerequisite for safety; permissions now belong at tool execution. [S3]
 
-Remove automatic MCP-local execution fallback. Establish/connect to the managed daemon or report unavailable. An explicit standalone execution mode is out of scope unless a real supported workflow requires it; it must reuse DispatchService, not own another walk implementation.
+Dedicated sessions isolate conversations, not files. Use separate worktrees for overlapping editing tasks; for a simple installation, one editing task per workspace is acceptable. Setup/instructions must make the chosen rule visible. Shell access under the user's account is not an OS sandbox, and a project path or tool-discovery profile does not confine an arbitrary command. Do not advertise stronger isolation than implemented. [S2, S3]
 
-### Configuration during work
+### Privacy and accounting
 
-Keep the transactional hot-reload behavior. Capture routing configuration for an admitted HTTP request or job so a reload cannot partially rewrite its semantics. Read live health/quota evidence at the existing decision boundaries. Recheck revocation and security admission before new external effects; a captured configuration must not authorize a newly forbidden launch. Document whether an explicit disable affects only new attempts or cancels existing work; do not silently reinterpret it in an adapter.
+OpenCode conversations, tool output and bridge results may contain full task content. This is a material change from the old plan's metadata-only job persistence, not something to hide behind the word "session." Before pilot use with real data, document actual stores, permissions, retention, deletion and backup behavior. Keep diagnostics metadata-only; review upstream debug/logging/callback defaults and disable unnecessary payload collection, remote telemetry and sharing. Do not feed service credentials to the model. A local same-user setup still does not protect secrets from every permitted shell command. [S2, S4, S6]
 
-Public status is a projection of the daemon's authoritative activity and walk verdict. CPU, traffic, output, and working-tree signals remain evidence, not a second decision engine in every frontend. Polling frequency must not determine whether a job progresses, completes, or is archived.
+Use useful upstream usage/cost facilities without promising parity with every old ledger dimension. Keep unknown values unknown and distinguish configured aliases from the actual served model where observable. Preserve explicit spending/access restrictions or flag them as unmapped before enabling use. No custom accounting dashboard, pricing catalog or provider-limit inference system is required for the first replacement.
 
-## 5. Storage and durability
+## 6. Scope reduction and deletion
 
-### Destination
+| Area | Target disposition |
+|---|---|
+| `src/routes/messages.ts`, `src/routes/openai-front.ts`, `candidate-runner.ts`, request lifecycle kernel | Retire with the custom serving path; do not first consolidate them into RequestService |
+| `backend.ts`, request translators, SSE/commit/repair/dialect machinery | Replace their required role with OpenCode/LiteLLM; remove obsolete runtime paths and `llm-bridge` if no consumer remains |
+| `src/mcp/server.ts`, custom lane runners, broker, launch clients | Replace required delegation with upstream bridge/worker; resolve actual native destinations before deleting their only supported path |
+| Host job journal/archive and custom transaction/lock code | Retire writers; preserve old results as inert archives rather than importing fictitious OpenCode sessions |
+| Custom health, quota, hedge, capability-ranking and accounting presentation | Prefer upstream configuration/facilities; retain only a documented requirement not otherwise supplied |
+| Installer, state-path resolution, host configuration, credential migration | Keep narrowly where needed; prefer existing mechanisms and remove obsolete options |
+| Old proxy interception and host subagent-routing hooks | Remove owned wiring at cutover; primary host conversations remain direct by default |
+| Agent instructions, docs and tests | Describe the adopted system and user workflows; remove obsolete assertions only with the retired behavior they protect |
 
-Use SQLite for operational job state with one normal mutation authority. Prefer explicit SQL and a small repository API over a generic ORM or event store.
+Repair, exact old ranking/health algorithms, transparent interception, the current dashboard and universal hard-cap continuation are not acceptance requirements for full-agent dispatch. Retiring a feature does not mean its old defect was fixed. The native Responses defect remains real while its old route is reachable; fix it only if continued use requires that route, or retire the route with migration notices. Historical gateway comparisons do not certify this new combined stack.
 
-The initial logical model is jobs, lane attempts, and execution metadata, with terminal result content attached to the job or a directly related result row. Include schema versioning, foreign keys, unique submission identities, bounded retention, and indexes for the actual status/result queries. Do not migrate configuration, credentials, provider caches, and the complete accounting ledger merely to make all persistence look uniform.
-
-Commit terminal status, final attempt outcome, and bounded result together. There must not be an interval in which the running journal has been cleared but the terminal archive has not committed. Administrative output caps and truncation markers remain explicit. Treat result text and existing bounded task labels as sensitive artifacts, not metadata suitable for tokenless dashboard output.
-
-### What SQLite does not solve
-
-Database transactions do not make process creation transactional. Cover crashes before admission commit, after admission but before spawn, and after spawn but before execution metadata is committed. Record intent before effects, preserve stable identities, and never automatically replay an uncertain launch after daemon death. Do not adopt a PID from disk to close that gap.
-
-Admission persistence failure refuses a new managed job before launch. A result-write failure for an already running job preserves the in-memory result, reports persistence degradation, and uses bounded retry; it must not misreport the underlying work as successful durable recovery. State whether recovery survives process death versus power loss and select the SQLite durability settings accordingly.
-
-Keep transactions short and never hold one across provider, harness, or network work. Bound busy handling and queries. A synchronous driver must not introduce seconds of blocking into cancellation or streaming; use an appropriate asynchronous driver or a small internal database worker when needed. A worker thread is an implementation detail, not a second job owner.
-
-Use a local filesystem. Choose journal mode deliberately; WAL is not a synonym for unlimited writers and adds checkpoint/sidecar handling. SQLite's documentation describes serialized writes and possible busy responses. Backups must be transactionally consistent, including any active WAL state. Protect the database, backups, and sidecars with the installation's restricted-file policy. Disable arbitrary extension loading. [S1, S2]
-
-### Migration and rollback
-
-Perform one controlled ownership/storage cutover, not persistent dual-writing:
-
-1. Stop admissions and drain existing jobs, or require explicit cancellation. Verify old MCP writers and the old daemon are stopped before import. Refuse migration while ownership is uncertain.
-2. Locate legacy state through the existing XDG/legacy path rules. Never read an unrelated default directory just because the new one is empty.
-3. Preserve a consistent pre-migration backup. Validate legacy records, preserve IDs and terminal outputs, and import in a transaction with an idempotent migration marker. Report malformed rows without silently discarding the original files.
-4. Import unresolved old running records as interrupted/unknown evidence, not resumable processes. Keep terminal records authoritative when both legacy stores describe the same completed job.
-5. Start the new daemon only after schema/import success. Retire legacy writers; leave backups inert, never as a second live source of truth.
-6. Test rollback before release. Rollback requires quiescing the new daemon and restoring the old binary plus its matched state snapshot. Do not promise that an old binary understands the new database. Export/preserve results created since cutover before restoring an older snapshot.
-
-A daemon/schema mismatch or a stale MCP must fail with an actionable upgrade/restart message before launch. An upgrade must not silently strand active work to complete the refactor.
-
-## 6. Dependencies and structural contracts
-
-### Decide replacements before building around the current code
-
-R1 below is a required decision packet, not an open-ended research backlog. Evaluate maintained translation components and complete gateways against the same fixtures. Include the existing implementation as the control, not the presumptive winner. Candidates include the current `llm-bridge`, LiteLLM, and Bifrost; no candidate is declared suitable by this plan.
-
-Assess protocol fidelity, streamed tool cycles, cancellation/backpressure, opaque content, IDs, cache usage, actual configured providers, routing hooks, credentials, accounting provenance, licensing, maintenance, and local installation. Count adapters and compatibility patches required by a dependency as owned code. Treat additional runtime/service installation as an ongoing product cost, not a refactor-size objection.
-
-Select one implementation per responsibility and write down the result in the PR. A gateway is acceptable if it genuinely replaces enough machinery without violating the product contracts. Disable any overlapping retry/routing machinery so exactly one layer owns those decisions. Do not create a second router around a gateway that still routes independently.
-
-If a mature translation solution passes, replace the custom implementation. If none passes, retain only the necessary narrow adapters and record the failed contract; do not replace that evidence with a universal intermediate representation. Positive evidence can change the dependency choice, but unknown external support is not a reason to pause unrelated storage/dispatch work.
-
-### MCP SDK
-
-Adopt the official TypeScript MCP server SDK for framing, initialization, negotiation, standard errors, and notifications. Keep the existing small dispatch tool surface and waiting/progress contract unless a separate explicit change improves it. Do not bundle a switch to MCP Tasks or a different job API into this replacement.
-
-At preparation time the official repository describes v2 as its stable line, with split server/client packages and Standard Schema integration. Prefer the supported server line that passes the real host matrix; verify package versions, supported protocol revisions, Node requirements, and cancellation behavior at implementation time. Do not advertise revisions merely because they are newer. The SDK does not supply llm-relay's job semantics. [S3]
-
-### Schemas
-
-Use one authoritative structural definition per owned boundary contract. Generate or infer TypeScript types and runtime schemas from that definition using maintained tooling; do not hand-maintain an interface, an allowed-key set, and a matching parser.
-
-Prefer reusing Ajv where it is a good fit, including arbitrary tool JSON Schema. Select the schema-authoring approach together with the MCP SDK integration. If an SDK-compatible authoring library generates the JSON Schema used by Ajv, that is one definition with two consumers, not two competing schemas. Do not invent a generic schema-conversion framework just to avoid one dependency.
-
-Keep structural validation separate from normalization and semantic checks. Preserve useful field-specific diagnostics, explicitly supported shorthand, unknown-key rejection where required, and open vendor payloads where fidelity requires them. No silent coercion, dropped properties, or validation-time mutation. Compile/cache validators rather than rebuilding them per request. Exhaustively test discriminated unions; Ajv's TypeScript helpers alone do not prove every union member is represented. [S4]
-
-### Node and package support
-
-The baseline declares `node >=22`. Do not assume that means every `node:sqlite` API is available: the official history records introduction in 22.5 and removal of the experimental flag in 22.13; DatabaseSync is synchronous. Choose a supported runtime floor or a maintained driver explicitly, with clean-install tests. Package selection must not silently raise the minimum Node version or require users to compile a native dependency without a supported installation path. [S5]
+Do not fork upstreams by default. Resolve a concrete failure in this order: supported configuration, compatible released version, focused upstream contribution, then a small documented patch if essential. Every retained patch needs a regression, upstream reference and removal condition. Reopen a component choice only when an essential workflow cannot be supplied reasonably; do not respond to one edge case by rebuilding the whole relay.
 
 ## 7. Implementation sequence
 
-Each packet lands working behavior, its tests, and deletion of the obsolete ownership it replaces. A packet is a unit of proof, not a requirement to keep diffs small. Combine adjacent packets when that avoids throwaway compatibility code. Do not merge an unused parallel architecture as progress.
+These adoption packets replace the old R2–R6 sequence. They are complete units of proof, not empty interfaces or directories.
 
-| Packet | Dependencies | Deliverable and exit condition |
+| Packet | Work | Exit condition |
 |---|---|---|
-| **R0 — baseline and urgent correctness** | None | Reconcile main and open PRs; preserve contract fixtures; verify the reported lock race; patch it before relying on the old store during migration if reproduced. Establish a green baseline. |
-| **R1 — dependency and boundary decisions** | R0 fixtures | Select translation/gateway approach, MCP SDK, schema tooling, SQLite driver/runtime floor, and journal/durability settings. Complete an executable install/contract comparison. No major rewrite starts around an undecided gateway choice. |
-| **R2 — shared request execution** | R1 | Route all HTTP fronts through RequestService. Share lifecycle decisions and outcome recording. Provide the internal answer consumer. Delete both old orchestration loops. |
-| **R3 — authoritative job store** | R1 | Implement SQLite repositories, import/rollback tooling, persistence failure behavior, and contract tests. Wire a real consumer in this packet or land it atomically with R4; no inert parallel store. |
-| **R4 — whole-job daemon ownership** | R2 and R3 | Move the walk, activity, global lane concurrency, result handling, and cancellation into DispatchService. Answer mode uses RequestService. Complete controlled cutover; delete host journals, adoption, and local execution fallback. |
-| **R5 — thin MCP/CLI and shared schemas** | R1 and R4 | Switch MCP to the SDK; keep adapters thin; finish owned boundary-schema consolidation and version compatibility. Delete hand-written MCP framing/negotiation and duplicate structural parsers. |
-| **R6 — deletion, release, and documentation** | R2–R5 | Remove dead imports/shims/configuration, update public behavior and installation docs, pass release checks and live host tests, and ship one coherent implementation. |
+| **A0 — resolve the actual installation** | Inventory hosts/versions, workspaces, endpoints and auth, required external tools, caps, owned host hooks and retained results. Produce a compact migration map without secrets. | Required destinations and data/access changes are mapped; no silent substitution of APIs for subscriptions/native runtimes |
+| **A1 — prove the integrated stack** | Pin upstream versions; start isolated OpenCode and standard LiteLLM; configure upstream bridge in both hosts; perform the acceptance matrix below before writing a new runtime | Full real task and follow-up work from both desktops, including restart/recovery observation; only concrete integration gaps remain |
+| **A2 — package the proven path** | Add minimal setup/service/health/update/removal support, native config templates and short host instructions. Prefer upstream packages unchanged | Fresh installation and reconnection do not require manual process management or copying handles; versions/state/secrets stay controlled |
+| **A3 — controlled cutover** | Back up settings and state; drain or explicitly cancel old jobs; switch owned host entries and remove interception hooks; use the replacement for ordinary work | Both hosts use the new service, required destinations remain available, old runtime is not a fallback, and rollback is rehearsed |
+| **A4 — delete and release** | Remove superseded code/dependencies/tests/workflows; publish accurate installation, permissions, retention and limitation docs | One adopted dispatch path remains; retained tests and clean-install checks pass; no custom request engine or parallel job store survives without a demonstrated need |
 
-R2 and the store/import work in R3 can proceed in parallel after R1. Schema work starts in R1 and is used by R2–R4; R5 completes adoption rather than creating schemas after consumers are built. A proven SDK adapter may land with R4 if that avoids a temporary transport layer. There is no quota-dependent prerequisite for offline architectural work.
+A0 should be a short inventory, not another platform survey. A1 may uncover an upstream bug; fix or report that mechanism rather than weakening the full-task requirement. Live paid/provider tests require controlled opt-in and available credentials/quota; mocks can prove integration mechanics but cannot establish model quality or desktop usability. Lack of live access is an explicit incomplete acceptance item, not a reason to implement old R2 as substitute progress.
 
-### R0 details
+## 8. Acceptance matrix
 
-The earlier conceptual review reported a stale-lock reclamation race in `src/storage/file-lock.ts`: a check of a dead owner and subsequent directory deletion may race with another reclaimer publishing a new owner. This planning change does not independently certify the earlier reproduction or claim the current installation lost data.
+Run the following against the pinned combined build. Save concise results with host/runtime versions, endpoint aliases, commands and evidence locations; redact secrets and private work. Upstream CI is supporting evidence, not our own end-to-end pass.
 
-Reproduce with the repository implementation in separate processes and deterministic barriers around reclamation; verify Windows and Linux. Do not use arbitrary sleeps as the proof. If the defect is present, land the safety fix and a regression before long-lived refactor work. Preserve the mutual-exclusion property as a store-level test after the custom lock is deleted. Do not spend the refactor polishing a bespoke lock as the final design.
-
-Build a compact matrix of behavior contracts, not snapshots of implementation internals. Label each existing test as protecting a product contract, a confirmed defect, or replaceable structure. Preserve the first two and replace obsolete structural assertions; never treat the old implementation as the correct oracle for a known bug.
-
-## 8. Acceptance tests
-
-### Shared request scenarios
-
-Parameterize the same lifecycle scenarios across Anthropic Messages, OpenAI Chat, OpenAI Responses, streaming/non-streaming where applicable, and the internal answer consumer. Use at least two candidates for failover tests. Verify:
-
-- credential rotation, explicit caps, quota/latency ordering, probation, sticky routing, and unknown limits;
-- egress starts, hedged winner/loser outcomes, local versus upstream failures, and accounting exactly once;
-- first-byte/stall/crawl timeout, caller abort, backpressure, bounded buffers, pre-commit failover, and post-commit failure without answer splicing;
-- complete tool-call/result cycles, form repair, destructive refusal, opaque/vendor fields, usage/cache distinctions, IDs, and explicit unsupported-content errors.
-
-Use fake providers and recorded sanitized fixtures for deterministic tests. Compare decisions across fronts, not only final response text. Do not duplicate live side-effecting requests as a production shadow test.
-
-### Dispatch and process scenarios
-
-Test multiple MCP hosts and executing CLI callers against one daemon. Kill the original MCP before acknowledgement, while a lane runs, between lanes, and after completion. Verify that the same job remains queryable and that the entire walk progresses without polling. Reconnect and cancel from another host.
-
-Verify same-key deduplication, payload conflicts, global concurrency, read-only/allowed-root admission, no arbitrary launch inputs, credential isolation, stale-client rejection, competing daemon starts, and removal of silent local fallback. Test activity evidence becoming unavailable without falsely declaring the lane idle or dead.
-
-Force exit/completion/cancel/timeout races. Do not start the next process until the previous one is confirmed terminated. Exercise real Windows npm shims, hidden-process behavior, process-tree cleanup, and parent-death cases; Linux success is not a substitute.
-
-Kill the daemon separately. Verify honest interrupted/unknown records, accessible committed results, no PID adoption, and no automatic replay of uncertain side effects. Prove that replacement admission cannot create overlapping work from survivors; use the existing OS process-boundary mechanisms or report the unresolved condition instead of inventing liveness from database rows.
-
-### Storage, privacy, and compatibility scenarios
-
-Inject failures around admission and terminal commits, disk full, lock contention, corrupt legacy files, interrupted import, unsupported schema, output pruning, idempotency retention, and rollback. Exercise the maximum supported retained outputs while streaming/cancelling other work to detect event-loop blocking.
-
-Confirm that full prompts, credential values, environment maps, and raw process IDs are not newly persisted. Check permissions on all database-related files and verify result content cannot leak into metadata-only views. Preserve existing historical usage/provenance and state-path selection.
-
-Run fresh global installation and upgrade fixtures on supported operating systems and the selected minimum Node version. Verify existing MCP hosts' initialization, discovery/negotiation, tool schemas, progress, wait limits, request cancellation, explicit job cancellation, and stdout purity. Unavailable live-host or provider checks remain explicitly unverified, not inferred from mocks.
-
-## 9. Deletion map and completion criteria
-
-| Current area | Required end state |
+| Test | Required observation |
 |---|---|
-| `src/routes/messages.ts`, `src/routes/openai-front.ts` | Protocol adapters; no private candidate-execution lifecycle |
-| `src/candidate-runner.ts`, `src/kernel/` | One adopted lifecycle owner plus focused policy functions; no duplicated finalization |
-| `src/mcp/server.ts` | SDK tool wiring, wait/progress adaptation, and presentation only |
-| `src/mcp/lane-runner.ts`, `src/lane-execution-broker.ts` | Shared process primitive under daemon-owned DispatchService; execution bookkeeping does not compete with job ownership |
-| `src/configured-lane-execution-launcher.ts` and MCP launch path | One configured-lane resolution/normalization path |
-| `src/mcp/job-journal.ts`, `src/mcp/job-archive.ts`, `src/mcp/persistence-lock.ts` | Retired runtime writers; only bounded legacy import logic remains while needed |
-| `src/storage/file-lock.ts` | Removed once no legitimate consumer remains; migrate every consumer rather than leave an unsafe orphan utility |
-| `src/storage/json-store.ts` | Only genuinely appropriate single-owner configuration/cache operations; no bespoke job transaction system |
-| `src/mcp/protocol.ts` | Replaced by the SDK; only application-specific conversion remains if required |
-| Routing/config/broker structural parsers | Single-source schemas plus explicit semantic validation |
-| Translation implementation | One selected implementation per direction; deleted superseded adapters and IR workarounds |
+| Full task from Claude Desktop and separately Codex Desktop | Worker reads a disposable repository, changes code, executes tests, fixes a deliberately exposed failure and returns a useful result without the parent driving tool calls |
+| Two actual approved endpoints | Both can complete the same representative tool-using workflow through LiteLLM; a text-only response test is insufficient |
+| Long job / parent restart | A task running longer than an ordinary host tool wait survives bridge/host shutdown, remains discoverable and completes without polling; repeat with both hosts and inspect from the other host |
+| Follow-up | Parent continues the same worker session, with the prior changes/context available and no manual ID transfer |
+| Required input and cancellation | Worker questions/permissions are surfaced and resolved; denied actions remain denied; cancelling one dedicated session stops its work without affecting another |
+| Failure and fallback | Synthetic endpoint failure exercises approved gateway fallback within the same agent workflow; gateway loss and ambiguous submission do not duplicate whole jobs or turn partial work into success |
+| Privacy, restrictions and access | Missing credentials fail clearly; routing does not widen to unauthorized/paid endpoints; diagnostic output contains no payloads/secrets; required external worker tools function |
+| Conflicting work and lifecycle | Parallel edits use separate worktrees or are explicitly serialized; worker restart and handle expiry are honestly represented; service start/stop cannot create duplicate workers sharing a store |
+| Install, update and rollback | Fresh Windows setup, private storage, authenticated readiness, host configuration preservation, controlled update and restoration all work; qualify other OSes before claiming support |
 
-Do not delete a file wholesale when it still contains valid unrelated behavior; relocate that behavior to its actual owner and prove its callers. Conversely, do not keep obsolete code as an undocumented fallback. Temporary migration shims need an explicit removal condition within R6.
+Measure user-facing costs during A1: installation friction, first delegation, time to usable progress/result, cancellation and idle resource use. Use a local fake backend to separate integration delay from model time when needed. Do not transplant R0's synthetic proxy microbenchmark budgets into a different agent product or make statistical calibration a prerequisite to trying it. No fixed unmeasured performance or memory claims.
 
-Completion requires `npm run gate` on the final tree, the targeted Windows process/persistence suite, the new cross-front/job/storage contract tests, package checks, and documented live-host results. Keep static analysis advisory; enforce a few real dependency boundaries, not another governance framework.
+## 9. Migration and rollback
 
-Compare startup, first-response latency, stream memory bounds, cancellation responsiveness, state-write behavior, and package installation against R0. Set explicit regression budgets before implementation from those measurements; do not manufacture target numbers or quietly loosen tests to accommodate a dependency.
+Run the pilot on separate ports/config/state with disposable workspaces. Never shadow a live editing task into both old and new systems. Keep old installation behavior unchanged until qualification and explicit cutover.
 
-Update [architecture.md](architecture.md), [reference.md](reference.md), [QUICKSTART.md](QUICKSTART.md), [the handoff](../HANDOFF.md), and the agent guide when behavior actually changes. Explain managed-daemon dependency, host-versus-daemon restart guarantees, any Node floor change, submission deduplication, persistence failure semantics, and migration/rollback. Keep rationale in this plan and short invariants beside code; do not regenerate a release narrative in every module comment.
+Before switching, back up the old binary/version, config/credential stores, results and exact owned host settings using the existing XDG/legacy path selection. Stop new old-system admissions and drain jobs or obtain explicit cancellation; verify relevant old writers are stopped. Retain the R0 lock upgrade warning while that code is used. Do not relabel legacy job IDs as OpenCode sessions or attempt to adopt persisted PIDs.
 
-The final proof is structural and behavioral: one request lifecycle; one job supervisor; one durable job model; standard protocol/schema machinery; unchanged safety/provenance guarantees; and no second implementation left behind.
+Prefer inert, readable legacy archives over building a new importer or dual-writing store. Keep their private permissions. Preserve new OpenCode conversations/results and workspace changes separately from those archives. Remove or replace only installer-owned MCP entries, proxy environment settings and routing hooks; never erase unrelated user configuration or general agent instructions.
 
-## 10. First implementation action and deferred work
+Rollback means quiescing the new worker, preserving its artifacts, stopping its services, and restoring the matched old software/settings/state and owned host entries. It does not undo file edits or external side effects, and old code cannot read new upstream session storage. Preserve/export post-cutover results before restoring snapshots. Service upgrades also need quiescence: restarting OpenCode is not transparent continuation of active work.
 
-**Start with R0 and R1, then implement toward the chosen architecture.** Do not start with directory renames, more helper extraction, or a generic continuation substrate.
+Update `README.md`, `docs/QUICKSTART.md`, `docs/reference.md`, `docs/architecture.md`, `CLAUDE.md`, the handoff and backlog as their behavior changes. Until then, those runtime references must not advertise adoption as already shipped. Keep this plan authoritative instead of maintaining competing implementation sequences in several files.
 
-The continuation feature remains a separate follow-on after ownership is stable. A harness must pass exact-ID interruption/resume and same-cwd isolation before it can gain automatic continuation. Wire it into the daemon-owned logical attempt with at most one live incarnation; do not build it in the MCP client and later move it.
+## 10. Completion and evidence
 
-Vendor-blocked routing, missing AGY envelope evidence, and live operator checks remain separate [backlog](backlog.md) items. They do not block this refactor's offline work, and the refactor does not make their missing evidence disappear.
+Done means ordinary full-agent delegation works from both desktop hosts through the adopted service, with follow-up, useful status, controlled access and a workable install. The old custom execution paths are removed. A passing upstream suite, a health check, another architectural diagram, or a reduced text-only demo is not completion.
 
-## Sources and baseline map
+Keep `npm run gate` and Windows checks for the code still retained. As code is deleted, replace only its obsolete topology/feature assertions with focused configuration, lifecycle and end-to-end acceptance coverage. Do not retain thousands of old tests by reimplementing the retired system in adapters, and do not delete a live safety regression to obtain green CI. Maintain a small release-tested version set and rerun the user workflows on dependency upgrades; no new governance framework is needed.
 
-Repository links above describe the reviewed baseline or historical rationale, not proof that the target is implemented. Relevant implementation starting points: [request lifecycle](../src/kernel/contracts.ts), [candidate runner](../src/candidate-runner.ts), [MCP server](../src/mcp/server.ts), [execution broker](../src/lane-execution-broker.ts), [running journal](../src/mcp/job-journal.ts), [terminal archive](../src/mcp/job-archive.ts), [file lock](../src/storage/file-lock.ts), [routing parser](../src/config/routing-parser.ts), and [package manifest](../package.json). Update these links as files move.
+This planning change installs nothing, changes no production dependency, and does not certify live hosts or provider credentials. The first implementation action is **A0 followed by A1**, not a custom service rewrite.
 
-First-party references checked during plan preparation; select and verify exact dependency versions in R1:
+### Primary references
 
-- **S1:** [SQLite transactions](https://sqlite.org/lang_transaction.html) — transaction boundaries, serialized writes, and busy handling.
-- **S2:** [SQLite WAL](https://www.sqlite.org/wal.html) — concurrency limits, checkpoints, sidecar files, and filesystem constraints.
-- **S3:** [Official MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) — supported server SDK, transport, version line, and schema integration.
-- **S4:** [Ajv and TypeScript](https://ajv.js.org/guide/typescript.html) — schema/type integration and union limitations.
-- **S5:** [Node SQLite documentation](https://nodejs.org/api/sqlite.html) — version history and synchronous database API; consult the selected Node line before using individual methods.
-- **S6:** [LiteLLM Anthropic-format endpoint](https://docs.litellm.ai/docs/anthropic_unified) — one candidate's documented surface, not a claim of compatibility with all relay contracts.
+Read on 2026-09-22; upstream pages may change. Version-pin implementation evidence in A1.
+
+- **S1:** [LiteLLM's OpenCode integration](https://docs.litellm.ai/docs/tutorials/opencode_integration) — provider wiring, aliases, modalities and narrow compatibility settings.
+- **S2:** `opencode-mcp` v3.0.0: [README](https://github.com/AlaeddineMessadi/opencode-mcp/blob/v3.0.0/README.md), [architecture](https://github.com/AlaeddineMessadi/opencode-mcp/blob/v3.0.0/docs/architecture.md), [configuration](https://github.com/AlaeddineMessadi/opencode-mcp/blob/v3.0.0/docs/configuration.md), [job implementation](https://github.com/AlaeddineMessadi/opencode-mcp/blob/v3.0.0/src/jobs.ts), [server lifecycle](https://github.com/AlaeddineMessadi/opencode-mcp/blob/v3.0.0/src/server-manager.ts), [release](https://github.com/AlaeddineMessadi/opencode-mcp/releases/tag/v3.0.0).
+- **S3:** OpenCode [server API](https://opencode.ai/docs/server/), [agents](https://opencode.ai/docs/agents/), [permissions](https://opencode.ai/docs/permissions/).
+- **S4:** OpenCode [configuration precedence](https://opencode.ai/docs/config/) and [external MCP tools](https://opencode.ai/docs/mcp-servers/).
+- **S5:** Standard LiteLLM [configuration](https://docs.litellm.ai/docs/proxy/configs) and [CLI installation](https://docs.litellm.ai/docs/proxy/quick_start).
+- **S6:** LiteLLM [virtual keys](https://docs.litellm.ai/docs/proxy/virtual_keys), [production persistence/logging](https://docs.litellm.ai/docs/proxy/prod), [logging controls](https://docs.litellm.ai/docs/proxy/logging).
+- **S7:** [Claude Desktop local MCP](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop), [remote connector network boundary](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp), [Codex MCP configuration](https://developers.openai.com/codex/mcp/).
+- **S8:** LiteLLM Agent Control Plane at reviewed commit `53bfd20e2fec51fc8f665fb614512c6b138367da`: [Compose bundle](https://github.com/LiteLLM-Labs/litellm-agent-control-plane/blob/53bfd20e2fec51fc8f665fb614512c6b138367da/compose.yaml), [OpenCode wrapper](https://github.com/LiteLLM-Labs/litellm-agent-control-plane/blob/53bfd20e2fec51fc8f665fb614512c6b138367da/templates/opencode/README.md), [initial MCP sub-agent call](https://github.com/LiteLLM-Labs/litellm-agent-control-plane/blob/53bfd20e2fec51fc8f665fb614512c6b138367da/src/http/platform_mcps/tools.rs).

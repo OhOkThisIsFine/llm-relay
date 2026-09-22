@@ -1,8 +1,35 @@
 # Project goals
 
-> Status: **ratified by the owner 2026-08-04** (hashed out in conversation, then confirmed).
-> This is the standing statement of what llm-relay is for and the rubric every proposed change
-> is judged against. Change it only with the owner.
+> Status: **ratified by the owner 2026-08-04**, with the adoption-first amendment below on
+> **2026-09-22**. This is the standing statement of purpose. Change it only with the owner.
+
+## Dispatch-first amendment — 2026-09-22
+
+**The purpose is smooth, full-agent delegation from Claude Desktop, Codex Desktop and other
+hosts to other endpoints.** A dispatched worker must be able to use tools, complete multistep
+work, return a result and continue the same conversation. The user should not stitch together
+model-only calls or supervise the worker's individual tool loop.
+
+Prefer adopting maintained projects that remove ongoing work. The replacement plan selects
+upstream `opencode-mcp`, a persistent OpenCode worker and standard LiteLLM, with llm-relay reduced
+to integration/packaging only where necessary. AX is excluded for now. These are planned
+implementation choices, not an installed replacement or completed live-host verification.
+
+**Repair is not essential.** Exact legacy ranking, health, accounting presentation, transparent
+proxy interception and universal hard-cap continuation are not reasons to rebuild the current
+system around another project's hooks. Preserve useful outcomes and actual access/spending
+restrictions; identify changes or unsupported destinations before cutover instead of treating
+every historical feature as indispensable. Full-agent capability does not mean blanket permission.
+
+This amendment and [the rewritten plan](architecture-refactor-plan.md) supersede conflicting
+legacy topology and implementation requirements below, in the earlier R1 record, or in agent
+instructions. The old custom RequestService/DispatchService/SQLite sequence is cancelled as the
+target. Existing runtime safeguards still bind until their paths are deliberately retired. In
+particular, disclose OpenCode's task/session retention, keep credentials contained, and do not
+claim API access replaces native-agent/subscription access without checking it.
+
+The remaining sections retain earlier goals and decisions as context. They do not authorize
+silently discarding data, disabling an explicit cap or weakening retained runtime behavior.
 
 ## What llm-relay is for
 
@@ -57,9 +84,9 @@ existing internal topology and accidental behavior have no independent authority
 choices should minimize total maintenance burden, not the number of entries in `package.json`.
 
 The target and execution sequence are recorded in
-[`architecture-refactor-plan.md`](architecture-refactor-plan.md). It proposes one shared request
-lifecycle, daemon ownership of complete dispatch jobs, transactional operational job state, and
-maintained protocol/schema infrastructure. It is a plan, not a claim that the runtime has changed.
+[`architecture-refactor-plan.md`](architecture-refactor-plan.md). Its September 22 replacement
+adopts full-agent dispatch rather than custom request/job services. The earlier custom-service
+version remains in git history. Neither planning revision claims the runtime has changed.
 
 This clarification supersedes migration-size objections in historical assessments below. It does
 not reinstate unused kernel ports or authorize speculative abstractions: replacements must be
