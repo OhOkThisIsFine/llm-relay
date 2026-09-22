@@ -4,7 +4,8 @@ Entry point for any agent picking up llm-relay. Read this before `CLAUDE.md`.
 
 ## 0. Current state — 2026-09-21
 
-The repository is on the published v0.86.0 baseline and is waiting on live continuation evidence.
+The repository is on the published v0.86.0 baseline. An architecture-first refactor is planned,
+not implemented; live continuation verification remains evidence-gated.
 
 - Published package version: **0.86.0**.
 - `main` contains the architecture published in **v0.86.0**.
@@ -28,7 +29,19 @@ The repository is on the published v0.86.0 baseline and is waiting on live conti
   removed stale restart/reload/continuation claims, and trimmed implementation comments to durable
   invariants. Its `src/**/*.ts` diff was comment-only; no runtime behavior changed.
 
-### Immediate next
+### Immediate next — architecture refactor
+
+Follow [`docs/architecture-refactor-plan.md`](docs/architecture-refactor-plan.md). The owner has
+clarified that finished-system simplicity takes priority over refactor size. Start with R0 baseline/
+reported lock-race verification and R1 dependency decisions, then implement one request lifecycle
+and daemon ownership of complete dispatch jobs. The plan includes migration, deletion and acceptance
+criteria; none of those changes is represented as shipped here.
+
+Offline refactor work does not wait for harness quota. Keep the continuation measurements below,
+but implement continuation only after the daemon-owned job boundary is stable and the harness has
+passed its evidence gates.
+
+### Continuation work — still evidence-gated
 
 All quota-independent continuation preparation is complete: the first-party survey, four exact-ID
 interruption/resume probes, and same-cwd two-job isolation probe are in `main`. Live verification
@@ -38,7 +51,7 @@ both its single-job probe and `scripts/measure-continuation-isolation.mjs <harne
 Audit evidence:
 [`docs/history/release-readiness-audit-2026-09-21.md`](docs/history/release-readiness-audit-2026-09-21.md).
 
-Work in this order:
+Continuation work proceeds in this order, subject to the refactor ownership boundary above:
 
 1. when quota is available, run any documented exact-ID continuation probe (prefer AGY, then Claude; Codex specifically tests active-turn durability);
 2. mark only a passing harness verified resumable;
@@ -46,7 +59,7 @@ Work in this order:
 4. implement one verified harness end to end, then expand harness support independently;
 5. clear evidence/vendor/operator-blocked items in parallel as their inputs become available.
 
-Detailed sequence and exit conditions:
+Detailed continuation sequence and exit conditions:
 [`docs/history/development-plan-2026-09-21.md`](docs/history/development-plan-2026-09-21.md).
 
 The authoritative unmet-property list is [`docs/backlog.md`](docs/backlog.md).
@@ -77,7 +90,8 @@ design records.
 |---|---|
 | `docs/README.md` | Documentation index |
 | `docs/backlog.md` | Current unmet properties |
-| `docs/history/development-plan-2026-09-21.md` | Current development sequence |
+| `docs/architecture-refactor-plan.md` | Target architecture, implementation sequence and acceptance criteria |
+| `docs/history/development-plan-2026-09-21.md` | Earlier continuation preparation sequence |
 | `CLAUDE.md` | Architecture map, invariants, responsibility table and gotchas |
 | `docs/architecture.md` | Human-facing codebase overview |
 | `docs/reference.md` | User-facing commands, configuration, APIs and caveats |
@@ -97,7 +111,7 @@ npm run gate
 
 `npm run gate` builds first, then runs both typechecks, the core test suite, dashboard checks and
 package checks. CI additionally has the targeted `windows-process-boundary` job for process,
-persistence and Windows-specific lifecycle behavior.
+persistence, spawning or lifecycle semantics.
 
 Important rules:
 

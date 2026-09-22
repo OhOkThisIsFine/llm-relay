@@ -2,18 +2,29 @@
 
 > The work queue. Each entry states an unmet **Property** and is deleted once that property is met.
 > Shipped work belongs in git history and dated records under [`history/`](history/).
-> [`../HANDOFF.md`](../HANDOFF.md) holds current state and the immediate next step; the current
-> development sequence is in
-> [`history/development-plan-2026-09-21.md`](history/development-plan-2026-09-21.md).
+> [`../HANDOFF.md`](../HANDOFF.md) holds current runtime state. The architecture refactor sequence is
+> in [`architecture-refactor-plan.md`](architecture-refactor-plan.md); the earlier continuation
+> sequence remains in [`history/development-plan-2026-09-21.md`](history/development-plan-2026-09-21.md).
 > This file is not a status log.
 
 ## Open
+
+- **Architecture refactor: single-owner request routing and dispatch.**
+  Follow [`architecture-refactor-plan.md`](architecture-refactor-plan.md), starting with R0 baseline/
+  lock-race verification and R1 dependency decisions. Optimize the finished architecture rather
+  than diff size; preserve product guarantees, not duplicated implementations. The plan is not yet
+  implemented and does not claim the reported lock race has been independently reverified.
+  **Property:** all API fronts share one request-execution lifecycle; the daemon owns each complete
+  dispatch job; transactional job state has one mutation authority; maintained MCP/schema machinery
+  replaces commodity handwritten code; migration is verified and superseded runtime paths are deleted.
 
 - **Active hard-cap continuation is designed but not implemented.**
   Survey and measurement tooling are complete for AGY, Claude, Codex and OpenCode, but no harness is
   yet verified resumable by both the exact-ID interruption/resume probe and the same-cwd isolation
   probe. Runtime implementation remains gated on that live evidence. The approved design is in
   [`history/active-hard-cap-lane-continuation-plan-2026-09-20.md`](history/active-hard-cap-lane-continuation-plan-2026-09-20.md).
+  Integrate continuation into daemon-owned attempts after the refactor's ownership boundary is stable;
+  do not build another MCP-owned continuation path. Offline refactor work does not wait for harness quota.
   **Property:** where a verified harness exposes an exact resumable session identity, an active
   hard-cap event rolls the same logical attempt into a new process incarnation without overlap,
   without consuming another walk rung, and without counting the rollover as lane-failure evidence.

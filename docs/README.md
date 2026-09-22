@@ -11,7 +11,8 @@ Start with the row that matches what you want to do.
 | To know what this project is, and is not | [`project-goals.md`](project-goals.md) |
 | The convictions that settle a design question | [`project-philosophy.md`](project-philosophy.md) |
 | What is still open | [`backlog.md`](backlog.md) |
-| What development should happen next | [`history/development-plan-2026-09-21.md`](history/development-plan-2026-09-21.md) |
+| The target architecture and refactor sequence | [`architecture-refactor-plan.md`](architecture-refactor-plan.md) |
+| The earlier continuation preparation sequence | [`history/development-plan-2026-09-21.md`](history/development-plan-2026-09-21.md) |
 
 ## Subject documents
 
