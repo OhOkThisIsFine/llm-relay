@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - 'scripts/refactor/gateway-contracts.*'
-      - 'test/refactor-gateway-fixtures.test.ts'
+      - 'scripts/refactor/gateway-*'
+      - 'test/refactor-gateway-*.test.ts'
       - '.github/workflows/gateway-contracts.yml'
 
 permissions:
@@ -31,7 +31,9 @@ jobs:
         with:
           node-version: 22
       - name: Verify positive and negative fixture controls
-        run: node scripts/refactor/gateway-contracts.mjs --self-test
+        run: |
+          node scripts/refactor/gateway-contracts.mjs --self-test
+          node scripts/refactor/gateway-boundaries.mjs --self-test
       - if: matrix.candidate == 'relay'
         run: npm ci --ignore-scripts
       - if: matrix.candidate == 'relay'
@@ -40,3 +42,5 @@ jobs:
       # A green job does not qualify a gateway: inspect allContractsPassed and each result.
       - name: Measure candidate contracts against synthetic providers
         run: node scripts/refactor/gateway-contracts.mjs ${{ matrix.candidate }}
+      - name: Verify native bypasses and single-wire providers
+        run: node scripts/refactor/gateway-boundaries.mjs ${{ matrix.candidate }}
