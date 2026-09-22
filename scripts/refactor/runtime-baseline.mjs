@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 const self = fileURLToPath(import.meta.url);
 const role = process.argv[2];
+const PRODUCER_BURST_BYTES = 64 * 1024;
 const listen = async (server) => {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -46,8 +47,9 @@ async function upstream() {
             res.once('drain', done); res.once('close', done);
           });
         }
-        // Yield so the first content and cancellation are observable before EOF.
-        await delay(1);
+        // Bound synthetic pacing to one timer per burst, not per 4 KiB frame.
+        // Windows timer granularity can otherwise dominate a multi-MiB measurement.
+        if ((sent + 4096) % PRODUCER_BURST_BYTES === 0) await delay(1);
       }
       if (!hold && !res.destroyed) res.end(frame({}, 'stop') + 'data: [DONE]\n\n');
     } catch (error) { if (!res.destroyed) res.destroy(error); }
@@ -162,7 +164,13 @@ async function measure() {
       startups.push(performance.now() - t);
       if (i < 2) { proxy.child.kill(); await proxy.closed; }
     }
-    const result = { version: 1, node: process.version, platform: process.platform, arch: process.arch, startupMs: summary(startups), fronts: {}, storageMs: null };
+    const timerSamples = [];
+    for (let i = 0; i < 12; i++) {
+      const t = performance.now(); await delay(1); timerSamples.push(performance.now() - t);
+    }
+    const timerDelayMs = summary(timerSamples);
+    process.stderr.write(JSON.stringify({ probe: 'runtime-baseline', stage: 'timer-calibration', timerDelayMs }) + '\n');
+    const result = { version: 2, node: process.version, platform: process.platform, arch: process.arch, producerBurstBytes: PRODUCER_BURST_BYTES, timerDelayMs, startupMs: summary(startups), fronts: {}, storageMs: null };
     for (const path of ['/v1/messages', '/v1/chat/completions', '/v1/responses']) {
       const body = (stream) => path === '/v1/responses'
         ? { model: 'bench/m', input: 'hello', max_output_tokens: 32, stream }
@@ -176,6 +184,7 @@ async function measure() {
       }
       const streams = [];
       for (const bytes of [1024 * 1024, 8 * 1024 * 1024]) {
+        process.stderr.write(JSON.stringify({ probe: 'runtime-baseline', stage: 'stream', path, bytes }) + '\n');
         await up.rpc('configure', { bytes, hold: false, token: ++sequence });
         await proxy.rpc('sample-start');
         const t = performance.now(); const response = await post(true); assert.equal(response.status, 200);

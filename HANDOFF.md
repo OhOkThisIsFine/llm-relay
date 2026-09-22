@@ -2,17 +2,29 @@
 
 Entry point for any agent picking up llm-relay. Read this before `CLAUDE.md`.
 
-## 0. Current state — 2026-09-21
+## 0. Current state — 2026-09-22
 
-The architecture refactor has begun with the R0 legacy-storage safety fix. The target request,
-dispatch and SQLite ownership changes are not implemented; live continuation remains evidence-gated.
+The architecture refactor has an R0 legacy-storage safety fix, executable runtime baselines and
+recorded R1 dependency/boundary choices. The target request, dispatch and SQLite ownership changes
+are not implemented; live continuation remains evidence-gated.
 
 - Published package version: **0.86.0**. This refactor work is not a new published release.
 - Starting `main` baseline: `3f5d88a` (merged architecture plan, PR #73), CI run **790** green.
 - R0 replaces unsafe recursive stale-lock deletion with generation-specific owner retirement.
   The source checkpoint `5737286` passed CI run **791**, including the full Linux gate and targeted
-  Windows suite. Evidence and remaining R0 work are in
+  Windows suite. Lock evidence and the upgrade boundary are in
   [`docs/history/refactor-r0-2026-09-21.md`](docs/history/refactor-r0-2026-09-21.md).
+- Runtime and SDK/schema/SQLite probes pass on Linux and Windows. Measurements and the protected
+  contract map are in
+  [`docs/history/refactor-baselines-and-dependencies-2026-09-22.md`](docs/history/refactor-baselines-and-dependencies-2026-09-22.md).
+- R1 selects in-process native adapters plus llm-bridge for supported cross-wire translation,
+  official MCP SDK v2, Zod/Ajv schemas, and worker-isolated SQLite using DELETE/EXTRA. Decisions,
+  gateway comparisons, performance-budget policy and remaining acceptance boundaries are in
+  [`docs/history/refactor-r1-decisions-2026-09-22.md`](docs/history/refactor-r1-decisions-2026-09-22.md).
+  Production dependencies and the Node engine range have not changed.
+- The expanded comparison confirms a current **native Responses fidelity defect**: unnecessary
+  translation changes native fields, IDs and usage structure. It is recorded in the backlog and
+  must be corrected by R2; it is not fixed by this evidence packet.
 - D1 restart-safe daemon-owned lane execution is implemented.
 - D2 transactional config hot reload is implemented.
 - Public dispatch/liveness state is explicit rather than inferred from circumstantial clues.
@@ -25,15 +37,25 @@ dispatch and SQLite ownership changes are not implemented; live continuation rem
   TypeScript 7 compilation, jest-dom 7 and lucide-react 1. Node declarations intentionally remain
   on the Node 22 line while Node 22 is supported.
 - PR #70 refreshed live documentation and trimmed implementation comments. The separate follow-up
-  documentation PR #72 was not included in this R0 packet.
+  documentation PR #72 was not included in this refactor packet.
 
 ### Immediate next — architecture refactor
 
 Follow [`docs/architecture-refactor-plan.md`](docs/architecture-refactor-plan.md). Finished-system
-simplicity takes priority over refactor size. The reported stale-lock race is reproduced and fixed;
-finish the remaining R0 contract classification and performance baselines, then execute R1 dependency
-comparisons before the request lifecycle and complete-job ownership cutovers. Do not mark all of R0
-complete or treat R1 dependencies as selected from this safety fix alone.
+simplicity takes priority over refactor size. R1 implementation choices are recorded: do not restart
+an open-ended gateway survey. Calibrate the matched same-build runtime controls against the explicit
+budget policy, then implement R2's one RequestService, including native Responses preservation.
+Delete both obsolete orchestration loops; answer mode must use a real internal consumer.
+
+The current compact contract map protects unreviewed tests by default; review each affected assertion
+before replacing its owning implementation. A passing comparison screen is not full qualification.
+The gateways' documented native passthrough routes passed all twelve tested native cases; their earlier
+unified-endpoint field losses are not evidence that native preservation is impossible.
+
+SDK/schema/SQLite choices are for implementation, not installed runtime changes. Node 22.13 is a
+tested minimum API level, not an operational patch recommendation; its SQLite API is experimental.
+Paired-control calibration, full host/schema/install and storage-cutover gates remain. Do not claim
+the service refactor or release acceptance complete from the probes alone.
 
 **Upgrade boundary:** drain and stop every old daemon, MCP and writing CLI process before running
 this lock version. A legacy `owner.json` lock is never reclaimed automatically. Only after all
@@ -94,7 +116,9 @@ design records.
 | `docs/README.md` | Documentation index |
 | `docs/backlog.md` | Current unmet properties |
 | `docs/architecture-refactor-plan.md` | Target architecture, implementation sequence and acceptance criteria |
-| `docs/history/refactor-r0-2026-09-21.md` | Initial R0 evidence, contract classification and upgrade boundary |
+| `docs/history/refactor-r1-decisions-2026-09-22.md` | Selected dependencies, native-wire evidence, performance budgets and R2 boundary |
+| `docs/history/refactor-baselines-and-dependencies-2026-09-22.md` | Runtime measurements, contract map and tested infrastructure choices |
+| `docs/history/refactor-r0-2026-09-21.md` | Initial R0 lock evidence and upgrade boundary |
 | `docs/history/development-plan-2026-09-21.md` | Earlier continuation preparation sequence |
 | `CLAUDE.md` | Architecture map, invariants, responsibility table and gotchas |
 | `docs/architecture.md` | Human-facing codebase overview |
@@ -115,7 +139,8 @@ npm run gate
 
 `npm run gate` builds first, then runs both typechecks, the core test suite, dashboard checks and
 package checks. CI additionally has the targeted `windows-process-boundary` job for process,
-persistence, spawning or lifecycle semantics.
+persistence, spawning or lifecycle semantics. The separate refactor evidence workflow runs the
+synthetic baseline and dependency probes; it does not replace this gate.
 
 Important rules:
 

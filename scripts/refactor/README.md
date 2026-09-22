@@ -1,17 +1,22 @@
 # Refactor evidence probes
 
 Offline, synthetic fixtures for R0/R1 of the [architecture refactor](../../docs/architecture-refactor-plan.md).
-These are test programs, not a second implementation or shipped runtime dependencies.
+These are test programs, not a second implementation or shipped runtime dependencies. The
+[dated checkpoint](../../docs/history/refactor-baselines-and-dependencies-2026-09-22.md) records
+measurements, infrastructure choices and the remaining comparison gates.
 
 - `runtime-baseline.mjs`: build the server first, then run with Node. Three separate relay process
   starts; 30 warm nonstreamed requests per HTTP front; 1/8 MiB streams with a throttled reader;
   three client-abort propagation measurements per front; 64/512-row legacy state-write timings.
   Upstream, relay and client run in separate processes. Only the relay's memory is sampled.
   All providers and state are temporary; provider credentials and user config are not inherited.
-- `sqlite-probe.mjs`: no installation required on Node 22.13+. Tests DELETE and WAL with FULL
-  synchronous mode, constraints, atomic terminal results, killed uncommitted writers, extension
-  refusal, POSIX sidecar permissions and worker-isolated busy handling. Does not test power loss,
-  migration, Windows ACL installation or daemon/process ownership.
+  Output version 2 records timer granularity and paces the producer once per 64 KiB burst, avoiding
+  thousands of timer pauses that dominated the original Windows fixture. Relay deadlines are unchanged.
+- `sqlite-probe.mjs`: no installation required on Node 22.13+. Compares DELETE/EXTRA with WAL/FULL:
+  constraints, atomic terminal results, killed uncommitted writers, extension refusal, POSIX sidecar
+  permissions and worker-isolated busy handling. Does not test power loss, migration, Windows ACL
+  installation or daemon/process ownership. EXTRA includes the rollback-journal directory sync that
+  FULL does not promise; see [SQLite's synchronous documentation](https://www.sqlite.org/pragma.html#pragma_synchronous).
 - `sdk-probe/`: isolated, private package with exact direct dependency versions. Run
   `npm install --prefix scripts/refactor/sdk-probe --ignore-scripts`, then
   `node scripts/refactor/sdk-probe/probe.mjs`. Exercises a single Zod definition via Ajv and the
@@ -19,9 +24,11 @@ These are test programs, not a second implementation or shipped runtime dependen
   cancellation. These are protocol fixtures, not live-host or daemon-owned-job verification.
 
 Each executable prints JSON evidence. The dedicated workflow runs the probes on Linux and Windows;
-SDK/SQLite probes use the proposed Node 22.13.0 floor without changing the production engine range.
-The SDK probe prints resolved transitive versions/integrities: its initial install is an experiment,
-not a production lockfile. Preserve the measured resolution when adopting the dependency.
+SDK/SQLite probes use the proposed Node 22.13.0 API floor without changing the production engine range.
+This old patch is a compatibility test, not an operational recommendation; use a supported current
+security patch for installations. The SDK probe prints resolved transitive versions/integrities:
+its initial install is an experiment, not a production lockfile. Preserve the measured resolution
+when adopting the dependency.
 
 Timing results are observations, not machine-independent thresholds. Record runner/runtime and
 compare like-for-like runs. Stream first-chunk timing means first received wire chunk, not semantic

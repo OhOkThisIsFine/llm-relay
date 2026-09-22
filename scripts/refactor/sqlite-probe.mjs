@@ -9,9 +9,11 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { isMainThread, parentPort, Worker, workerData } from 'node:worker_threads';
 
+function synchronous(mode) { return mode === 'DELETE' ? 'EXTRA' : 'FULL'; }
+
 function open(path, mode) {
   const db = new DatabaseSync(path, { allowExtension: false, enableForeignKeyConstraints: true });
-  db.exec(`PRAGMA journal_mode=${mode}; PRAGMA synchronous=FULL; PRAGMA busy_timeout=100;`);
+  db.exec(`PRAGMA journal_mode=${mode}; PRAGMA synchronous=${synchronous(mode)}; PRAGMA busy_timeout=100;`);
   return db;
 }
 
@@ -44,7 +46,7 @@ if (!isMainThread) {
         db.exec(`CREATE TABLE jobs (id TEXT PRIMARY KEY, submission TEXT NOT NULL UNIQUE, status TEXT NOT NULL) STRICT;
           CREATE TABLE results (job_id TEXT PRIMARY KEY REFERENCES jobs(id), output TEXT NOT NULL) STRICT;
           PRAGMA user_version=1;`);
-        assert.equal(db.prepare('PRAGMA synchronous').get().synchronous, 2);
+        assert.equal(db.prepare('PRAGMA synchronous').get().synchronous, mode === 'DELETE' ? 3 : 2);
         assert.equal(db.prepare('PRAGMA foreign_keys').get().foreign_keys, 1);
         assert.equal(db.prepare('PRAGMA journal_mode').get().journal_mode, mode.toLowerCase());
         assert.throws(() => db.enableLoadExtension(true));
@@ -96,7 +98,7 @@ if (!isMainThread) {
         timings.sort((a, b) => a - b);
         const files = readdirSync(dir).filter((name) => name.startsWith(mode)).map((name) => ({ name, bytes: statSync(join(dir, name)).size, mode: statSync(join(dir, name)).mode & 0o777 }));
         if (process.platform !== 'win32') assert(files.every((f) => (f.mode & 0o077) === 0), 'Database and sidecars must stay private');
-        results.push({ mode, busy, parentTimerTicks: ticks, commitMs: { median: timings[50], p95: timings[94] }, files });
+        results.push({ mode, synchronous: synchronous(mode), busy, parentTimerTicks: ticks, commitMs: { median: timings[50], p95: timings[94] }, files });
       } finally {
         if (crashed) { crashed.kill(); await crashExit; }
         await worker?.terminate();
