@@ -59,9 +59,9 @@ async function upstream() {
 }
 
 async function relay() {
-  const { createProxy } = await import('../../../dist/server.js');
-  const { ModelCatalog } = await import('../../../dist/catalog.js');
-  const { transactionalUpdateJsonSync } = await import('../../../dist/storage/json-store.js');
+  const { createProxy } = await import('../../dist/server.js');
+  const { ModelCatalog } = await import('../../dist/catalog.js');
+  const { transactionalUpdateJsonSync } = await import('../../dist/storage/json-store.js');
   const config = {
     host: '127.0.0.1', port: 0,
     providers: { bench: { base: process.env.RELAY_BENCH_UPSTREAM, kind: 'openai', authHeader: 'authorization', credentialMode: 'contained', timeoutMs: 10000 } },
