@@ -1,339 +1,263 @@
 # llm-relay quick start
 
-**Hand this file to your AI coding assistant and say "set this up for me."** It is written to
-be followed by an assistant with shell access, but a human can follow it too.
-
-Goal: run Claude Code (or any Anthropic-API client) so that **bulk background work runs on
-free third-party quota** while your own conversation keeps using your own subscription.
-
-Nothing here is required all at once. Stage 1 is useful on its own; each later stage adds
-capability. **Stop wherever it stops being worth it.**
-
----
+Set up the loopback proxy and MCP dispatch server, then enable only the routing you need.
+The proxy routes selected client requests to your configured providers; MCP dispatch delegates
+complete tasks to configured agent lanes. Each stage is optional after the basic installation.
 
 ## One dispatch rule for every host
 
-When an assistant has the `llm-relay` MCP tools, it should call `dispatch` for a self-contained
-task. This is the same rule in Claude, Codex, desktop apps, CLIs, and any other MCP host. The MCP
-server chooses the lane and returns its answer; the assistant does not need to identify its host or
-construct a lane command.
+When an assistant has llm-relay MCP tools, use `dispatch` for a self-contained task. The MCP
+server chooses the lane and returns its answer; the assistant does not need to identify its host
+or construct a lane command.
 
-If MCP is unavailable, the one fallback is:
+Without MCP, use the advisory CLI fallback:
 
 ```bash
 llm-relay dispatch --next-command -t "<the whole task>"
 ```
 
-Follow the command or target it returns. Do not guess whether a native child can reach a relay pool.
+Follow the returned command or target. Do not assume that a host's native child agents can use
+`pool/*` model names. Use MCP `dispatch` for Codex Desktop and Claude Desktop rather than relying
+on their native child traffic reaching the proxy.
 
-⚠ **Codex Desktop must use MCP `dispatch`, not a `pool/*` collaboration child.** With a ChatGPT
-account, Desktop validates that child model before contacting the custom provider or llm-relay and
-returns HTTP 400. A global llm-relay install registers its MCP server for local Codex automatically.
-
-For Claude, register it once with:
+A global install registers the MCP server for local Codex. For Claude, register it once:
 
 ```bash
 claude mcp add --scope user llm-relay -- llm-relay mcp
 ```
 
-Other MCP hosts should register the stdio command `llm-relay mcp` using their normal MCP settings.
-
----
+Other MCP hosts should register the stdio command `llm-relay mcp` in their MCP settings.
 
 ## What this actually does
 
-llm-relay has two complementary entry points: an MCP dispatch server (`llm-relay mcp`) that hands a
-whole task to the configured lane, and a loopback API proxy for clients whose HTTP traffic can be
-pointed at it. The proxy then:
+The HTTP proxy supports clients that honor a custom API base URL. With the starter Anthropic
+passthrough configuration, ordinary conversations retain their normal route; enabling subagent
+only offload sends marked child requests to the configured offload targets. Repair mode can
+correct malformed tool calls, but it does not supply judgment or invent intent.
 
-- forwards your **own** conversation to real Anthropic, untouched (your subscription, your model);
-- optionally routes **subagents** to free providers instead (this is the quota saving);
-- validates and repairs the tool calls weaker models emit, so they can drive an agent loop.
+MCP dispatch is separate: it hands a whole task to a lane and can launch the configured agent
+process. It does not require the host's own HTTP traffic to pass through the relay.
 
-The key idea: a subagent doing "read 20 files and summarise" does not need a frontier model.
-Free providers are plenty, and that work is where the tokens go.
+> **Credential handling:** create provider accounts and enter keys locally. Do not paste keys into
+> an assistant conversation. Treat `.env`, `keystore.json` and `control-token` as secrets.
 
-> **Assistant note:** the user must create the accounts and paste the keys themselves. Never
-> ask them to send you a key, and never type one into a file on their behalf if you can have
-> them set an environment variable instead.
+## Stage 1 — install and run
 
----
-
-## Stage 1 — install and run (10 minutes)
+Use Node.js 22 or later:
 
 ```bash
 npm install -g llm-relay
-```
-
-Generate a starter config:
-
-```bash
 llm-relay onboard
-```
-
-That writes `~/.llm-relay/config.json`. Then start it:
-
-```bash
 llm-relay
 ```
 
-It listens on `127.0.0.1:8791` and refuses to bind anything non-loopback — it holds provider
-keys. Its data plane relies on the configured client/provider credentials; stateful and costly
-control routes independently require the per-install capability that the CLI manages automatically.
+Onboarding creates a starter configuration. The legacy default is `~/.llm-relay/config.json`.
+With XDG variables set, config and cache artifacts prefer their XDG locations, but an existing
+legacy artifact remains in use when its preferred counterpart is absent. Nothing is migrated
+automatically. Use the paths reported by the CLI when they differ from the legacy examples below.
 
-**Point a terminal-launched Claude CLI at it** by adding an `env` block to
-`~/.claude/settings.json`:
+The default listener is `127.0.0.1:8791`. Other valid ports and the supported loopback hosts
+`localhost` and `::1` are configurable; non-loopback hosts are rejected. The data plane uses
+configured client/provider credentials. Protected control routes separately require the
+per-install token, which the CLI manages automatically.
+
+For a terminal-launched Claude CLI that honors a custom base URL, add this environment setting
+to `~/.claude/settings.json`, preserving any existing settings:
 
 ```json
 { "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:8791" } }
 ```
 
-> ⚠️ Use the settings file, not a shell environment variable. Some launchers set
-> `ANTHROPIC_BASE_URL` into the process environment themselves, which silently overrides a
-> user-level variable — and then nothing looks wrong while the proxy is not in the path.
+Verify that requests reach the relay: launchers can override inherited environment settings.
+A desktop host that bypasses custom base URLs should use MCP dispatch instead. Check required
+host features before changing its base URL; direct-provider features and extended-context support
+may behave differently behind a proxy. See [reference.md](reference.md) for recorded host caveats.
 
-> ⚠️ Claude Desktop is a bypassed host: it pins its own sessions to `api.anthropic.com`. Use
-> MCP `dispatch` there. The setting above applies only to a client that honors the custom base URL.
+With the starter passthrough configuration, verify ordinary requests before enabling offload.
 
-**Known cost of a custom base URL:** Claude Code's `/remote-control` is hard-gated to
-`api.anthropic.com` and will not work behind any proxy. There is no workaround; if you rely
-on it, stop here. Claude Code also drops the 1M-context beta header behind a custom base URL.
+## Stage 2 — add providers
 
-At this point everything still goes to Anthropic. Nothing is saved yet — but nothing is broken
-either, which is the right place to verify from.
+Choose providers and models for which you have access. Free tiers, prices and allowances depend
+on the account and model and can change; verify the provider's current terms rather than treating
+this guide as a quota promise. Multiple providers give the relay alternatives when one is unavailable.
 
----
+| Provider | Account/key page | Env var |
+|---|---|---|
+| Cerebras | https://cloud.cerebras.ai | `CEREBRAS_API_KEY` |
+| Groq | https://console.groq.com/keys | `GROQ_API_KEY` |
+| Google AI Studio | https://aistudio.google.com/app/apikey | `GEMINI_API_KEY` |
+| NVIDIA NIM | https://build.nvidia.com | `NVIDIA_API_KEY` |
+| Mistral | https://console.mistral.ai/api-keys | `MISTRAL_API_KEY` |
+| OpenRouter | https://openrouter.ai/keys | `OPENROUTER_API_KEY` |
+| Cohere | https://dashboard.cohere.com/api-keys | `COHERE_API_KEY` |
 
-## Stage 2 — add free providers (the actual savings)
-
-Every provider below has a genuinely free tier. **Get as many as you have patience for; two
-or three is enough to be useful.** More providers mainly buys resilience, since any one can
-rate-limit you.
-
-| Provider | Free allowance | Sign up | Env var |
-|---|---|---|---|
-| **Cerebras** | 1M tokens/day, no card | https://cloud.cerebras.ai | `CEREBRAS_API_KEY` |
-| **Groq** | ~14,400 req/day on small models | https://console.groq.com/keys | `GROQ_API_KEY` |
-| **Google AI Studio** | generous on Flash models | https://aistudio.google.com/app/apikey | `GEMINI_API_KEY` |
-| **NVIDIA NIM** | 40 req/min | https://build.nvidia.com | `NVIDIA_API_KEY` |
-| **Mistral** | large per-model token budgets | https://console.mistral.ai/api-keys | `MISTRAL_API_KEY` |
-| **OpenRouter** | 20 req/min, 50 req/day, many `:free` models | https://openrouter.ai/keys | `OPENROUTER_API_KEY` |
-| **Cohere** | 20 req/min, 1,000 req/month | https://dashboard.cohere.com/api-keys | `COHERE_API_KEY` |
-
-Set the keys so they persist across restarts.
-
-**macOS / Linux** — add to `~/.zshrc` or `~/.bashrc`:
+Persist keys locally. For a shell-launched relay on macOS/Linux, add an export to the shell's
+startup file:
 
 ```bash
-export CEREBRAS_API_KEY="csk-..."
+export CEREBRAS_API_KEY="<your key>"
 ```
 
-**Windows** — `setx` writes to the registry, and only affects *new* processes:
+On Windows, `setx` changes the environment for **new** processes:
 
 ```bash
-setx CEREBRAS_API_KEY "csk-..."
+setx CEREBRAS_API_KEY "<your key>"
 ```
 
-Either way, **restart the relay afterwards** or it will not see the new keys.
+Restart the relay from an environment containing the new values. Alternatively, use `KEY=value`
+lines in the relay's `.env` file (legacy default `~/.llm-relay/.env`). It is read at startup;
+already-set environment variables take precedence. Config reload does not refresh the process's
+inherited environment.
 
-Alternatively put them in `~/.llm-relay/.env` as `KEY=value` lines — llm-relay reads that file
-at startup. A variable already set in your environment always wins over the file.
+For multiple keys on one provider, replace its `authEnv` with a credential fleet. For example,
+inside `providers` in the active configuration:
 
-Optional: if one provider has multiple accounts, replace that provider's `authEnv` with a
-credential fleet in `~/.llm-relay/config.json`:
-
-```jsonc
+```json
 "nim": {
   "base": "https://integrate.api.nvidia.com/v1",
   "kind": "openai",
   "credentials": [
     { "label": "personal", "authEnv": "NVIDIA_API_KEY" },
     { "label": "work", "authEnv": "NVIDIA_WORK_API_KEY" }
-  ],
-  "tierType": "free"
+  ]
 }
 ```
 
-Use `authEnv` or `credentials[]` on a provider, never both. A fleet slot's env name is exact (it
-does not use the legacy provider alias lookup), and its label is visible non-secret metadata.
+Use `authEnv` or `credentials[]`, never both. Fleet env names are exact; they do not use legacy
+provider aliases. Labels are visible metadata, so do not put secrets in them. Adding providers
+or changing credential identity requires a restart.
 
-Now verify, and **do not skip this** — the two checks answer different questions:
+Verify credentials and actual model access separately:
 
 ```bash
 llm-relay keys
-```
-
-```bash
 llm-relay pools --probe
 ```
 
-`keys` checks every configured credential slot. `pools --probe` spends one real completion per
-unique deployment in your routing pools, through one serviceable slot — not once per credential.
-It is the only way to catch a model that is configured, listed by the provider, and nonetheless
-dead. Remove a deployment from `routing.pools` only for deployment-level `DEAD` evidence.
+`keys` checks configured credential slots. `pools --probe` makes real completion requests through
+one serviceable slot per unique deployment in the routing pools, not once per credential.
+A listed model can still be unavailable to your account.
 
-Two of the verdicts are about credentials, and they mean different things:
+| Verdict | Meaning and action |
+|---|---|
+| `AUTH` | No enabled, model-eligible slot held a key; no request was sent. Check the key, slot enablement and model restrictions. |
+| `DENIED` | The provider answered 401/403. Check both credential validity and model entitlement; the probe does not distinguish them. |
+| `DEAD` | Deployment-level failure evidence; inspect it before changing pool membership. |
 
-- **`AUTH`** — no enabled credential slot that this model is allowed to use held a key, so **no
-  request was sent**. It is a configuration fact, not a provider answer. Add a key, enable the
-  slot, or widen its `models` list. Rotating a key fixes nothing here.
-- **`DENIED`** — the server itself answered 401/403. That may be a bad credential, **or** an
-  entitlement wall on a model your key legitimately cannot touch. The probe cannot tell the two
-  apart, so it does not guess. Check the model's plan tier before you rotate anything.
-
-Neither verdict proves the deployment is dead, and neither invalidates a sibling slot — the probe
-spends one slot only. `keys` names each slot as `provider#label`.
-
-> **Assistant note:** never add a model to a pool without probing that exact spec first. A
-> plausible-looking model id that 404s will sit at the top of a pool and burn a failover hop
-> on every single request.
-
----
+A credential failure does not invalidate sibling slots or prove the deployment is dead. Probe an
+exact model spec before adding it to a pool; do not substitute a plausible-looking model name.
 
 ## Stage 3 — choose client-specific offload
 
-This stage is only for a client's own HTTP traffic that already reaches the relay. It is not
-needed for MCP `dispatch`, and it cannot reroute a native child from a bypassed host. Offload is
-**off by default**, deliberately. Enable only the harnesses and request scope you want:
+Offload affects only HTTP requests that already reach the relay. It is not needed for MCP dispatch
+and cannot intercept native children from a bypassed host. It is off by default.
 
 ```bash
-llm-relay offload <harness> <on|off> [--scope <scope>]
+llm-relay offload <client> <on|off> [--scope <scope>]
 ```
 
-`<harness>`: `claude` | `codex` | another configured client. `<scope>`: `subagents` | `all`
-(default: `subagents`).
+The built-in client keys are `claude`, `codex`, `openai` and `default`. They are derived from request
+paths, not arbitrary application names. `default` supplies the fallback rule when a client has no
+specific rule. Other configured labels match no front door.
 
-On a routed client, marked Claude/Codex subagent requests now use the free pools while the parent
-conversation stays on its normal route. `--scope all` also routes the parent conversation through
-the pool. Changes take effect on the next request; no restart. Codex Desktop collaboration does not
-reach this routing layer—use MCP `dispatch` there.
+The default scope, `subagents`, applies only to marked child requests and keeps the parent on its
+normal route. `--scope all` also applies the configured offload mapping to the client's parent
+conversation. Offload changes take effect on the next request without a restart.
 
 ```bash
+llm-relay offload claude on --scope subagents
 llm-relay offload status
+llm-relay offload claude off
 ```
 
-Use `llm-relay offload <harness> off` to disable one harness. The legacy boolean form remains
-supported in config files as a global subagents-only rule, but CLI changes require a harness name.
+The legacy boolean config form remains a global subagents-only rule; CLI changes require a client
+name. To override one marked subagent request on an already-routed client, put a directive in its
+initial prompt using a configured pool or provider spec:
 
-To offload a **single request on an already-routed client** without turning the switch on globally,
-put this as the first line of that subagent's prompt:
-
-```
+```text
 @relay: pool/high
 ```
 
-The line is stripped before forwarding, so the model never sees it.
+The directive is stripped before forwarding. An unknown pool or provider fails explicitly rather
+than silently spending the primary route's quota.
 
-**Choosing targets:**
-
-```bash
-llm-relay candidates
-```
-
-That prints capability, price, latency and quota as separate columns — deliberately not blended
-into one score, because which column matters depends on the task.
-
-> ⚠️ Offloaded output is **advisory**. It comes from a different, usually weaker model. Verify
-> claims against real files before acting on them. Do not delegate judgement to this lane.
-
----
+Use `llm-relay candidates` to compare capability, price, latency and quota separately. Treat
+delegated output as advisory and verify claims against source material before acting.
 
 ## Stage 4 (optional) — local models
 
-Free, unlimited, offline, and no rate limits — but bounded by your hardware.
+A local provider uses your hardware rather than a hosted model allowance. Choose a model,
+quantization and context size suited to that hardware; parameter count alone is not a memory budget.
+
+For example, with Ollama installed:
 
 ```bash
 ollama pull qwen2.5-coder:7b
 ```
 
-Roughly: a 7B model needs ~8 GB of VRAM, 14B ~16 GB, 32B ~24 GB. Below that it runs on CPU and
-gets slow. Add to `~/.llm-relay/config.json`:
+Add a provider entry inside `providers` in the active config, then restart:
 
 ```json
 "ollama": { "base": "http://localhost:11434/v1", "kind": "openai" }
 ```
 
-No key needed. Ollama also offers a **cloud** tier (`https://ollama.com/v1`, `OLLAMA_API_KEY`)
-with some free hosted models and some subscription-only ones — probe before relying on any.
-
----
+Add and probe the exact local model spec before relying on it for routed work. A local endpoint
+and a provider's cloud offering are separate configurations; do not assume they share access or quotas.
 
 ## Stage 5 (optional) — your other subscriptions
 
-If you pay for other AI CLIs, they are additional capacity that llm-relay cannot reach
-directly: their quota is tied to their own client credentials. **Each subscription spends its
-own quota — there is no way to make one vendor's client spend another's.**
+Configured agent CLIs can use their own authenticated subscriptions. Each lane spends its own
+provider/account allowance; llm-relay does not convert one vendor's subscription into another's.
 
-The relay can still tell you which lane to use next:
+Configure `routing.ladder` with only the tools available on your machine. The CLI command below
+is advisory: it returns a ladder and the command to run, rather than executing the selected lane.
 
 ```bash
 llm-relay dispatch -t "trace every caller of parseConfig"
 ```
 
-It returns an ordered ladder and the exact command to run. **You (or your assistant) run it —
-the relay never spawns a CLI.** Configure the order in `routing.ladder`; add a rung per CLI you
-actually have, e.g. `codex exec` for a ChatGPT subscription. Omit the ones you don't.
+By contrast, **MCP `dispatch` can launch configured CLI lanes** and return their results. Daemon-owned
+attempts can survive an MCP host restart while the daemon remains alive. This is not automatic
+continuation of a killed harness session; active hard-cap continuation remains planned in
+[backlog.md](backlog.md).
 
-If a lane is out of credit, record it and get the next:
+To exclude an unavailable lane and request the next choice:
 
 ```bash
 llm-relay dispatch -x codex
 ```
 
-> A refusal or a bad answer is a *judgement*, not a transport failure. Only availability
-> failures (quota, rate limit, missing CLI) justify walking to the next rung — otherwise you
-> are just shopping for a more agreeable answer.
-
----
+Only availability failures justify walking the ladder. Do not treat disagreement or an unwanted
+answer as a transport failure and keep retrying for a preferred judgment.
 
 ## Troubleshooting
 
-**Everything fails to start.** The proxy is now in the path of every session. Escape hatch:
-remove `ANTHROPIC_BASE_URL` from `~/.claude/settings.json`.
+**A client stops working behind the proxy.** Restore its prior base-URL setting. For the Claude
+configuration above, remove only the added `ANTHROPIC_BASE_URL` entry, preserving other settings.
 
-**A provider is disabled at startup.** If a provider's `base` contains `${SOME_VAR}` and that
-variable is unset, that one provider is disabled with a warning and everything else keeps
-working. Set the variable, or use a literal value, and restart.
+**A provider is disabled at startup.** An unset `${SOME_VAR}` in its `base` disables that provider
+with a warning. Supply the variable or a literal base URL and restart. If required routing is left
+unusable, resolve that configuration error rather than assuming startup can continue.
 
-**`keys` says a key is fine but requests fail.** Run `llm-relay pools --probe` — the key can be
-valid while the specific *model* is dead or not on your plan. With a credential fleet, `keys`
-checks every slot while the probe deliberately uses only one serviceable slot per deployment.
+**`keys` succeeds but requests fail.** Run `llm-relay pools --probe` to test actual deployment access.
+A valid credential does not prove that a particular model is available on its plan.
 
-**`keys` reports one credential slot as `INVALID_KEY`.** Its row names the `provider#label`; fix, rotate,
-or disable that slot. `llm-relay candidates` shows the slot's affected deployment cells and policy.
-Do not remove the whole deployment or its sibling slots unless you also have deployment-level
-evidence that the model is unavailable.
+**One slot is `INVALID_KEY`.** Fix, rotate or disable the named `provider#label`, not every slot on
+the deployment. `llm-relay candidates` shows affected deployment cells and policy.
 
-**`keys` reports UNVERIFIED.** It is a refusal to conclude, never an accusation — the probe
-produced no evidence about the credential either way. Four situations reach it: the provider
-serves its model list publicly *and* answers the probe identically with and without your key; the
-first probe returns 405 (an anthropic-kind provider probes with a GET on `/v1/messages`, which
-normally answers 405, so it usually lands here); the first probe returns 400 or 404; or the
-authenticated probe returns any other status, such as a 5xx gateway error. The row's message names
-which one. `pools --probe` is the ground truth.
+**`keys` reports `UNVERIFIED`.** The check produced no conclusive credential evidence; it does not
+mean the key is invalid. Read the row's explanation, then probe the exact model.
 
-**A 403 that appears out of nowhere.** Check whether a VPN is running — some providers block
-VPN egress, which looks exactly like a rejected key.
+**A request returns 403.** Check credential and model entitlement as well as network restrictions,
+including VPN egress. The status alone does not identify the cause.
 
-**Windows: launching from a stale shell fails.** A process inherits the environment of whatever
-started it, not the registry. If you `setx` a variable, shells opened *before* that will not
-have it, and anything they launch will not either.
-
----
+**An edit has not taken effect.** Run `llm-relay reload` for supported config changes. If it reports
+restart-only fields, the candidate was not partially applied: restart to load them. Environment
+changes also require a process started with the new values; `setx` does not update existing shells.
 
 ## Machine-specific: this is not part of the standard setup
 
-The author's own machine layers extra things on top. **You do not need any of it**, and copying
-it blindly will cause problems:
-
-- **A second proxy (`headroom`) in front of llm-relay** for context compression. It means two
-  processes must be running for anything to work at all.
-- **Windows `.vbs` autostart scripts** in the Startup folder. Platform-specific; on
-  macOS/Linux use `launchd`/`systemd` or just run it in a terminal.
-- **A dispatch ladder naming specific agent CLIs** (`agy`, `codex`) that you probably do not
-  have installed. Configure `routing.ladder` with your own tools, or leave it out.
-- **Specific pool membership.** Model ids churn constantly — that config is a snapshot of what
-  was live on one account on one day, not a recommendation. Build your pools from
-  `llm-relay candidates` and confirm with `pools --probe`.
-- **`mode: "repair"` with a configured reshaper.** Sensible when driving weak models hard;
-  `mode: "detect"` is the simpler starting point and needs no reshaper.
+Do not copy another machine's proxy chain, startup scripts, dispatch ladder or model list without
+checking them. The standard setup does not require a second compression proxy or platform-specific
+autostart scripts. Configure only installed lanes, and build pools from current candidates verified
+by probes. Start with `mode: "detect"`; use repair mode only with the required reshaper configuration.

@@ -93,10 +93,7 @@ const THOUGHT_SIGNATURE_MODES: readonly ThoughtSignatureMode[] = ["none", "senti
 
 const REASONING_MODES: readonly ReasoningMode[] = ["none", "deepseek"];
 
-/**
- * Parse a provider's `compat` block. Adding the next key is one entry in `COMPAT_KEYS` plus its
- * own value check below.
- */
+/** Validate every declared compatibility key; unknown keys and values are load errors. */
 function parseProviderCompat(raw: unknown, where: string): ProviderCompatConfig | undefined {
   if (raw === undefined) return undefined;
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
@@ -131,13 +128,7 @@ function parseProviderCompat(raw: unknown, where: string): ProviderCompatConfig 
   return Object.keys(out).length > 0 ? out : {};
 }
 
-/**
- * Parse a provider's `wire` field — the `compat` precedent: an unknown VALUE is a hard load error
- * naming the key, because an ignored typo would read as a declaration that took effect while the
- * wire stayed unchanged. Declaring it on an `anthropic`-kind provider is a hard error too — that
- * kind never speaks either OpenAI endpoint, so the field could only ever be a lie about what the
- * provider does.
- */
+/** Reject unknown wire modes and declarations on providers that do not speak the OpenAI wire. */
 function parseProviderWire(raw: unknown, kind: Kind, name: string): ProviderWireMode | undefined {
   if (raw === undefined) return undefined;
   if (kind === "anthropic") {
@@ -151,13 +142,7 @@ function parseProviderWire(raw: unknown, kind: Kind, name: string): ProviderWire
   return raw as ProviderWireMode;
 }
 
-/**
- * Parse a provider's `firstByteTimeoutMs` — the `compat`/`wire` precedent: any value present but
- * not a positive integer is a hard load error naming the key, rather than the lenient
- * silently-dropped parse `stallTimeoutMs` uses. `0` bounds nothing while looking like it did (an
- * armed-but-instant deadline would abort every non-streamed attempt), so it is refused by name
- * exactly like a negative or fractional value.
- */
+/** An explicitly declared first-byte deadline must be a positive integer; never silently ignore it. */
 function parseProviderFirstByteTimeout(raw: unknown, name: string): number | undefined {
   if (raw === undefined) return undefined;
   if (typeof raw !== "number" || !Number.isFinite(raw) || !Number.isInteger(raw) || raw <= 0) {
@@ -166,12 +151,7 @@ function parseProviderFirstByteTimeout(raw: unknown, name: string): number | und
   return raw;
 }
 
-/**
- * The RESOLVED time-to-first-byte deadline for one provider: an explicit `firstByteTimeoutMs`, or
- * `stallTimeoutMs` as the default (same intent — "no bytes for this long means dead"), or absent
- * when neither is configured. An explicit value always wins, even `undefined` cannot occur here
- * since `parseProviderFirstByteTimeout` never returns `0` or another falsy-but-present value.
- */
+/** Use the explicit first-byte deadline, otherwise the stall timeout; absent values remain absent. */
 export function resolveFirstByteTimeoutMs(p: { stallTimeoutMs?: number; firstByteTimeoutMs?: number }): number | undefined {
   return p.firstByteTimeoutMs !== undefined ? p.firstByteTimeoutMs : p.stallTimeoutMs;
 }
@@ -192,23 +172,14 @@ function isMistralHost(base: string): boolean {
   return host === "mistral.ai" || host.endsWith(".mistral.ai");
 }
 
-/**
- * Is this base URL Google's Generative Language API — the host whose gemini 3.x models enforce the
- * `thought_signature` rule? Deliberately the ONE exact host, not `*.googleapis.com`: Vertex and
- * every other Google surface are different products with different validators.
- */
+/** Match the Generative Language API only; other Google API hosts have different wire contracts. */
 function isGoogleGenerativeLanguageHost(base: string): boolean {
   return baseHost(base) === "generativelanguage.googleapis.com";
 }
 
 /**
- * The resolved outbound tool-call-id shape for one provider.
- *
- * A LABELLED PROVIDER FACT, allowed by the "Provider knowledge is data, not routing configuration"
- * invariant precisely because config overrides it: mistral's own validator states the rule
- * (`^[a-zA-Z0-9]{9}$`, first-party evidence in `src/openai-request.ts`), so a mistral base host
- * defaults to `"strict9"` and every other host to `"preserve"`. An explicit `compat.toolCallIds`
- * wins in BOTH directions — `"preserve"` on a mistral host, `"strict9"` on anything else.
+ * Default Mistral hosts to strict nine-character tool IDs; explicit compatibility settings win
+ * in either direction. The provider evidence is documented in openai-request.ts.
  */
 export function resolveToolCallIdMode(p: { base: string; compat?: ProviderCompatConfig }): ToolCallIdMode {
   if (p.compat?.toolCallIds !== undefined) return p.compat.toolCallIds;
@@ -216,14 +187,8 @@ export function resolveToolCallIdMode(p: { base: string; compat?: ProviderCompat
 }
 
 /**
- * The resolved thought-signature mode for one provider.
- *
- * The SAME labelled-fact mechanism as `resolveToolCallIdMode`, and allowed by the SAME invariant —
- * "Provider knowledge is data, not routing configuration" permits a labelled provider fact in
- * `src/` only while config can override it. Google's Generative Language API states the rule (its
- * gemini 3.x models 400 a replayed tool call carrying no signature; first-party evidence in
- * `src/openai-request.ts`), so that base host defaults to `"sentinel"` and every other host to
- * `"none"`. An explicit `compat.thoughtSignature` wins in BOTH directions.
+ * Default the Generative Language API to sentinel signatures; explicit compatibility settings
+ * win in either direction. The provider evidence is documented in openai-request.ts.
  */
 export function resolveThoughtSignatureMode(p: { base: string; compat?: ProviderCompatConfig }): ThoughtSignatureMode {
   if (p.compat?.thoughtSignature !== undefined) return p.compat.thoughtSignature;
@@ -245,30 +210,15 @@ export function resolveReasoningMode(p: { base: string; compat?: ProviderCompatC
 }
 
 /**
- * Marker Claude Code stamps into the `system` block of SUBAGENT requests only (verified on wire,
- * Claude Code 2.1.220): `x-anthropic-billing-header: …; cc_entrypoint=…; cc_is_subagent=true;`.
- * Built-in subagents (Explore, general-purpose) carry it too, not just custom `.md` agents.
- *
- * This is what makes tier-based subagent routing safe. Without it, a subagent declaring
- * `model: haiku` and a HUMAN picking Haiku for their own conversation are byte-identical, so any
- * tier→provider mapping silently drops the human's own conversation onto a weak model.
+ * Claude Code's subagent attribution marker, verified on wire in 2.1.220. Tier names alone
+ * cannot distinguish a child request from a human conversation using the same model.
  */
 const SUBAGENT_MARKER = "cc_is_subagent=true";
 
 /**
- * Claude Code's documented per-request agent identifier: "Identifier of the subagent that issued
- * the request, present only on requests from an agent Claude Code spawned inside the session"
- * (gateway protocol reference), which the same page explicitly permits a gateway to consume for
- * routing. Same semantics as SUBAGENT_MARKER.
- *
- * ⚠ Checked ALONGSIDE the marker, never instead of it — each covers the other's silent failure,
- * and the failure is the same either way: an undetected subagent falls through to the passthrough
- * and spends PRIMARY quota while looking like a successful offload.
- *  - The header dies to any middleware that filters unknown request headers (this relay commonly
- *    runs behind one), and Anthropic's own advice is to treat `x-claude-code-*` as an open list.
- *  - The marker dies to `CLAUDE_CODE_ATTRIBUTION_HEADER=0`, which drops the attribution block —
- *    and therefore the marker — from the system prompt entirely.
- * The header travels outside the body, the marker inside it, so no single component drops both.
+ * Claude Code's documented child-agent header. Check it alongside the body marker: middleware
+ * can strip the header, while disabled attribution can remove the marker. Neither is required
+ * when the other supplies evidence of a child request.
  */
 const CLAUDE_AGENT_ID_HEADER = "x-claude-code-agent-id";
 
@@ -289,8 +239,7 @@ const RELAY_DIRECTIVE = /^[ \t]*@relay:[ \t]*(\S+)[ \t]*$/m;
 export function isSubagentRequest(reqJson: unknown, headers?: RequestHeaders): boolean {
   if (typeof reqJson === "object" && reqJson !== null) {
     const system = (reqJson as { system?: unknown }).system;
-    // Check if system contains SUBAGENT_MARKER. Since the marker contains no newline,
-    // it cannot span join boundaries — safe to check each block independently.
+    // The marker contains no newline, so it cannot span joined block boundaries.
     if (typeof system === "string") {
       if (system.includes(SUBAGENT_MARKER)) return true;
     } else if (Array.isArray(system)) {
@@ -301,15 +250,11 @@ export function isSubagentRequest(reqJson: unknown, headers?: RequestHeaders): b
     }
   }
 
-  // Claude Code's own subagent header — present on exactly the requests the marker is present on,
-  // and independent of it. Presence alone is the signal; the value identifies WHICH agent, and per
-  // the protocol reference identifies an agent rather than a person, so it is never used as one.
+  // A nonblank child-agent header is independent evidence; its value is not a user identity.
   const agentId = headerValue(headers, CLAUDE_AGENT_ID_HEADER);
   if (typeof agentId === "string" && agentId.trim().length > 0) return true;
 
-  // Codex's Responses requests do not have an Anthropic `system` field. Its local clients identify
-  // child-agent turns in `x-codex-turn-metadata`; parse it defensively and fail open for ordinary
-  // turns or metadata we do not recognize. This header is intentionally not forwarded upstream.
+  // Unrecognized Codex metadata does not establish a child request. Do not forward this header.
   const metadataText = headerValue(headers, CODEX_TURN_METADATA_HEADER);
   if (typeof metadataText !== "string") return false;
   try {
@@ -322,12 +267,8 @@ export function isSubagentRequest(reqJson: unknown, headers?: RequestHeaders): b
 }
 
 /**
- * Read (and optionally strip) an `@relay: <spec>` directive from the dispatcher's prompt.
- *
- * ⚠ Only the LAST text block of `messages[0]` is inspected — that is the dispatcher-authored
- * prompt. Block 0 is Claude Code's injected `<system-reminder>` (CLAUDE.md, date, …) and later
- * messages carry tool results, i.e. file contents. Reading those would let any file the subagent
- * happens to read redirect its own routing.
+ * Read and optionally strip a directive from the first message's string content or last
+ * non-system-reminder text block. Never scan later messages or tool results for routing intent.
  */
 export function readRelayDirective(reqJson: unknown, strip = false): string | null {
   if (typeof reqJson !== "object" || reqJson === null) return null;
@@ -368,13 +309,9 @@ export function readRelayDirective(reqJson: unknown, strip = false): string | nu
 }
 
 /**
- * Why routing could not reach this spec, or null when it can.
- *
- * Mirrors what `pickSpecs` + `resolveSingleSpec` will do with it: `pool/<name>` needs a configured
- * pool, anything else needs a declared provider (plus a model id when that provider is openai-kind).
- * Deliberately does NOT accept "detectTier thinks this looks like a Claude id" as resolvable — that
- * route ends at the passthrough, which for a directive means a typo like `opus-coder` is answered
- * by primary quota instead of failing.
+ * Require an explicit configured pool or provider, plus a model for OpenAI providers.
+ * A Claude-like tier name is not a valid directive: falling back would spend primary quota
+ * while appearing to have offloaded the task.
  */
 function directiveUnresolvableReason(spec: string, cfg: Config): string | null {
   const names = (o: object | undefined) => Object.keys(o ?? {}).join(", ") || "none";
@@ -395,16 +332,13 @@ function directiveUnresolvableReason(spec: string, cfg: Config): string | null {
   return null;
 }
 
-/**
- * The client names used by the built-in front doors. Other clients may use their own key in the
- * object form of `routing.offload`, or fall back to the explicit `default` rule.
- */
+/** Built-in offload rule keys. Request paths select these names; arbitrary client names do not match. */
 export const CLAUDE_CLIENT = "claude";
 export const CODEX_CLIENT = "codex";
 export const OPENAI_CLIENT = "openai";
 export const DEFAULT_CLIENT = "default";
 
-/** Map a relay front-door path to the originating harness name used by offload settings. */
+/** Map a relay front-door path to the offload rule key; unknown paths use `default`. */
 export function clientForPath(pathname: string): string {
   if (pathname === "/v1/messages" || pathname.startsWith("/v1/messages/")) return CLAUDE_CLIENT;
   if (pathname === "/v1/responses" || pathname === "/responses") return CODEX_CLIENT;
@@ -416,15 +350,8 @@ export function clientForPath(pathname: string): string {
 export const FRONT_DOOR_CLIENTS: readonly string[] = [CLAUDE_CLIENT, CODEX_CLIENT, OPENAI_CLIENT, DEFAULT_CLIENT];
 
 /**
- * Why a targeted offload rule for `client` could never affect a request, or null when it can.
- *
- * The request path looks up ONLY the name `clientForPath()` derived from the front-door path. A
- * rule keyed anything else ("claude-desktop" was the real case) is dead config: the toggle
- * succeeds, status shows it ON, and every request falls through to the `default` rule — so the
- * operator's `--scope all` silently did nothing. Same principle as an unknown pool: refuse loudly
- * and name what IS valid. A key that already exists in the config stays legal (`fatal: false`) so
- * state remains visible and an operator can still turn a dead rule off — callers surface the
- * message as a prominent warning instead.
+ * Explain an unreachable client rule. New unknown keys are errors; existing ones produce a
+ * warning so their state stays visible and the operator can disable them.
  */
 export function unroutableOffloadClient(
   client: string,
@@ -464,19 +391,10 @@ export function anyOffloadEnabled(cfg: Pick<Config, "routing">): boolean {
 }
 
 /**
- * The spec a request should route to, or null to leave routing unchanged.
- *
- * Precedence: an explicit `@relay:` directive (per-call opt-in, works even with the client rule off) >
- * `routing.subagents[<tier>]` > `routing.subagents.default` — the last two only when
- * the effective client rule is enabled. A `scope: "subagents"` rule only applies to marked child
- * requests; `scope: "all"` also applies to the client's main conversation.
- *
- * ⚠ An unresolvable directive is a loud `RoutingError`, never a quiet fall-through. The map forms
- * are validated at config load (`assertSpecResolvable`), but a directive arrives per request and
- * had no check at all: a typo'd provider or pool name matched nothing in `pickSpecs`, so it landed
- * on `routing.default` — the Anthropic passthrough. That spends PRIMARY quota while the dispatcher
- * believes it offloaded, and nothing in the response says otherwise. Same rule as an unknown pool:
- * fail and name what IS configured.
+ * Resolve a subagent override without changing ordinary routing when none applies.
+ * An explicit directive on a marked child wins even with offload disabled; otherwise use the
+ * enabled rule's tier mapping, then its default. `scope: "all"` also admits main conversations.
+ * An unresolvable directive throws rather than silently spending primary quota.
  */
 export function subagentSpec(
   reqJson: unknown,
@@ -536,7 +454,7 @@ export const DEFAULT_DESTRUCTIVE = [
 const DEFAULT_ANTHROPIC_VERSION = "2023-06-01";
 export { DEFAULT_ANTHROPIC_VERSION };
 
-/** Claude tier names, longest-first so "haiku"/"sonnet" match before generic bits. */
+/** Tier aliases matched against requested model IDs. */
 const TIER_NAMES = CLAUDE_TIER_NAMES;
 
 /** A routing failure — surfaced to the client as a clean 400, never a crash. */
@@ -550,14 +468,8 @@ function detectTier(model: string): string | null {
 }
 
 /**
- * Pick the "provider/model" spec(s) for an inbound model id:
- *  1. `pool/<name>` → that pool's full candidate list (ranked + failed over downstream);
- *  2. namespaced (`known-provider/…`) → use verbatim;
- *  3. a Claude tier with a configured mapping → that tier's spec(s);
- *  4. otherwise the routing default.
- *
- * Pools are checked FIRST so the reserved `pool/` prefix can never be shadowed by a provider that
- * happens to be named "pool" (config load also rejects that name outright).
+ * Resolve pool specs first, then known provider/model specs, tier mappings and the default.
+ * Unknown namespaced providers use the default; unknown pools fail during expansion.
  */
 function pickSpecs(model: string | null, cfg: Config): string[] {
   if (model) {
@@ -580,13 +492,8 @@ function pickSpecs(model: string | null, cfg: Config): string[] {
 }
 
 /**
- * Expand any `pool/<name>` spec into that pool's candidate list. Applied to whatever
- * pickSpecs chose, so pools work uniformly whether addressed directly by the request,
- * from routing.tiers/default, or via routing.subagents. Pool members themselves are
- * provider specs only (config load rejects pool-in-pool), so no recursion.
- *
- * An unknown pool must NOT silently fall through to routing.default — that is exactly the
- * "succeeded against a much weaker model than you asked for" failure. Fail loudly instead.
+ * Expand configured pools wherever a routing spec is accepted. Members are provider specs,
+ * not nested pools. Unknown pools throw rather than silently falling back to another model.
  */
 export function expandPoolSpecs(specs: string[], cfg: Config): string[] {
   const out: string[] = [];
@@ -638,9 +545,7 @@ function resolveSingleSpec(spec: string, cfg: Config, modelForError: string | nu
   };
 }
 
-/**
- * Filter targets to those with active/usable credentials, falling back to full list if none are active.
- */
+/** Exclude declared-missing credentials when alternatives exist; otherwise retain the full list. */
 function filterUsableTargets(
   targets: readonly ResolvedTarget[],
   scopedKeystoreOptions: KeystoreOptions,
@@ -688,10 +593,8 @@ export function resolveTargets(
   const specs = expandPoolSpecs(picked, cfg);
   const rawTargets = specs.map((spec) => resolveSingleSpec(spec, cfg, model));
   const activeTargets = filterUsableTargets(rawTargets, scopedKeystoreOptions);
-  // The routed pool's effort band, when the request was resolved through a single dynamic pool
-  // whose policy declares one. Stamped here so the request mapper can map "pool effort →
-  // `reasoning_effort`" for a `"deepseek"` target without reaching back into routing. A direct
-  // spec or a static pool leaves `target.effort` absent — then there is no effort to map.
+  // Carry an explicit dynamic pool effort band to the mapper; direct specs and static pools
+  // leave it absent. Do not overwrite effort already present on a target.
   const poolEffort = poolEffortFor(picked, cfg);
   if (poolEffort !== undefined) {
     for (const t of activeTargets) if (t.effort === undefined) t.effort = poolEffort;
@@ -746,11 +649,7 @@ export interface ConfigOverrides {
   mode?: string | undefined;
 }
 
-/**
- * Expand `${ENV}` references in a config string against process.env, failing
- * loudly if a referenced variable is unset — so a missing provider URL/key is a
- * clear startup error, never a silent empty value.
- */
+/** Expand config environment references, rejecting unset variables instead of substituting blanks. */
 function expandEnv(value: string, where: string): string {
   return value.replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name: string) => {
     const v = process.env[name];
@@ -868,8 +767,7 @@ export function loadConfig(
   } catch (e) {
     throw new Error(`could not read/parse config at ${path}: ${(e as Error).message}`, { cause: e });
   }
-  // Captured for the config-staleness notice (`configStaleness()` below). Never fails config
-  // load over a stat failure — the read above already succeeded, so this is best-effort.
+  // A failed metadata stat must not undo a successful config read.
   let sourceMtimeMs: number | undefined;
   try {
     sourceMtimeMs = statSync(path).mtimeMs;
@@ -907,12 +805,8 @@ export function loadConfig(
 
   const mode = normalizeMode(c.mode);
 
-  // A repair-mode target reshapes on itself (openai) or via the explicit global
-  // reshaper. An anthropic provider has no fixed model id, so if any provider is
-  // anthropic and no explicit reshaper is set, repair can't reshape it — reject.
-  // `reshaper: { pool: "<name>" }` is the resilient form: it expands to the pool's ranked
-  // candidates, so repair survives one model being de-listed. Pinning a single {base, model} still
-  // works but is fragile — the provider dropping that id silently disables repair.
+  // Anthropic targets need an explicit reshaper. Pool-backed reshapers retain fallback candidates;
+  // a valid empty dynamic pool is resolved lazily after catalog materialization.
   const reshaperCandidates = resolveReshaperPool(c.reshaper, routing, providers);
   const reshaper = reshaperCandidates?.[0] ?? parseReshaper(c.reshaper);
   const reshaperPoolRaw = typeof c.reshaper === "object" && c.reshaper !== null
@@ -1003,8 +897,7 @@ export function loadConfig(
     ...(warnings.length > 0 ? { warnings } : {}),
   };
   if (sourceMtimeMs !== undefined) {
-    // Non-enumerable so it never appears in a JSON.stringify of the whole config, a `toEqual`
-    // comparison of a loaded Config, or Object.keys(cfg) — see the config-types.ts doc comment.
+    // Keep load metadata out of serialized config and enumerable comparisons.
     Object.defineProperty(cfg, "sourceMtimeMs", {
       value: sourceMtimeMs,
       enumerable: false,
@@ -1020,34 +913,23 @@ export interface ConfigStalenessReport {
   path: string | null;
   /** This config's recorded mtime (ms since epoch) at load time, or null if never recorded. */
   loadedAt: number | null;
-  /** True when the file on disk no longer matches what this process loaded, including when the
-   *  file has been deleted. False for a Config with no recorded source (never file-backed) —
-   *  there is nothing on disk to have diverged from. */
+  /** True for a missing/unreadable file, an absent recorded mtime, or an mtime mismatch.
+   *  False when no sourcePath was recorded because there is no file-backed state to compare. */
   changedOnDisk: boolean;
   /** The file's CURRENT mtime (ms since epoch), read live at call time; null when it cannot be
    *  stat'd (missing, permission denied, or no source recorded at all). */
   diskMtime: number | null;
 }
 
-/**
- * The ONE text of the config-staleness notice — printed by the daemon (once, to its log/stderr,
- * the first time `GET /telemetry` observes the change) and by every config-reading CLI command
- * that talks to a running relay (`routing show`, `offload status`, `pools`, `routing`, `config`),
- * so every surface says exactly the same thing rather than each hand-copying its own wording.
- */
+/** Shared config-staleness notice for telemetry and config-reading CLI commands. */
 export const CONFIG_STALENESS_NOTICE =
   'config changed on disk since the relay loaded it — run "llm-relay reload"; a restart is required if the changed fields are not reloadable';
 
 /**
- * Does the config file on disk still match what this process loaded? Pure over its inputs aside
- * from the injectable `stat` — the default reads the real filesystem, a caller may inject one for
- * tests. NEVER throws: a missing or otherwise unreadable file reads as `changedOnDisk: true` with
- * `diskMtime: null`, because "the relay's copy no longer matches whatever is on disk" is the true
- * state whether the file was edited or removed out from under it.
- *
- * The relay does not hot-reload (see `Config.sourceMtimeMs`) — this is the one helper that turns
- * "the file changed" into a fact `GET /telemetry` and the CLI can both report, so an operator who
- * edits `config.json` is told to restart rather than being left to wonder why nothing took effect.
+ * Compare the recorded mtime with disk without applying changes. Missing or unreadable files
+ * report changedOnDisk with a null diskMtime; a config without sourcePath has nothing to compare.
+ * Telemetry and CLI use this evidence to request an explicit reload. Restart-only fields still
+ * require a restart; merely editing the file does not apply a reload.
  */
 export function configStaleness(
   cfg: Pick<Config, "sourcePath" | "sourceMtimeMs">,
@@ -1056,8 +938,7 @@ export function configStaleness(
   const path = cfg.sourcePath ?? null;
   const loadedAt = cfg.sourceMtimeMs ?? null;
   if (path === null) {
-    // Never file-backed (a hand-built Config, e.g. under test) — nothing can have "changed
-    // on disk" under a config that was never read from disk.
+    // No file-backed state exists to have changed on disk.
     return { path: null, loadedAt: null, changedOnDisk: false, diskMtime: null };
   }
   let diskMtime: number | null;
@@ -1071,17 +952,8 @@ export function configStaleness(
 }
 
 /**
- * Parse `leave_me_alone` — the provider suppression list.
- *
- * ⚠ A name matching NO known provider is deliberately legal and produces neither an error nor a
- * warning. Storing only the negative space is the whole point: you suppress the nudge for a
- * provider you have chosen not to configure, which by definition is not in `config.providers`,
- * and most of them are only ever preset names. Validating against the known set would reject
- * exactly the entries the feature exists for.
- *
- * The VALUE's shape is still checked loudly — a string where a list belongs, or a number in the
- * list, is a mistake with no plausible reading, and silently ignoring it would leave the user
- * being nagged with no idea why.
+ * Validate suppression-list shape, not provider membership. Unknown names are legal because
+ * the operator may suppress onboarding suggestions for providers they have not configured.
  */
 function parseLeaveMeAlone(raw: unknown): string[] {
   if (raw === undefined || raw === null) return [];
@@ -1147,11 +1019,8 @@ function parseCredentialDeclarations(
         models = Object.freeze([...new Set((value.models as string[]).map((model) => model.trim()).filter(Boolean))]);
       }
     }
-    // A malformed limits block THROWS rather than following the drop-with-a-warning convention
-    // above: dropping the slot would silently remove a whole key (and its quota domain) from the
-    // fleet, and keeping the slot while ignoring the block would leave the operator believing a
-    // ceiling is asserted when none is. Both failure modes are worse than refusing to start.
-    // parseConfiguredLimits throws naming the exact offending key/path.
+    // Invalid limits must throw: dropping the slot or ignoring its limits would silently remove
+    // an operator-declared quota boundary. The parser names the offending path.
     const limits = parseConfiguredLimits(value.limits, `${where}.limits`);
     if (labels.has(label) || envNames.has(authEnv)) {
       const duplicate = labels.has(label) ? `label "${label}"` : `authEnv "${authEnv}"`;
@@ -1354,12 +1223,8 @@ function parseProviders(
 }
 
 /**
- * Expand `reshaper: { pool: "<name>" }` into ranked reshaper candidates.
- *
- * Only openai-kind targets can reshape (an anthropic passthrough has no fixed model id to send),
- * so anthropic entries in the pool are skipped rather than failing the whole pool. A pool naming
- * no usable target IS an error — silently ending up with no reshaper would disable repair without
- * saying so, which is the failure this whole form exists to prevent.
+ * Expand the pool's configured OpenAI targets into reshaper candidates. An empty dynamic pool
+ * is deferred only if an OpenAI provider can contribute; other empty pools are load errors.
  */
 function resolveReshaperPool(
   raw: unknown,
@@ -1397,10 +1262,8 @@ function resolveReshaperPool(
     });
   }
   if (out.length === 0) {
-    // A catalog-backed pool can legitimately have an empty configured prefix. Its discovered
-    // tail is materialized after load, so remember the pool and resolve it lazily in server.ts.
-    // This is allowed only when an OpenAI provider could actually contribute a reshaper; an
-    // all-Anthropic config would otherwise defer a deterministic startup error until first use.
+    // Catalog-backed pools are materialized after load. Do not defer an all-Anthropic
+    // configuration that cannot supply any reshaper.
     if (routing.poolPolicies?.[poolName] && Object.values(providers).some((p) => p.kind === "openai")) {
       return [];
     }
@@ -1437,4 +1300,3 @@ function normalizeMode(v: unknown): Mode {
   if (v === "detect" || v === "repair" || v === "strict") return v;
   return "detect";
 }
-

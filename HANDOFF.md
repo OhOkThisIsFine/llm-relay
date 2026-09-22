@@ -5,14 +5,13 @@ Entry point for any agent picking up llm-relay. Read this before `CLAUDE.md`.
 ## 0. Current state — 2026-09-22
 
 The architecture refactor has an R0 legacy-storage safety fix, executable runtime baselines and
-recorded R1 dependency/boundary choices. The target request, dispatch and SQLite ownership changes
-are not implemented; live continuation remains evidence-gated.
+recorded R1 dependency/boundary choices. PRs #74 and #75 are merged. The target request, dispatch
+and SQLite ownership changes are not implemented; active hard-cap continuation remains
+unimplemented and evidence-gated.
 
 - Published package version: **0.86.0**. This refactor work is not a new published release.
-- Starting `main` baseline: `3f5d88a` (merged architecture plan, PR #73), CI run **790** green.
 - R0 replaces unsafe recursive stale-lock deletion with generation-specific owner retirement.
-  The source checkpoint `5737286` passed CI run **791**, including the full Linux gate and targeted
-  Windows suite. Lock evidence and the upgrade boundary are in
+  Lock evidence and the upgrade boundary are in
   [`docs/history/refactor-r0-2026-09-21.md`](docs/history/refactor-r0-2026-09-21.md).
 - Runtime and SDK/schema/SQLite probes pass on Linux and Windows. Measurements and the protected
   contract map are in
@@ -24,20 +23,24 @@ are not implemented; live continuation remains evidence-gated.
   Production dependencies and the Node engine range have not changed.
 - The expanded comparison confirms a current **native Responses fidelity defect**: unnecessary
   translation changes native fields, IDs and usage structure. It is recorded in the backlog and
-  must be corrected by R2; it is not fixed by this evidence packet.
-- D1 restart-safe daemon-owned lane execution is implemented.
-- D2 transactional config hot reload is implemented.
-- Public dispatch/liveness state is explicit rather than inferred from circumstantial clues.
-- Multi-process journal/archive mutations are transactionally locked and tolerate bounded transient
-  Windows replacement failures without weakening atomic writes.
-- Lane capability is derived from synced model evidence/pool bands; the legacy hand-set capability
-  value has no routing authority.
+  must be corrected by R2; it is not fixed by the evidence packet or this documentation cleanup.
+- D1 daemon-owned lane execution survives an MCP host restart while the daemon remains alive.
+- D2 explicit, transactional config reload applies supported fields; restart-only changes reject
+  the whole candidate rather than partially applying it.
+- Dispatch exposes a public activity/liveness verdict rather than requiring circumstantial inference.
+- Multi-process journal/archive mutations are locked, with bounded retries for transient Windows
+  replacement failures that preserve atomic writes.
+- Lane capability derives from synced model evidence and pool bands, not the legacy hand-set value.
 - Repeated 402/5xx failures use bounded recovery escalation and remain eligible for failover.
-- D5 dependency modernization is complete: Vitest 5, Vite 8, jsdom 30, Tailwind 4, native
-  TypeScript 7 compilation, jest-dom 7 and lucide-react 1. Node declarations intentionally remain
-  on the Node 22 line while Node 22 is supported.
-- PR #70 refreshed live documentation and trimmed implementation comments. The separate follow-up
-  documentation PR #72 was not included in this refactor packet.
+- D5 dependency modernization is complete. Builds use native TypeScript 7; classic TypeScript
+  remains the runtime Compiler API. Node declarations stay on the Node 22 line while it is supported.
+- PRs #70 and #71 contain the earlier documentation/comment cleanup and its checkpoint. PR #72
+  follows with factual corrections and the compact `CLAUDE.md` guide, reconciled with R0/R1 here.
+
+Verified pre-merge checkpoints: R0 `5e8c260b` passed CI **796** and refactor evidence **4**;
+R1 `d800e7c` passed CI **805**, refactor evidence **13** and gateway comparison **9**.
+These are recorded checkpoints, not a claim about later commits; check GitHub CI for the tree
+being changed. Green comparison jobs mean evidence generation succeeded, not every contract passed.
 
 ### Immediate next — architecture refactor
 
@@ -68,106 +71,81 @@ passed its evidence gates.
 
 ### Continuation work — still evidence-gated
 
-All quota-independent continuation preparation is complete: the first-party survey, four exact-ID
-interruption/resume probes, and same-cwd two-job isolation probe are in `main`. Live verification
-is currently blocked by harness/provider capacity. Do not begin Phase 5.2 until one harness passes
-both its single-job probe and `scripts/measure-continuation-isolation.mjs <harness>`.
+Quota-independent continuation preparation is complete: the first-party survey, four exact-ID
+interruption/resume probes and same-cwd two-job isolation probe are in `main`. Live verification
+is blocked on harness/provider capacity. **Do not begin Phase 5.2 until one harness passes both
+its single-job probe and `scripts/measure-continuation-isolation.mjs <harness>`.**
 
-Audit evidence:
-[`docs/history/release-readiness-audit-2026-09-21.md`](docs/history/release-readiness-audit-2026-09-21.md).
+Subject to the refactor ownership boundary above, mark only a passing harness verified resumable,
+then add the generic continuation substrate without changing behavior, and implement that harness
+end to end before expanding support. AGY is the preferred first probe, then Claude; Codex
+specifically tests active-turn durability. Other evidence/vendor/operator-blocked work can proceed
+when its inputs become available.
 
-Continuation work proceeds in this order, subject to the refactor ownership boundary above:
-
-1. when quota is available, run any documented exact-ID continuation probe (prefer AGY, then Claude; Codex specifically tests active-turn durability);
-2. mark only a passing harness verified resumable;
-3. then add the generic continuation substrate without changing behavior;
-4. implement one verified harness end to end, then expand harness support independently;
-5. clear evidence/vendor/operator-blocked items in parallel as their inputs become available.
-
-Detailed continuation sequence and exit conditions:
+The authoritative queue is [`docs/backlog.md`](docs/backlog.md). The continuation sequence and exit
+conditions are in
 [`docs/history/development-plan-2026-09-21.md`](docs/history/development-plan-2026-09-21.md).
-
-The authoritative unmet-property list is [`docs/backlog.md`](docs/backlog.md).
+The dated release audit is
+[`docs/history/release-readiness-audit-2026-09-21.md`](docs/history/release-readiness-audit-2026-09-21.md).
 
 ## 1. What still binds
 
-These are load-bearing constraints. Do not relax them casually:
-
-- **Loopback only.** Startup refuses a non-loopback bind. Loopback is not authorization; mutating
-  endpoints also use admission checks and the control token.
-- **Logs are metadata only.** Never log headers, bodies or URL parameter values.
-- **Repair protocol form, not judgment.** Tool-call repair may fix malformed protocol form; no LLM
-  opinion enters the request path. Routing remains deterministic/config-driven.
+- **Loopback only; loopback is not authorization.** Keep request admission and control-token checks.
+- **Metadata-only logs.** Never log headers, bodies or URL parameter values.
+- **Repair form, not judgment.** Routing stays deterministic/configured; no LLM opinion enters the
+  request path. Never invent intent to repair malformed protocol.
 - **Destructive tool calls are refused, never fabricated.**
-- **Health demotes, never drops.** A temporarily unhealthy candidate remains available to the
-  failover/recovery machinery.
-- **Unknown capability is not weak capability.** Missing capability evidence must not silently
-  exclude a lane.
-- **One logical lane attempt may own at most one live process incarnation at a time.** This becomes
-  especially important when hard-cap continuation is implemented.
+- **Health demotes, never drops.** Unhealthy candidates remain available for failover and recovery.
+- **Unknown capability is not weak capability.** Missing evidence must not silently exclude a lane.
+- **One logical attempt owns at most one live process incarnation.** Continuation must preserve this.
 
-Authoritative rationale lives in `CLAUDE.md`, `docs/project-goals.md`, and the relevant dated
-design records.
+Authoritative rationale lives in `CLAUDE.md`, `docs/project-goals.md` and the relevant design records.
 
 ## 2. Where to read
 
 | Document | Purpose |
 |---|---|
-| `docs/README.md` | Documentation index |
-| `docs/backlog.md` | Current unmet properties |
-| `docs/architecture-refactor-plan.md` | Target architecture, implementation sequence and acceptance criteria |
-| `docs/history/refactor-r1-decisions-2026-09-22.md` | Selected dependencies, native-wire evidence, performance budgets and R2 boundary |
-| `docs/history/refactor-baselines-and-dependencies-2026-09-22.md` | Runtime measurements, contract map and tested infrastructure choices |
-| `docs/history/refactor-r0-2026-09-21.md` | Initial R0 lock evidence and upgrade boundary |
-| `docs/history/development-plan-2026-09-21.md` | Earlier continuation preparation sequence |
-| `CLAUDE.md` | Architecture map, invariants, responsibility table and gotchas |
-| `docs/architecture.md` | Human-facing codebase overview |
-| `docs/reference.md` | User-facing commands, configuration, APIs and caveats |
-| `docs/history/mcp-restart-safe-lane-execution-design-2026-09-20.md` | D1 design/evidence |
-| `docs/history/config-reload-design-2026-09-20.md` | D2 design/evidence |
-| `docs/history/active-hard-cap-lane-continuation-plan-2026-09-20.md` | Planned continuation feature |
-| `docs/history/active-hard-cap-harness-survey-2026-09-21.md` | Exact-resume capability matrix and live-probe gate |
-| `docs/history/stabilization-plan-2026-09-17.md` | Historical stabilization packets; not the live queue |
+| `docs/README.md` | Documentation index. |
+| `docs/backlog.md` | Current unmet properties. |
+| `docs/architecture-refactor-plan.md` | Target architecture, implementation sequence and acceptance criteria. |
+| `docs/history/refactor-r1-decisions-2026-09-22.md` | Selected dependencies, native-wire evidence, performance budgets and R2 boundary. |
+| `docs/history/refactor-baselines-and-dependencies-2026-09-22.md` | Runtime measurements, contract map and tested infrastructure choices. |
+| `docs/history/refactor-r0-2026-09-21.md` | Initial R0 lock evidence and upgrade boundary. |
+| `docs/history/development-plan-2026-09-21.md` | Earlier continuation preparation sequence and evidence gates. |
+| `CLAUDE.md` | Detailed architecture, invariants and gotchas. |
+| `docs/architecture.md` | Contributor source map. |
+| `docs/reference.md` | Commands, configuration, APIs and caveats. |
+| `docs/history/mcp-restart-safe-lane-execution-design-2026-09-20.md` | D1 design and evidence. |
+| `docs/history/config-reload-design-2026-09-20.md` | D2 design and evidence. |
+| `docs/history/active-hard-cap-lane-continuation-plan-2026-09-20.md` | Planned continuation feature. |
+| `docs/history/active-hard-cap-harness-survey-2026-09-21.md` | Resume-capability matrix and probe gate. |
+| `docs/history/stabilization-plan-2026-09-17.md` | Historical packets, not the live queue. |
 
 ## 3. Verification
-
-The complete local gate is:
 
 ```bash
 npm run gate
 ```
 
-`npm run gate` builds first, then runs both typechecks, the core test suite, dashboard checks and
-package checks. CI additionally has the targeted `windows-process-boundary` job for process,
-persistence, spawning or lifecycle semantics. The separate refactor evidence workflow runs the
-synthetic baseline and dependency probes; it does not replace this gate.
+The gate builds, type-checks source and tests, runs the core and dashboard suites, and checks the
+package. CI also runs the targeted `windows-process-boundary` job for process, persistence and
+Windows lifecycle behavior. The separate refactor evidence workflow runs synthetic baseline and
+dependency probes; it does not replace this gate. Static analysis is advisory and outside the gate.
 
-Important rules:
+Scripts under `scripts/*.mjs` consume `dist/`; rebuild before running them. Tests read `src/`.
+Update ratcheted package/bundle baselines with intentional size changes, leaving real headroom.
+For documentation moves or additions, stage the paths before running the link tests: they read
+the Git index.
 
-- scripts under `scripts/*.mjs` consume `dist/`; rebuild before running them;
-- tests read `src/` directly;
-- bundle/package baselines are ratcheted and must change in the same commit as intentional bundle
-  weight changes;
-- do not fix contention flakes by increasing an arbitrary test timeout unless the measured failure
-  is actually timeout exhaustion;
-- a failing regression may be exposing a source defect rather than a test defect. Prove the
-  mechanism before weakening the assertion.
-
-Static analysis remains advisory and is outside the gate.
+Do not hide a regression by raising an arbitrary timeout or weakening an assertion. Establish
+whether the mechanism is a source defect, a test defect or genuine timeout exhaustion first.
 
 ## 4. Definition of done
 
-For source changes:
+Run `npm run gate` on the final tree. Changes to spawning, processes, persistence or lifecycle
+also need the Windows boundary suite. New behavior needs a regression that fails without the fix;
+shared request policy needs all applicable fronts; failover tests need at least two candidates.
 
-- `npm run gate` is green on the final committed tree;
-- the targeted Windows process-boundary suite is green when the change touches process,
-  persistence, spawning or lifecycle semantics;
-- new behavior is pinned by a regression that fails when the implementation is removed;
-- both request fronts are covered by any policy that applies to both;
-- failover tests use at least two candidates;
-- docs/backlog/handoff are updated only when the change alters a live property or immediate next
-  step;
-- deliberate intermediate states are labeled explicitly.
-
-Do not use this file as a release diary. Historical measurements, designs, audits and closeouts
-belong under `docs/history/` and in git history.
+Update the backlog and handoff when a live property or immediate next step changes, and label
+intermediate states explicitly. Record only checks actually performed. Keep dated measurements,
+audits and closeouts in `docs/history/` and git history, not a release diary here.

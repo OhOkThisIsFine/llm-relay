@@ -1,1432 +1,511 @@
 # CLAUDE.md — llm-relay (agent orientation)
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
-Read this first. It's the map; [README.md](README.md) is the short user-facing front door
-(kept ~400 words for npm) and [docs/reference.md](docs/reference.md) is the full usage
-reference — user-facing detail belongs there, not in the README.
-
-⚠ **`docs/` holds LIVE documents only; a dated record goes in `docs/history/` (2026-09-17).** The
-top level had 73 dated closeouts, design notes and audits sitting beside the eight documents a
-contributor reads, so a stranger could not tell a live document from evidence. The split is now the
-rule, not a one-off tidy: **a file whose name carries a date, or which records what was true on a
-date, is written straight into `docs/history/`** — never into `docs/` and moved later. ⚠ The
-human-facing entry points are [CONTRIBUTING.md](CONTRIBUTING.md) (set up, the gate, the invariants,
-the tester redaction rules) and [docs/architecture.md](docs/architecture.md) (a source map for a
-PERSON — this file is the same map at roughly fifty times the length, for an agent); keep both
-current when you change what they describe, and [docs/README.md](docs/README.md) is the index that
-lists every live document. ⚠ **`test/doc-links.test.ts` resolves every relative documentation link
-against the GIT INDEX, not the filesystem**, so a moved or added document fails the suite until it
-is STAGED — a move done with `mv` and left unstaged reads as 99 broken links. ⚠ Machine paths are
-scrubbed to `C:\Users\<user>` throughout; do not paste a real home directory into a tracked file,
-and keep a test fixture's account name fictional (`Pat Example` in
-`test/secret-file-acl.test.ts`, whose space is load-bearing for the ACL quoting).
+Read [HANDOFF.md](HANDOFF.md) first for the current checkpoint and immediate next step.
+This file holds durable engineering rules and the source map, not release status or a work queue.
+[docs/backlog.md](docs/backlog.md) is the queue; [docs/README.md](docs/README.md) is the documentation
+index. Read the relevant source and tests before changing a subsystem: an old comment or design
+record is evidence to check, not proof of current behavior.
 
 ## What this is
 
-A standalone, **loopback-only** LLM traffic control plane: it steers one person's LLM traffic
-across providers and quotas — **reliably** (benchmark-ranked pools, failover, circuit breaking,
-health that survives restarts), **transparently** (things just work in operation, and the
-metadata, logs and metrics answer "what happened" with provenance when you look), and
-**lightweight** (only what is necessary; three runtime deps as of `delegate-gate/`'s
-`typescript` compiler-API detectors — was two before; no second implementation of
-anything). A client (the `claude` CLI, Codex, or anything that honors `ANTHROPIC_BASE_URL`)
-points at it; the relay resolves the requested model through pools/tiers/offload rules to a
-concrete deployment and forwards. Owner-stated goals and the rubric for judging proposed
-changes: [docs/project-goals.md](docs/project-goals.md).
+A personal, loopback-only LLM traffic control plane, built to be shareable. It routes requests
+across configured providers, models and credentials, and delegates complete tasks through agent
+lanes. Reliability, observable decisions and minimal mechanism are the priorities. Tool-call
+repair is one component, not the project's identity.
 
-**Tool-call repair is one component, not the identity.** (Earlier revisions of this file called
-it the heart of the project; that was an agent's drift, corrected 2026-08-04.) For requests
-carrying tools, the relay validates the backend's tool calls and can repair malformed ones, so
-the Claude Code harness can run on models that are weaker at tool-use.
+The HTTP data plane serves Anthropic Messages and OpenAI Chat/Responses. MCP dispatch is a separate
+execution surface: it can launch configured agent processes. Do not insert agent CLI execution
+into a model-serving HTTP turn or mistake advisory CLI dispatch for MCP execution.
 
-**The repair boundary — do not cross it:** the proxy fixes/flags *protocol form* (malformed tool
-calls), never *judgment* (bad reasoning). It repairs a tool call whose args violate the schema;
-it does not invent intent, and it refuses to fabricate destructive-tool calls. The same line
-bounds the whole project: routing decisions come from config and deterministic classification,
-never from an LLM's opinion inserted into the request path.
+[docs/project-goals.md](docs/project-goals.md) and
+[docs/project-philosophy.md](docs/project-philosophy.md) define the owner's scope and rubric.
+Prefer a small adopted mechanism to a speculative framework or a second implementation of an
+existing policy. Distinguish owner decisions from agent assumptions. When an invariant changes
+what you build, explain the constraint and the alternative rather than narrowing the task silently.
 
 ## Build / test / run
 
+Use Node.js 22 or later. Work and run tests in the intended checkout or worktree.
+
 ```bash
-npm install
-npm run build          # build:server (TWO native-TS7 tsc passes -> dist/, see below) + build:dashboard (vite, from dashboard/)
-npm test               # vitest run  (the suite is the source of truth; do not pin a count here — it drifts)
-npm run typecheck      # native TypeScript 7 tsc --noEmit — src/ (tsconfig.json)
-npm run typecheck:test # native TypeScript 7 tsc — the SUITE (tsconfig.test.json). See the note below.
-npm run check          # typecheck + typecheck:test + test + check:dashboard (native TS7 tsc for dashboard/ + the dashboard suite's own vitest config) + check:package (bundle inventory check + packed smoke). The one gate's second half; CI runs this full gate on Ubuntu, plus a targeted Windows process-boundary job.
-npm run gate           # build + check, in ONE command — THE gate. Record the ledger through it.
-npm run dev -- --config config.json   # run from src via tsx, no build
-npm run sync:tiers     # regenerate docs/tier-data.json (shipped in the published package)
-
-llm-relay keys         # are the CREDENTIALS good?
-llm-relay pools --probe # will each configured MODEL actually answer? (the only real liveness check)
-
-npx vitest run test/repair.test.ts             # one file
-npx vitest run -t "refuses to reshape a destructive"   # one test by name
+npm ci --ignore-scripts
+npm run gate                         # build, then all checks
+npm run dev -- --config config.json  # run source with an existing config
+npx vitest run test/repair.test.ts    # focused test, not the full gate
+npm run sync:tiers                   # refresh the capability snapshot
 ```
-**Always verify green before AND after a change:** `npm run gate` — the ONE gate command, which is
-exactly `npm run build && npm run check`. It exists as a single script because
-`verify-green.mjs record -- <cmd>` takes ONE command, and a fresh lap worktree has no `dist/`
-(gitignored), so `check:package` fails unless the build ran first; recording `npm run check` alone
-therefore certified a gate that had not built. Record the ledger with
-`node ~/.agent-config/verify-green.mjs record -- npm run gate`.
 
-⚠ **`build:server` runs the NATIVE TYPESCRIPT 7 compiler TWICE, and the second pass is
-load-bearing** (owner decision 2026-08-30, package-size variant C; compiler upgraded 2026-09-20).
-Every build/typecheck script calls `node node_modules/@typescript/native/bin/tsc` explicitly.
-Do not replace that with a bare `tsc`: the package also ships classic TypeScript 5.9 as the
-runtime Compiler API for `delegate-gate`, so the two installations have different jobs. Pass 1 is
-the native-TS7 equivalent of `tsc -p tsconfig.json` and emits the `.d.ts` files WITH their doc
-comments. Pass 2 re-emits only the JavaScript
-(`--removeComments --declaration false --declarationMap false`), overwriting `dist/*.js` and
-`dist/*.js.map` with comment-free output while leaving pass 1's declarations untouched. Measured:
-**29.5% of `dist/*.js` was comment prose** (578657 bytes), and dropping it took the tarball from
-1113288 to **861516 packBytes — 22.6% smaller** with the entry count unchanged at 347.
-⚠ The split exists so consumers KEEP their IntelliSense text. Collapsing it to a single
-`removeComments: true` in `tsconfig.json` would strip the `.d.ts` docs too and save only a further
-~122k — that is variant B, and it was rejected for exactly this reason. Do not "simplify" the two
-passes into one. ⚠ The only comment surviving in a `dist/*.js` is its `//# sourceMappingURL=` line,
-which must stay. Evidence, the four costed variants and the commands to re-measure:
-[docs/history/package-size-2026-08-30.md](docs/history/package-size-2026-08-30.md).
+`npm run gate` is `npm run build && npm run check`. The check phase covers source types, test types,
+core tests, dashboard types/tests, and package inventory/smoke checks. CI also checks the inert
+non-global postinstall hook and runs `windows-process-boundary` for process, spawning, broker and
+persistence behavior. Static analysis is advisory and outside the gate.
 
-⚠ **When you ratchet `docs/dashboard-package-baseline.json`, leave REAL headroom — a ceiling fitted
-to your own machine's bytes fails on CI.** Measured 2026-09-06/07: the lane-walk commit set
-`packBytes` and `unpackedBytes` about 0.2% above a local measurement, which is roughly what the
-existing entries carried, and CI came in **123 bytes over** on the same toolchain and the same
-source. `packBytes` is gzip output and is not byte-reproducible; `unpackedBytes` moves with `tsc`
-output too. The correction (`d498b46`) rounded the ceiling up to the next thousand instead, which is
-the rule to follow — the ceiling exists to catch a change that grows the package by a MEANINGFUL
-amount, and a few hundred bytes of build noise is not that. ⚠ Do not chase the difference: the
-`observed` block is a record, never an equality check, so a small drift between your machine and
-CI's is expected and means nothing.
+Keep these build and verification contracts:
 
-⚠⚠ **And the ceiling is now a ROUND NUMBER well clear of the observation (1300000 / 6500000 since
-2026-09-19; 1100000 / 5500000 from 2026-09-08, which +32 KB of persisted-cell validators and their `.d.ts`
-doc comments crossed), not a tight fit — because the tight fit failed a SECOND time, in the very
-lap that wrote the paragraph above.** The second failure had a different cause worth naming: the baseline was measured, and then
-more documentation prose was added, and every added comment lands in a `.d.ts` by the two-pass
-design at the top of this section. **Measure LAST.** A ceiling fitted to a mid-lap measurement is
-stale before the lap ends, and each re-fit costs a red CI run. A regression this metric should
-actually catch — a stray dependency, a data file, a doubled bundle — is hundreds of kilobytes, not
-hundreds of bytes, so slack here costs nothing and churn costs a release cycle.
+- Run the gate before and after changes when the environment permits. Report the exact tree,
+  checks and results; distinguish local runs, CI and live provider probes. Do not substitute a
+  focused suite or a previous green commit for the final-tree gate.
+- Build/typecheck scripts explicitly use `node_modules/@typescript/native/bin/tsc`. Classic
+  `typescript` remains a runtime Compiler API dependency for `delegate-gate/`; do not collapse the
+  two packages or replace script invocations with an ambiguous bare `tsc`.
+- The server build has two compiler passes: retain documentation in declarations, then emit
+  comment-free JavaScript without replacing those declarations. Preserve source-map directives.
+- Vitest reads `src/` and transpiles tests; `typecheck:test` checks their types separately.
+  Keep test discovery scoped to this checkout. Most measurement scripts consume `dist/`, so
+  rebuild before running them. See [scripts/CLAUDE.md](scripts/CLAUDE.md) for prerequisites.
+- Measure package size after all edits, including declaration comments. Update intentional
+  bundle/baseline changes together and leave meaningful headroom; an observation is not an
+  exact-byte requirement.
+- Stage added or moved documents before link tests: link targets resolve against the Git index.
+  Preserve the source-map and script-inventory checks rather than weakening them to fit edits.
+- Failover tests need at least two candidates. Inject tier data instead of pinning real models'
+  changing bands. Reset process-global evidence between tests and give hand-built configs the
+  required repair fields and provider kinds.
+- Verify a regression's mechanism before weakening an assertion or raising its timeout. Tests can
+  encode an old defect; change such a test with the source fix only after proving that distinction.
+  For closed-vocabulary checks, add a temporary union member and confirm the intended compile error.
 
-**`test/` is type-checked by `tsconfig.test.json`, not by `tsconfig.json` or by vitest.**
-`tsconfig.json` is `include: ["src/**/*.ts"]` with `exclude: [… "**/*.test.ts"]` because it drives
-`dist/`, and vitest **transpiles** tests rather than type-checking them (`vitest.config.ts` declares
-no `typecheck` block, deliberately — it would run tsc twice). `tsconfig.test.json` extends the base
-with the same strictness, widens `rootDir` and adds `test/`, and `npm run check` runs it. Its first
-run found 23 errors, including hand-built `ProviderConfig`/`ReshaperConfig` literals missing a
-required field — i.e. tests asserting against a shape the source no longer has.
+The owner's external `verify-green` ledger may record `npm run gate` when installed; it is not a
+repository prerequisite. For releases, follow
+[.claude/skills/release/SKILL.md](.claude/skills/release/SKILL.md), including the workflow and repository
+settings checks. Do not replace the trusted-publishing path with an assumed local npm credential.
+Attribute model-authored commits to the actual model, using an appropriate attribution address.
 
-⚠ A `@ts-expect-error` in a test file was inert for the whole life of the project before this
-(never evaluated ⇒ neither passing nor failing), so **any pre-existing one proves nothing about
-when it was written**. It is live now, but prefer a runtime assertion where the point is that a
-surface does not EXIST — a type-level assertion only says it is untyped. (Two independent workers
-were misled by the older "vitest is what checks those" claim here.)
+## Invariants (keep these true)
 
-⚠ **`vitest.config.ts` scopes the suite to this checkout's `test/` directory on purpose.**
-Without an explicit `include`, vitest's default glob walks the whole tree, so **any nested checkout**
-— a git worktree under the repo root, a vendored copy — contributes its own copy of every test file.
-Tooling that fanned work out across per-task worktrees inside the repo once made `npm test` run 70
-files / 638 tests instead of the real suite. That breaks the gate in both directions: another
-worktree's half-finished edit fails this tree's run, and a stale copy passes one. Don't widen it.
-
-**Static analysis is ADVISORY and deliberately outside the gate.** `npm run analysis:run`
-(eslint + sonarjs, knip, madge, dependency-cruiser, ts-prune, jscpd) writes to `analysis-reports/`
-(gitignored). It is **not** in `npm run check` and CI does not run it — the gate stays the two
-typechecks, the server suite, the dashboard checks and the package checks. Several default rules contradict documented invariants here, so they
-are switched **off in `eslint.config.mjs` with the invariant named beside each**: this proxy is
-loopback-only so `http://127.0.0.1` is the architecture (`no-clear-text-protocols`); the dispatch
-ladder names agent CLIs for the HOST to resolve (`no-os-command-from-path`); the suite uses temp
-dirs to stay hermetic (`publicly-writable-directories`). What is left as a **warning** —
-cognitive complexity, super-linear regexes — is worth reading and not worth blocking on;
-restructuring `server.ts`/`config.ts` to clear the first is the enterprise-shaped refactor
-[docs/history/suggestion-review-2026-08-04.md](docs/history/suggestion-review-2026-08-04.md) already rejected.
-⚠ Don't "fix" a finding by deleting an intentional discard: `_`-prefixed names and
-`const { key, ...rest }` are conventions here, covered by the rule options rather than by edits.
-
-**CI** (`.github/workflows/ci.yml`) runs the full `npm ci --ignore-scripts` → `npm run build` →
-`npm run check` gate on Ubuntu for every push to `main` and every PR, plus a check that the
-`postinstall` hook stays inert on a non-global install. A targeted `windows-latest` job separately
-type-checks the test suite and executes the lane spawn/env/lifecycle boundary, including a real npm
-command shim. Before CI existed, `typecheck` ran in **no** workflow and the suite
-ran only inside the publish job — i.e. first at the moment a version was already shipping, so every
-"tsc clean / suite green" claim in this repo rested on somebody's unverifiable local run.
-
-**Releasing: use the `/release` skill** ([.claude/skills/release/SKILL.md](.claude/skills/release/SKILL.md)),
-which carries the full publish mechanics. Two facts worth knowing before you get there: publishing is
-npm **Trusted Publishing** from GitHub Actions — no npm token exists here, the tag push IS the
-credential, and a local `npm publish` fails with a misleading 404; and one of the four tag→registry
-gates (the `npm-publish` environment's `v*` deployment-branch policy) lives in **repo settings**, not
-in the workflow YAML, so don't judge the protection by the YAML alone.
+1. **Repair form, not judgment.** Routing is deterministic/configured; no model opinion enters the
+   request path. Repairs may correct arguments, not invent intent, add/drop/repoint calls, or change
+   the backend answer's identity. Destructive calls are refused, never fabricated.
+2. **Keep provenance.** Unknown is not zero or weak capability. Distinguish reported, estimated,
+   provider-stated, reference and operator-declared values. Keep mixed bases separate. Tunable
+   defaults are allowed; invented provider limits, prices and context ceilings are not.
+3. **Provider knowledge is data.** Routing destinations and credentials come from configuration.
+   Labelled aliases, protocol quirks and preset facts may live in source when configuration can
+   override them. Do not guess credentials, model identities or scopes from similar names.
+4. **Health demotes, never drops.** Retain unhealthy candidates for failover/recovery. Configuration,
+   eligibility and explicit cost/cap rules are different boundaries; do not disguise those as
+   health filtering. Unknown evidence must not become a negative verdict.
+5. **Counting is not permission to refuse.** Meter without requiring a published allowance. Quota,
+   pacing and latency policies normally reorder. Only an explicit operator hard cap may refuse on
+   a usage count. Hedging is the separately approved duplication exception: free-class deployments
+   only, abort the loser at winning commit, and announce it.
+6. **Credentials stay contained.** Declaration, not key presence, decides whether caller credentials
+   may pass through. A declared-but-missing key must not leak the caller's credential to a different
+   provider. Local encrypted custody is separate from accounting; neither authorizes obtaining
+   consumer tokens, operating logins, a hosted relay or pooled consumer accounts.
+7. **Loopback is not authorization.** Reject unsupported bind hosts. Match `Host` and any present
+   `Origin` to the actual listener; allow absent `Origin` for CLI clients. Mutations require JSON.
+   Protected control routes also require the per-install token; data-plane provider credentials
+   and dashboard read-only sessions have different roles.
+8. **Log metadata only.** Enforce allow-lists at the sink, including nested attempt records. Never log
+   headers, bodies, secrets or URL parameter values. Query names and value lengths are sufficient.
+   Counters do not justify logging tool IDs, arguments or vendor-private reasoning.
+9. **Shared policy reaches both HTTP fronts.** Keep candidate outcomes, health, accounting,
+   guardrails and announcements consistent across Anthropic and OpenAI paths. Deliberate
+   translation-versus-passthrough differences follow authorship, not accidental missing wiring.
+10. **Own lifecycle and persistence explicitly.** One logical lane attempt may own at most one live
+    process incarnation. Preserve foreign journal/archive rows, acknowledge recovery only after
+    durable terminal storage, and never infer death from unavailable transport or activity data.
+11. **Tests cannot use real operator state or quota.** Guard persistent-path resolvers and real
+    keyring/registry/process spawners; inject seams and temporary state. `state-paths.ts` alone is
+    not a test guard. Redact machine paths and use fictional fixture identities.
+12. **Closed vocabularies stay exhaustive.** Use total typed tables or exhaustive switches. Derive
+    runtime lists and unions from one definition. A fallback must not promote uncertainty into
+    success, upstream blame, authorization or a stronger provenance claim.
 
 ## Architecture — file → responsibility (all in `src/`)
 
+Each source file or containing directory has a row; `test/architecture-map.test.ts` checks coverage.
+Responsibilities below are a navigation aid. Detailed user behavior belongs in
+[docs/reference.md](docs/reference.md), not another copy of this table.
+
 | File | Responsibility |
 |---|---|
-| `cli.ts` | Entry point. Parses flags (`--config`, `--default`, `--mode`, `--listen`, `--provider`, `--refresh`, `--client`, `--scope`, `--credential`, `--label`, `--env-name`, `--check`, `--out`, `--purge`) and dispatches the commands `CLI_COMMAND_NAMES` declares — `onboard`, `setup`, `keys {check,add,list,rotate,revoke,remove,disable,enable,export,import,unlock}`, `check-keys`, `models`, `ping`, `dashboard`, `telemetry`, `offload`, `lanes`, `dispatch`, `cooldowns`, `eligibility`, `candidates`, `cost`, `pools`, `routing`, `route`, `config`, `reload`, `stop`, `help`, `version`. ⚠ That set, not HELP, is the authority — though the three long-standing HELP drifts are now CLOSED: `lanes` and the `route` alias have entries, and `setup` REFUSES an unknown target instead of falling through to the CLI setup (`setup clade-desktop` used to print the Claude CLI setup and exit 0, so a typo silently did the wrong thing; `claude-cli` was documented but matched no branch and is a real token now). ⚠ **`routing answered`** retires the FIRST-RUN notice and changes no routing: `resolveConfigPath` writes `~/.llm-relay/first-run` beside the config it creates, and `routing show` / `offload status` print a notice on **stderr** while it exists (never stdout — both are JSON surfaces, and a synthetic key inside `cfg.routing` would be a lie about the config). The skill tells the agent to ASK the operator what they want on first use. A flag, not a prompt: `resolveConfigPath` runs inside every command and inside the proxy, usually with no terminal. ⚠ **`DEFAULT_CONFIG_TEMPLATE` now declares the Anthropic passthrough** and points `routing.default` and all four tiers at it. It used to declare NO anthropic provider and default to `pool/medium`, so on a clean HOME `resolveTargets("claude-opus-5")` returned `[]` while README, QUICKSTART and SKILL.md all promised Anthropic — false for exactly the stranger `docs/project-goals.md` makes a goal. The template also declares `cerebras` and `cohere` (bases from the live-verified endpoints), so QUICKSTART Stage 2's `CEREBRAS_API_KEY` and `COHERE_API_KEY` rows are no longer silent no-ops. ⚠ Adding the passthrough REQUIRES `reshaper: { pool: "medium" }` in the template: `mode: "repair"` plus an anthropic-kind provider is a hard load error, so without it every fresh install failed to start. `test/first-run.test.ts` caught that and pins the whole contract against the REAL constant (`DEFAULT_CONFIG_TEMPLATE_FOR_TEST`) — a test that rebuilt the object would be testing itself. Pool/routing/config editors validate the complete JSON before writing; `llm-relay reload` can then apply the D2 reload-safe subset to the running daemon, while a 409 names only the fields that still require restart; targeted offload/candidates/dispatch queries talk to a **running** proxy over loopback when there is one, so a client rule takes effect without a restart and status gets warm health data. `cooldowns clear` is stricter: breaker state lives in the running process (its cooling half is now MIRRORED to disk by `breaker-persistence.ts`, but the live Map is the authority and a clear must reach it), so it requires the running relay, carries the control token, and never falls back to editing files. `cost` is the opposite case — it reads the LOCAL accounting store through a **read-only** store (`readOnly: true`: no writes performed at all — DR-020 (2026-09-03) deleted the write-ahead journal, replay and quarantine machinery this note used to name, in favor of the shared atomic JSON writer; `readOnly` still matters because a live relay may be committing ordinary writes to the same directory), projects through the SAME `readCostReport` roll-up as the contract's `dashboard.cost.v1` (one aggregation, one policy — no second summing of shards), and works whether or not the proxy runs; a live relay's unflushed in-memory deltas are reported as "recent minutes may lag", never repaired. ⚠ **It also prints the PERIOD, because the window NAME is not it** (owner decision 2026-08-31, option A): `rollingPlan` floors `to` by the window's bucket, so the newest partial bucket is outside every rolling window — 15 min for `24h`, an hour for `7d`, **6 h for `30d`** — and until this landed the table printed only the name. Measured against a live store: one request at 06:23Z showed under `1h` and showed as ZERO under `24h`/`7d`/`30d`, with nothing on screen to say why. `writeCoveredPeriod` renders `from`/`to` (already in `CostReportV1`, already in `--json`) plus a FLOORED count of whole excluded minutes; a sub-minute gap prints nothing, because "0 minutes" would read as a defect where the window reaches the clock. ⚠ It RENDERS the bounds and does not move them — ending the cost window at `now` would give one figure two definitions, since the dashboard chart resolves the same `windowPlan`. ⚠ Distinct from the footer's flush note, which is about a RUNNING relay's unwritten deltas; this applies to a stopped relay with everything committed. ⚠ **An unrecognized command is REFUSED, not run as the proxy.** `dispatchDashboardOrProxy` ends the `main` ladder, so any positional no branch claimed lands there — and it used to mean "start the proxy", so a mistyped command started a relay instead of reporting a typo. It now exits 1 naming the token unless the positional is in `CLI_COMMAND_NAMES`; a KNOWN name still falls through unchanged, and a bare `llm-relay` still starts the proxy. Second-order: a value-taking flag missing from `VALUE_FLAGS` puts its VALUE in command position, so that long-warned hazard now fails loudly. ⚠ **Extra positionals are refused across the whole command family** (`COMMAND_ARITY` + the pure `commandArityError`): the read-only commands used to accept and DISCARD what they did not understand — `cost --window 1h 7d` reported 24h, `models nim` listed every provider. Bounds are derived from what the DISPATCHER reads, never from HELP (which omits `lanes` and the `route` alias, and documents a `setup` target that matches no branch). `pools`/`routing`/`route` are VARIADIC and deliberately unbounded — multi-candidate specs are a routing feature. `keys`/`cooldowns`/`help`/`version` are exempt in `ARITY_EXEMPT`, the first two because their own parsers are stricter, fail-closed and secret-safe. The guard runs after help/version and before the first side effect (`loadOrExit` CREATES a config file), and never echoes the stray token — unlike the unknown-command guard, a positional can be anything pasted. `test/cli.test.ts` pins the table against `CLI_COMMAND_NAMES` so a new command cannot miss it. The option guard now derives short aliases from the alias table (2026-09-03), because `-t` was advertised by help and read by the parser yet rejected by the guard. `reportMcpTelemetry` POSTs that report to `/dispatch/telemetry` beside `reportMcpExhaustion`, best-effort (false with no proxy, never throws) because a lost telemetry row changes only a ledger while a lost quota report changes routing. ⚠ `runMcp` hands `process.stdin` to `McpDispatchServer.serve` and never awaits `ingest` per chunk (2026-09-05) — the old loop serialized every MCP request behind the one in flight; see the `mcp/server.ts` row. `resolveDispatchView` — the MCP server's view builder — always sends `requester=mcp` and forwards `mode` and `model`; `runMcp` injects `installedVersion` (re-read on every call), `readAgyLog`, and `defaultProcessCpuReader`, so non-relay CLI lanes can prove liveness from the exact process tree already owned for reaping. |
-| `keys-cli.ts` | CLI-local key-custody router and exported lifecycle runners. Validates configured providers/slots and the strict declared-plus-curated write-name gate; owns the injectable echo-off/piped one-line secret and passphrase input seam; calls keystore APIs and renders non-secret metadata only. Rotation refuses a shadowed store before mutation and uses the existing admitted route only for its non-secret credential selector plus `kinds:["credential-fault"]`; every other operation stays local and never edits live fact files. |
-| `config-edit.ts` | Shared JSON document editor for the CLI. Preserves unknown config fields, supports dot paths, rejects prototype-pollution path segments, and runs every candidate document through `loadConfig()` before committing it. |
-| `state-paths.ts` | **Where state lives — the ONE definition.** `relayBaseDir(kind)` maps `config` → `XDG_CONFIG_HOME` and `cache` → `XDG_CACHE_HOME`, each falling back to `~/.llm-relay` when its variable is unset, empty or whitespace-only; `relayStatePath(kind, segments)` adds the legacy fallback. It replaced THIRTEEN hand-rolled resolvers running THREE policies — `usage/`/`probe-cache.json`/`runtime-telemetry.json` honoured `XDG_CACHE_HOME`, `target-facts.json`/`refusal-interpretations.json` honoured `XDG_CONFIG_HOME`, and the other eight (`config.json`, `.env`, `keystore.json`, the control token, `models-cache.json`, `lane-manifest.json`, `update-check.json`, the `hooks/` script) honoured neither — so with either variable set the state directory SPLIT and "back up `~/.llm-relay/`" was not a complete backup. Owner decision 2026-08-27: honour XDG everywhere. ⚠ **The legacy fallback is the safety story and is not optional:** `relayStatePath` returns the legacy path whenever the XDG one is ABSENT and the legacy one EXISTS, so an existing install keeps reading AND writing where it already does. That is why there is no migration and nothing is copied or deleted — for `keystore.json` the alternative is an operator's credentials reading as an empty store. Once the XDG path exists it wins, even with a legacy file beside it. ⚠ Classification is per ARTIFACT and follows XDG's own distinction — operator-authored or credential-bearing is `config`, re-fetchable is `cache`; never reclassify an artifact to move it. ⚠ Bases identical ⇒ NO `existsSync` call at all, so the common case costs nothing. ⚠ It is NOT a vitest guard: every caller keeps its own `process.env.VITEST` check ABOVE the call (a call-site guard is how the control-token one came to be half-covered). `test/state-paths.test.ts` pins the policy through injected `env`/`home`/`exists` seams AND greps `src/` so no fourteenth resolver can reintroduce a raw XDG read or a hardcoded `homedir(), ".llm-relay"`. |
-| `dotenv.ts` | Loads `~/.llm-relay/.env` into `process.env` at startup, **never overwriting an already-set variable**, and records only the names it populated so credential provenance distinguishes `env-file` from the real environment. `onboard` always wrote this file and nothing ever read it, so a wizard-saved key worked for one shell and then "stopped working". The real environment wins because it is the more explicit signal. |
-| `pool-health.ts` | `llm-relay pools --probe` — sends a REAL completion to every pool member. Config-time validation cannot see a model that is listed and still dead (de-listed behind the scenes, gated to a paid tier, routed to a missing function), and that is exactly how a pool ends up with one live member and paper failover. Probes at 400 max_tokens because reasoning models return an empty 200 at a low cap — `empty` is a distinct verdict from `missing`, not a synonym. ⚠ **A verdict may only claim what its evidence supports** (2026-08-27). The probe posts a completion for ONE model, so a 401/403 is exactly the entitlement-wall case and reports `denied` — a rejection with no blame assigned, and the CLI advice says in as many words not to rotate a credential on it. `auth` survives only for the case that IS a credential fact: no enabled slot holds a key, so no request was sent. And 400 no longer shares `missing` with 404 — a 400 is a request-validation error (mistral's 9-char tool-call-id refusal; a `max_tokens` complaint), so it maps to `error`. `MemberVerdict`'s consumers are total records, so a new member is a compile error until handled. |
-| `authEnv.ts` | Resolves a provider's declared `authEnv` name against a **closed** per-provider alias list (`GEMINI_API_KEY` vs `GOOGLE_API_KEY`, …), then falls back by those same names to the keystore with source-major env precedence and `env`/`env-file`/`keystore` provenance. Explicit fleet slots stay declared-only. Deliberately never scans the env for key-shaped names — a heuristic match would ship one provider's credential to another's endpoint. ⚠ `buildAuthHeaders` writes through a **total writer table** `satisfies Record<AuthHeaderName, …>`, not an if/else: it used to end in an unconditional `return { "x-api-key": value }`, so a future header name would have sent the operator's credential under the wrong one, and an absent `authHeader` (a hand-built test target) was accepted silently as `x-api-key`. A new member is now a compile error at the table. |
-| `credential-id.ts` | Stable identity for a configured credential slot — a branded `provider#label` string (`makeCredentialId`/`parseCredentialId`). Labels are bounded to `[A-Za-z0-9_.-]{1,32}` and the provider may not contain `#`, so an id always round-trips to exactly one (provider, label) pair. |
-| `credential-fleet.ts` | Normalizes a provider's declared credential slots (`credentials[].label/authEnv/models`) into non-secret descriptors plus source-labelled resolvers for each. Attempt identity always comes from the config slot; keystore entry identity remains provenance only. An empty `models` array deliberately matches NO models; slots from `credentials` resolve **declared-only** (no legacy alias fallback); only enabled + model-allowed + present slots produce an attempt. |
-| `resolved-attempt.ts` | The application-layer attempt shape with credential resolution performed exactly once (`ResolvedAttempt` = target + `credentialId` + resolution + slot). A missing slot still returns a frozen attempt carrying `declared-missing`, so legacy callers raise their established credential-config error before any egress. |
-| `credential-select.ts` | Ranks credentials WITHIN one deployment (never reorders deployments) and runs the request-local breadth-first `CredentialWalk`. Ranking bands: hard facts → health/cooling/fault → fresh provider-stated headroom (unknown ⇒ neutral band, never a guess) → cost (unknown ties with paid) → LRU → config order. `next()` only OFFERS a candidate; `recordStarted()` immediately before fetch is the sole budget/LRU mutation boundary. ⚠⚠ **`next()` re-offers a pending-but-UNSTARTED attempt before taking a new one, and that rule is load-bearing** (2026-08-30). Both fronts decide failover by asking for the next candidate and then `continue`, so the top of the loop asks AGAIN and one candidate must come back twice. At `maxInFlight` 1 the saturation branch did that BY ACCIDENT — one pending attempt made the walk saturated, so the second ask re-offered it. Raising the cap to 2 for hedging broke exactly that: the walk handed out a THIRD candidate while the second stayed pending and unstarted forever. **Measured: 40 tests across both fronts, every one a multi-candidate failover, and they HUNG rather than failed** — which is why a hedging change nobody expected to touch failover must still run the whole suite. A hedge is unaffected because it is asked for only while the primary is in flight, i.e. already STARTED. ⚠ `maxInFlight` is set from `h.hedgeMaxInFlight` (2 with hedging on, 1 off), so `routing.hedge: false` is a byte-for-byte revert to the single-slot walk. |
-| `configured-limits.ts` | Operator-asserted rate limits (spec §4 rung 3): the closed axis list (`CONFIGURED_LIMIT_AXES`), the `limits` block parser (hard error on an unknown axis or non-positive value, naming the key — an ignored typo reads as a ceiling while bounding nothing), and the pure per-axis resolver (`resolveConfiguredLimits`: credential-model → provider-model → credential → provider; null when nothing is declared). Every figure is labelled basis `configured`; these never refuse a request by themselves — except a figure under the `hard` sub-block, which is G2's refusal ceiling and lives in `hard-cap.ts`. Carries the axis→quota-vocabulary mapping so consumers join it with header observations without importing config internals. |
-| `hard-cap.ts` | The G2 manual per-credential HARD CAP — the refusal half of "a DERIVED number may only demote; an explicit operator-set cap may refuse". Pure `evaluateHardCap` resolves the `limits.hard` block through the same per-axis ladder as the soft figures and compares it against this relay's own in-memory `usedInWindow` — the seam `quota-demotion.ts` uses, whose `bucketRank` it imports rather than re-states. For token axes, an estimated-only window now includes estimated input + output, correcting the pre-M4 input-only undercount, so that completed estimate can move the explicit refusal ceiling. **The read is narrowed by the cap's own SCOPE, taken from `hardSource`:** a flat `credential`/`provider` cap counts that credential's usage across ALL models, a `credential-model`/`provider-model` cap counts only that deployment's — the verdict carries `source`+`scope` so all three consumers (request path, `/candidates`, dashboard producer) ask the ledger the same question. Inclusive (`used >= cap`; 450 admits 450); unknown usage ⇒ null ⇒ no effect; month axes are rejected at CONFIG LOAD because the window read declines month and a cap that could never fire would bound nothing while looking like it did. `routing.quota.hardCaps: false` (default true) turns every cap back into a soft limit. The server wraps it in `nextUncappedAttempt()` on BOTH fronts at the attempt boundary before egress/`recordStarted()`: a capped attempt is skipped with no egress/LRU/breaker/accounting mutation but still counts as `Nxcapped` in pool-attempts; when EVERY candidate was capped the relay answers 429 itself (`respondAllCapped`) with the front's native error body, `x-llm-relay-capped` (at most 5 cells named, `+K more` beyond), and a Retry-After derived only from the soonest UTC period boundary. A cap never registers on the breaker — it is config, not health. |
-| `availability.ts` | The spec §5.1-5.3 availability ladders as PURE functions (no IO, no clock — `now` is an argument): `resolveRemaining` (provider-stated → derived limit−localUsed → null; staleness is a READ-TIME eligibility test against the current UTC period, never a repair write; a negative remaining is preserved, not clamped — overshoot is information), `resolveResetsAt` (provider-stated → reviewed-rule → derived UTC boundary → null), `periodStart`/`periodEnd` (UTC only, real month lengths), and the ONE mapping of internal bases onto the dashboard contract spellings. `routingEligible` (true for `provider-stated`, `derived:provider-stated` and `derived:configured` — never for learned or published) is the ROUTING gate Gap 12 reads, not a display flag: `quota-demotion.ts` demotes only a bucket that clears it, or a `derived:learned` one under the `routing.quota.enforceLearned` opt-in, which bypasses the flag rather than flipping it. This module itself stays pure — it never reorders or refuses; it only labels what MAY gate. The reviewed-rule rung is **fed** since 2026-08-23: `factResetInputs` turns the target-facts covering one credential×deployment cell into rung-1/rung-2 inputs, and it is the ONE definition of that policy — the dashboard producer and `candidates.ts` both call it, because two implementations is how one cell comes to read `reviewed_rule` on one surface and `derived_boundary` on the other. A fact answers a bucket only when EVERY gate holds: its kind is in `QUOTA_RESET_FACT_KINDS`, it carries an explicit `untilBasis`, its `until` is still future, the bucket is MEASURED-spent (`remaining <= 0`; unknown has no effect at all) and the eligible observation stated no reset of its own. Within that the most-specific SCOPE wins per basis class — never the soonest expiry, which would let an unrelated short fact pre-empt rung 2 — and both inputs are returned independently so the ladder, not recency, picks the rung. ⚠ A fact carries no axis/period attribution, so those gates ARE the containment; inferring an axis from a fact's kind would be the invention `target-facts.ts` refuses. Still pure — it is handed facts a caller already read. Also `projectLocalUsed` — the ONE projection of a raw ledger window onto a quota axis, shared by `quota-demotion.ts`, `availability-snapshot.ts` and the hard-cap ledger reader. It labels a relay-counted REQUEST total `relay-counted` rather than borrowing the store's `basis`, which describes the TOKEN figure only; `LocalUsedBasis` gained `relay_counted` additively on the wire. ⚠ The vocabulary mappers (`mapRemainingBasis`, `mapLocalUsedBasis`) carry `const _never: never` exhaustiveness assertions, so a new provenance is a COMPILE error rather than a silent null on the dashboard; `DERIVED_BASIS` `satisfies Record<LimitProvenance, …>` so a missing row is reported at the table. `bucketKey` is imported from `quota-observation.ts` — three hand-copies of `${axis}:${period}` existed, one of them added by the commit that gave bucket GATHERING one home. |
-| `availability-snapshot.ts` | The producer the dashboard's Quota/Cooldown panels were missing: walks breaker cell state, configured/learned limits, target-fact COOLING conditions and the local ledger IN MEMORY and emits `QuotaRowV1[]`/`CooldownRowV1[]`. No provider egress, no probes, no disk reads; never throws (a failing dependency yields empty panels, which the projection marks as its own coverage). Does NOT truncate — `dashboard-snapshot.ts` owns the row cap and the partial flag. Cooldown reason mapping: retry-after/escalation/429/402 → `rate_limit`; `failure-escalation` uses its status (402 → `rate_limit`, 5xx → `provider_error`); generic → `provider_error`; credential fault → `auth_error`, `allowance-exhausted`/`rate-limited` facts → `rate_limit`, `credential-invalid` → `auth_error`; fact-derived rows carry `observedAt: null` rather than a fabricated time. Quota rows also read those facts for their `resetsAt`: one `factsFor` call per cell (not per bucket), fed through `availability.ts` `factResetInputs`, so a reviewed refusal-interpretation reset renders as `reviewed_rule` and a header/body one as `provider_stated` without this read path ever re-parsing vendor prose. The injected `readFacts` seam covers BOTH halves — a seam only one consumer honours implies coverage it does not have. |
-| `key-import.ts` | Parses dotenv files or the documented FreeLLMAPI v1 export envelope into provider/env-name records. Matching is closed: legacy providers accept their declared plus curated aliases and configured fleet slots accept their exact `authEnv`; provider-derived guesses and value-shape heuristics (`sk-…`, length, entropy) never become writes. Onboarding may persist parsed values to `.env`; `keys import` sends them to the keystore. Valid JSON of any other shape is rejected outright, not treated as dotenv. |
-| `keystore.ts` | Versioned encrypted credential store: KEK-verifier-checked lazy unwrap memoized process-wide on success and per cooldown epoch on failure, AES-256-GCM rows bound to version/provider/id/envName, salted keyed fingerprints, non-secret descriptors/status, lifecycle mutations (revoke/remove/disable/enable remain metadata-only while locked), passphrase-verifier/wrap-mode introspection, encrypted-only scrypt + AES-256-GCM export/decrypt/restore APIs, zeroization, and atomic restrict-before-publish writes. Existing-but-unparseable or degraded stores refuse every mutation byte-preservingly: credential rows are the operator's only keys, unlike re-learnable target facts, so degrade-to-fresh is unsafe. Read-side candidate walks deliberately cover derived env names wider than the strict `keys add` write gate; read-side env parity is the contract, while entry provider/id remain provenance rather than lookup filters. Parsed-store verdicts, including absence and unreadability, are memoized by normalized path and the practical `mtimeMs` + `size` + `ino` stat token: `path.resolve` coalesces syntactic aliases only, stat-token change invalidates immediately, and unchanged unreadable stores retry automatically after about 30 seconds. Unlock failures are cooldowns keyed by normalized path plus canonical KEK-descriptor identity: they self-heal after about 60 seconds with at most one unwrap spawn per uninterrupted cooldown epoch; same-descriptor stat changes do not bypass the cooldown, descriptor changes do, and explicit `lock()` ends it. Successful `keystoreStatus()` deliberately retains the verified KEK process-wide to serve spawn discipline. |
-| `os-keyring.ts` | KEK creation and recovery through DPAPI, Keychain, libsecret, or scrypt passphrase mode. KEK bytes travel only through captured stdin/stdout — Keychain writes use `security -i`, never argv — and child failures are sanitized because diagnostics may echo secrets. Under VITEST, no real keyring process runs without an injected spawner, preventing tests from touching live custody. |
-| `secret-file-acl.ts` | Best-effort Windows hardening of secret files (`icacls /inheritance:r /grant:r <user>:F`). Fire-and-forget by design — a missing or broken icacls is a hardening failure, never a reason to make the secret unusable. Skipped under vitest unless the spawner is injected, so the suite can't lock itself out of its own fixtures. |
-| `presets.ts` | `FREE_PROVIDER_PRESETS` — built-in free/subscription provider definitions (base, kind, authEnv, signup URL, recommended models) used by onboarding and setup. |
-| `spec.ts` | How a routing SPEC is spelled — `POOL_PREFIX`, `AUTO_MODEL` and `splitSpec`, and nothing else. A spec is what routing resolves: `provider`, `provider/model`, or the reserved `pool/<name>`. Nine modules reason about that spelling and all of them used to reach into `config.ts` for it. ⚠ It exists as its OWN leaf so `config/routing-parser.ts` can be extracted from `config.ts` without importing back into the file it came from (HOTSPOT-03 stage 1) — a parser that needs `POOL_PREFIX` and imports `config.js` to get it is a cycle, and copying the literal `"pool"` into the parser instead is the hand-copied-closed-set defect this file records against `UNTIL_BASES` and `CooldownSource`. ⚠ `config.ts` RE-EXPORTS all three, so every existing `from "./config.js"` importer is unchanged; the point of the move is to give the parser a leaf to depend on, not to make eight modules edit their imports. ⚠ `splitSpec` splits on the FIRST slash only, because a model id legitimately contains slashes (`nim/moonshotai/kimi-k3`) — splitting on every slash would rewrite one provider's model id into another provider's name. It imports nothing; keep it that way. |
-| `config/routing-parser.ts` | Pure parser/validator for the `routing` block. Validation order is user-visible and pinned by `test/config/routing-parser-order.test.ts`; unknown keys fail loudly. It parses pools, offload, sticky/quota/latency/hedge/probation/pacing/crawl/lane-probe/dispatch-walk/MCP settings and ladder forms, degrades disabled-provider references, and validates resolved specs. `routing.mcp.maxWaitMs` is clamped to the supported MCP wait ceiling with a warning. Legacy rung `capability` remains compatibility vocabulary only; dispatch derives capability from evidence. The module stays leaf-like and I/O-free. |
-| `config-types.ts` | Single declaration of the configuration vocabulary and shared routing constants. `config.ts` re-exports these types/constants so consumers do not need the loader. `DEFAULT_MCP_MAX_WAIT_MS` is 25 s. Legacy dispatch-walk attempt-budget fields remain parseable for compatibility but do not drive lane stopping; rung `capability` is likewise non-authoritative. |
-| `config.ts` | Loads and validates relay configuration, expands environment references, enforces loopback binding, resolves provider compatibility/wire modes, offload/subagent rules, limits, pools and targets, and tracks source path/mtime for staleness reporting. Provider-base expansion is fail-soft per provider; invalid config/routing vocabulary remains loud. Runtime reload policy is owned by `config-reload.ts`; this module exposes the live config identity and staleness data used by that transaction. |
-| `config-reload.ts` | D2's transactional hot-reload boundary. It compares a fully normalized candidate with the live `Config`, reports only field paths, refuses the whole reload if any restart-only field differs, and otherwise mutates the existing `Config` identity synchronously (no `await` after the first write). Reloadable today: request-time routing/pool policy, latency/probation/pacing settings, provider timeout/concurrency/limit policy, credential nested `limits`, validation mode/reshaper policy, body/walk budgets and warnings/mtime. Restart-only today: listener host/port, logger policy, destructive-tool matcher, provider/credential identity and wire/auth shape, sticky/hedge policy, `dispatchWalk`, and `mcp`. Provider membership also requires restart. The daemon materializes dynamic pools on the candidate before commit, preserves startup CLI overrides in its loader, resets the config-staleness latch after success, and warms catalog state only after commit. |
-| `session-pin.ts` | Ephemeral sticky-session affinity (`routing.sticky`, off by default): relay-owned `x-llm-relay-session` or a 16-hex SHA-256 first-user-message key, optionally compounded with the documented Claude agent id. Sliding 30m TTL, 1,000-entry LRU default, metadata only. No unverified client-session header is accepted, and request-path promotion is constrained by health and the pool's degrade boundary in `server.ts`. |
-| `offload.ts` | Client-specific offload state. `setOffload()` mutates the **live** `Config` (so the next request routes the new way with no restart) and rewrites the targeted `routing.offload.<client>` rule in the file it was loaded from. Never throws — an unpersistable change still applies in memory and reports `persisted:false`. |
-| `dispatch.ts` | Builds dispatch ladder/view state; it does not execute lanes. `DispatchView.order` is the single selectable order while `ladder` remains in configured order. Selection combines per-config cooldown/exhaustion state, stats/history, pin/demotion memory, host/requester transposition, derived capability, model overrides and context evidence. Pins promote only already-selectable lanes; demotions reorder rather than drop. Unknown capability/context evidence remains non-restrictive. Legacy attempt-budget settings do not control walk stopping. |
-| `daemon-dispatch-view.ts` | The daemon's ONE builder for a dispatch view. `GET /dispatch` and D1 broker launch resolution share it so cached manifest state, published/observed context windows, host transposition and Windows launcher wrapping cannot drift. The helper sets `source: "daemon"` and accepts injected manifest/platform/launcher seams for tests; it never probes. |
-| `context-limits.ts` | Context ceilings LEARNED from what a deployment stated when it refused an over-length request. The top rung of `contextWindowResolver` — first-party evidence about the exact deployment, which a published catalogue figure can contradict by being generic or stale. ⚠ **Only an explicitly stated maximum is recorded**: "the request was too long" bounds the ceiling by this proxy's own chars/4 estimate, and a store whose value is that it holds measurements must not accept a guess. Stored as a `context-limit` **fact** in `target-facts.ts` (deployment scope, 30-day TTL) — there is no separate `context-limits.json`. Also holds the OUTPUT-token sibling: `parseStatedMaxOutput`/`recordObservedMaxOutput` learn an EXPLICITLY stated `max_tokens` ceiling (the groq 400 case) as a `max-output` fact, same scope, TTL and fail-safe, wired beside the context observer in `inspectCandidateResponse`. ⚠ Display-only by owner decision ([docs/history/max-output-caps-design-2026-08-29.md](docs/history/max-output-caps-design-2026-08-29.md)): renders in `candidates`; nothing clamps the caller's `max_tokens`, nothing refuses, nothing routes on it. |
-| `target-facts.ts` | The ONE store for learned facts about targets (`~/.llm-relay/target-facts.json`), each carrying the **scope** it applies to: `attempt` (one credential × model) → `group` (explicit member list) → `deployment` (provider + model) → `credential` (one slot) → `provider` (every credential for it) → `model` (cross-provider, reference-grade). Lookups resolve most-specific-first. Eleven kinds in two halves — five CONDITIONS (`not-servable`, `subscription-required`, `allowance-exhausted`, `credential-invalid`, `rate-limited`) and six MEASUREMENTS (`context-limit`, `max-output`, `rate-limit-rpm|rpd|tpm|tpd`). ⚠ Only `not-servable`/`subscription-required` evict; the rest demote. ⚠ A success clears only CONDITIONS (`clearFacts` excludes every measurement) — a success disproves a condition, never a measurement; measurements are also never cooling and never cost-blocking. ⚠ And since 2026-09-09 only INSIDE its cost class: `clearFacts` takes an optional `costClass`, and a fact carrying `costClasses` is retracted only when the caller's class is a member — a fact without the filter is retracted as before, and a caller passing no class leaves filtered facts standing (a success of unknown class disproves nothing about a subset). The request path resolves the class inside `completeAttemptSuccess` through `h.costClassOf`, the walk's own resolver; the ping loop through `assessCost` for the probed target. Measured 2026-09-04: a success on a FREE Zen deployment retracted the accepted `subscription-required` fact filtered to `paid` 837 minutes early and re-admitted the paid SKUs it excluded. ⚠ The persisted key is `<kind>:<scope>` — one scope may carry several kinds at once (a real Groq 429 states an RPM and a TPM ceiling together), which a scope-only key silently collapsed to one; pre-existing scope-keyed rows are migrated at load. ⚠ A row may also carry `untilBasis` — the closed enum (`retry-after` | `reviewed-field` | `stated-body` | `reviewed-fixed`) naming which rung of `server.ts` `resolveReset` produced its expiry, so the availability ladder can rank a reset without re-reading the response. It is bound to the expiry it explains: `recordFact` drops it unless `retryAfterMs` is positive and finite, and `load` drops it on a row with no explicit `until` or with a spelling outside the enum — ABSENT means "a legacy row, or the kind's default TTL", and a fallback wearing a basis is exactly a guess labelled a measurement. An unknown spelling never fails the load. `QUOTA_RESET_FACT_KINDS` (allowance-exhausted + rate-limited) is exported for the quota ladder: COOLING minus `credential-invalid`, because when the relay will next retry a faulted key is not when an allowance refills. `clearCooldownFacts()` is narrower than success clearing: it retracts only active cooling conditions whose whole atomic scope is contained by the provider/model/credential selector; broader rows, eviction conditions, and every measurement remain intact. ⚠ Credential-scoped eviction facts (`subscription-required`, `not-servable`) now reach pool admission and the free-only guard per slot via `isCostBlockedForEverySlot()` (2026-09-03); previous call sites hard-coded null for the credential id, hiding credential evictions from both. |
-| `rate-limits.ts` | Rate ceilings LEARNED from what a deployment STATED about itself — the sibling of `context-limits.ts`, stored as the four `rate-limit-*` measurement facts. ⚠ **Only an explicit limit with a confidently identified axis AND period is recorded** ("limit 60 requests per minute", "TPM: 6000"); "rate limit exceeded" proves throttling but states no number, and "you used 120 tokens" is a count, not a ceiling — either way a miss learns NOTHING, same fail-safe as the context parser. A body naming several ceilings yields each (`<kind>:<scope>` keying keeps RPM and TPM side by side). Scope follows evidence: attempt → credential ONLY when the wording names the account/key → deployment when no credential is known; never widened by counting siblings. Wired on BOTH fronts in `server.ts` — 429 bodies beside `observeContextLimit`, and the durable `limit` half of provider-stated quota headers (minute/day only). **Acted on by `pacing.ts` since 2026-09-15** (owner direction 2026-09-10): a learned ceiling paces the relay's own attempt rate for that cell WITHOUT the `routing.quota.enforceLearned` opt-in — that opt-in still governs only `quota-demotion.ts`'s allowance path (spec decision M2), which is untouched. `/candidates` still renders kind + value + scope. |
-| `refusal-interpretation.ts` | What a refusal MEANS — deterministic lookup on the request path, judgement strictly out of band. A refusal reduces to a signature (provider + model + message with uuids/ids/numbers/urls stripped); a hit applies, a **miss learns nothing** and queues the signature for offline research. Seeds (reviewed source, derived from first-party probes) bind immediately; a researched verdict binds only once accepted via `llm-relay eligibility`. ⚠ **And it now reaches a RUNNING relay** (2026-08-27). The store memoized on the path alone, so an `accept` written by the CLI process never invalidated the relay's copy — `docs/reference.md` promised "only `accept` makes an interpretation affect routing" and it took a restart. The memo is now keyed by the `keystore.ts` stat token (`mtimeMs:size:ino`, symlink-resolved, normalized path), and `persist` re-reads and MERGES whenever the token moved, so a relay write cannot serialize a stale snapshot over an operator's acceptance: disk wins for `confirmed`, `unknown` rows union, and a signature promoted to `confirmed` on disk is never resurrected into `unknown`. `readStoreFile` is the one parser both paths use. ⚠ `target-facts.ts` deliberately does NOT get this: its writer/reader roles are reversed (relay writes, fresh CLI processes read), so it has no equivalent exposure. ⚠ **Signatures converge across LANES (2026-08-29).** The walk lane hands the observer the relay's own anthropic error envelope, whose `error.message` is the `openai backend HTTP <n>: …` wrapper around a 300-char-truncated provider body — so one provider condition used to normalize DIFFERENTLY per lane and need two accepts (the lane-split defect, [docs/history/eligibility-triage-2026-08-29.md](docs/history/eligibility-triage-2026-08-29.md) finding 1). `normalizeRefusalMessage` now unwraps to a FIXPOINT: extract the message (JSON parse, then a deterministic field-regex fallback for truncated/unparseable payloads, unterminated-value tolerant, escape-decoding), strip the relay's own wrapper prefix, repeat. `readStoreFile` re-keys every stored signature through the current normalizer at load (`migrateSignatures` — later acceptance wins a confirmed collision, unknown rows merge counts and update `normalized`/`sample` so `unknownMatchesSignature` keeps holding, ignored keeps the latest; idempotent, and inside the ONE parser so the persist-merge can never resurrect an old key). Residuals, stated: a message CUT by the 300-char cap converges only when both lanes' extractions share the same 240-char signature prefix — otherwise each lane keeps its own signature and binds per-lane; and an EMPTY wrapped body normalizes to "" and learns/queues NOTHING (relay wrapper prose is not a provider statement — one live empty-body row went inert on migration, by design). ⚠ It also exports **`statesModelDoesNotExist(status, body)`** (2026-09-10), the classifier behind the catalog-staleness trigger — see the `catalog.ts` row for the whole policy. Two things about it are local to this file: the wording family lives in ONE constant (`STATED_MODEL_ABSENCE`) that this classifier and the `not-servable` seed BOTH read, so the meaning and the trigger cannot drift; and it tests the NORMALIZED message, so the relay's own `openai backend HTTP <n> — model "…" is not served by provider "…" (…)` wrapper — which NAMES the model but is prose the relay wrote — cannot itself become the evidence. It is deliberately narrower than the seed: the seed fires on 400 or 404, this only on 404. |
-| `network-block.ts` | Recognising a refusal that is about the CALLER'S NETWORK — a VPN exit, a proxy, a blocked egress IP — rather than about the target. Measured 2026-08-29: `groq/qwen/qwen3.6-27b` refused 20 times over 7.9 hours with `access denied. please check your network settings.` while the credential was VALID, the model was in the account's roster and the quota was untouched; it answered HTTP 200 the moment the operator's VPN came off. ⚠ **Display-only, and that is the design.** It records no fact, demotes nothing, refuses nothing and never reaches the request path — every member of the closed `FactKind` vocabulary states something about DEPLOYMENT eligibility, and a client-side network block is none of them, so recording one would assert what the evidence does not support. `test/network-block.test.ts` pins the claim structurally: the module must import NOTHING, so a later edit that pulls in `target-facts.js` to "also record it" fails at the claim. ⚠ Matching is on WORDING and deliberately NOT scoped to the provider first observed — the inverse of `refusal-interpretation.ts`'s per-(provider, model) keying, because the condition belongs to the operator's own network and can strike any vendor; the trade is safe only because the output is one advisory line. ⚠ Every pattern names its provenance and only first-party-observed wording is admitted; plausible additions (Cloudflare `error 1020`, bare `access denied`) are absent as guesses. ⚠ **The advice says LEAVE THE ITEM PENDING, never `reject`** — reject writes the signature to the store's `ignored` set where it stays suppressed, so the tidy-looking verdict would silence the next episode entirely and defeat the module's whole purpose. A permanent queue entry is the price of a warning that still fires. |
-| `executable-lookup.ts` | **Finding an executable on PATH — the ONE definition.** `commandExistsOnPath` lived inside `os-keyring.ts`, scoped to picking the Linux `secret-tool` backend, and moved here when `installed-hosts.ts` needed the same question; `executableOnPath` is now the one resolving walk and `commandExistsOnPath` is its boolean wrapper, so the Windows npm-shim fallback can reuse the same PATH/PATHEXT semantics instead of growing a second walker. `os-keyring.ts` still imports and re-exports the boolean surface. ⚠ The keyring's copy had **no PATHEXT handling** — correct for Linux, and silently always false on Windows for anything not spelled with its extension, which would have made `codex` (an npm `.cmd` shim) undetectable on every Windows machine that has it. `executableCandidates` appends PATHEXT on win32 only, falls back to the documented `.COM;.EXE;.BAT;.CMD` when the variable is unset, skips blank entries, and does NOT double-suffix a name that already ends in a known extension (`agy.exe.EXE` exists nowhere; the test is case-insensitive because Windows paths are). ⚠ It never spawns — no `which`/`where` subprocess — so unlike `winenv.ts`/`os-keyring.ts`/`secret-file-acl.ts` it needs no vitest spawn guard; `X_OK` has no effect on Windows (Node treats it as `F_OK`), so one call is correct on both platforms and Linux behaviour is byte-for-byte what it was. Absence is the branch signal, never an exception. |
-| `installed-hosts.ts` | Which agent CLIs are **actually installed** on this machine (`claude`, `codex`, `agy`, `opencode`) — a different question from every other detection here, which is why it exists. `lane-probe.ts` asks what an ALREADY-CONFIGURED ladder rung serves and can say nothing about a tool absent from `config.json`; `authEnv.ts` asks whether a DECLARED credential is present. Neither answers "the operator has Codex; should we offer it?", which is what an onboarding conversation needs. ⚠ **Detection requires POSITIVE evidence and reports its basis**: `onPath` (a binary resolved) and `configPath` (an owned path exists) are separate fields, and `installed: false` means NO EVIDENCE FOUND, never "absent" — the `key-checker.ts` `unverified` rule applied to tools. ⚠ **A config path is deliberately weaker than a binary**: `install-skill.mjs` writes into `~/.codex/`, so counting the bare directory would be llm-relay detecting its own footprint and the gate it feeds would be permanently true. Codex is therefore keyed on `.codex/config.toml`, which the installer writes only once Codex is already detected; a caller that must not be fooled reads `onPath`. ⚠ `agy` carries BOTH `agy.exe` and `agy` because a bare `agy` on Windows can resolve to a PowerShell function that opens the IDE — naming both is detection, and nothing here ever runs either. `HOST_PROBES` is a total `Record<AgentHostId, …>` closed with `satisfies`, so a new host is a compile error rather than a member that silently never gets detected. Every environment input (`env`, `platform`, `home`, `exists`, `onPath`) is injectable, and no seam failure can throw out of `detectHost`. |
-| `host-routing.ts` | Does the CALLING host's traffic reach this relay? `routed` / `bypassed` / `unknown`, decided on the caller's `ANTHROPIC_BASE_URL` (loopback ⇒ routed, so a chained proxy still counts) and never on `CLAUDE_CODE_ENTRYPOINT`, which only names the host in the message. ⚠ Evaluated in the **CLI** process and forwarded as `?host=` — the server cannot detect a bypassing host, because a bypassing host sends it nothing. |
-| `claude-hook.ts` | The `PreToolUse(Agent)` hook that delivers `offload claude on` where HTTP rerouting cannot: it denies the `Agent` call and hands back the transposed command. **Forcing function, not a redirect** — no hook can move an in-process subagent's endpoint. Appends alongside the user's own hooks, refuses to rewrite an unparseable `settings.json`, and the generated script fails **open** on every error. |
-| `dynamic-pools.ts` | Materializes `{ preferred: [...], include: "free" }` pools as an invariant fixed prefix plus every catalog-discovered target in deployment-fitness order, **free-class members first and paid/unknown-cost members strictly behind them within each effort band**. ⚠ Cost stopped gating ADMISSION in the server decomposition (`28efb91`; `test/dynamic-pools.test.ts` "Reversed deliberately"), so the `freeOnly` offload guard — not pool membership — is what keeps a walk free-only, and that guard is `false` on all three of this machine's offload rules by OWNER DECISION (2026-09-04: paid capacity behind every free member is the deliberate last resort; recorded in the `include: "free"` entry of `docs/backlog.md`, not an oversight to "fix"). Only cost-blocking facts (`not-servable`, `subscription-required`, evaluated per credential slot) drop a deployment; a model with no exact tier-data row clears no band and is admitted nowhere, which today excludes every OpenCode Zen `-free` SKU. Replaces the tail after catalog refresh so new models need no manual config edits. |
-| `candidates.ts` | The un-blended decision table for offload targets (`GET /candidates`). Capability, live health, quota, breaker state and observed traffic as **separate** fields, config order, no ranking. Existing composites are quarantined under `sortInputs`, labelled as what they drive. Its §5 availability rows resolve through the same `factResetInputs`/`resolveResetsAt` pair the dashboard producer uses, so `llm-relay candidates` and the Quota panel cannot disagree about one cell's reset provenance. |
-| `server.ts` | Proxy composition and request-path wiring for Anthropic Messages and OpenAI Chat/Responses fronts. It owns loopback/control-route admission, forward-header containment, request guardrails, candidate-execution dependencies, breaker/ping/pacing/probation wiring, persistence installation, config-reload integration and the daemon `LaneExecutionBroker`. Reloadable policy reads through the live `Config` identity. Control routes include dispatch telemetry/activity, broker lane execution, reload and stop; loopback alone is never authorization. |
-| `backend.ts` | `fetchBackend()` → returns an **Anthropic-shaped** `Response` (`anthropic` passthrough; for `openai` the REQUEST direction is relay-owned — `openai-request.ts` — and only the RESPONSE direction is llm-bridge's). **An `openai`-kind target with `wire: "responses"` (2026-09-09, backlog route B) is dispatched at the top of `fetchOpenAiBackend` to `fetchOpenAiResponsesBackend`, the UPSTREAM speaker of the OpenAI Responses API** — three relay-owned mappers under one banner in this file: `anthropicRequestToOpenAiResponses` (Messages → `input` items, `function_call`/`function_call_output` with the caller's ids intact, thinking dropped, an unmodelled block a local 400 — the `openai-request.ts` policy), `openAiResponsesToAnthropicMessage` (buffered; `cached_tokens` split out of `input_tokens` on the same inclusive semantics as Chat's `prompt_tokens`), and `translateResponsesStreamToAnthropic` (a handler table over the Responses event set on `createSseTransformStream`, emitting Anthropic SSE that then runs through the SAME think-tag, dialect-rescue and tool-use-id passes the Chat path uses; a `response.completed` whose content no incremental event announced has its blocks synthesized). `ResponseProtocol` carries `"openai-responses"` and `invalidEnvelopeReason` is a closed dispatch. It lives here rather than in a new module because OpenCode Zen's contributor SKUs (Muse Spark 1.3) answer only on `/responses`, and the Chat branch is untouched. `fetchOpenAiFront()` → bidirectional OpenAI Chat/Responses adapter (its direct-Chat passthrough excludes a Responses-wire target, which goes through the translated path instead): direct OpenAI Chat passthrough, or OpenAI↔Anthropic request/response/SSE translation for the other combinations. The RESPONSES request direction is relay-owned too (`responses-request.ts`); llm-bridge keeps only the CHAT request translation (`openaiToUniversal` does model `tool_calls`/`role:"tool"`) and every response/stream direction. Also the wire-shape helpers both paths share: `parseRetryAfterMs()` (both RFC 9110 forms; null, never 0, for garbage) and `normalizeOpenAiErrorBody()` (passes a conforming `{error:{…}}` through byte-exact, unwraps gemini's array envelope, wraps everything else). Cross-protocol usage honours each protocol's inclusion semantics — OpenAI `prompt_tokens` INCLUDES cached tokens, Anthropic `input_tokens` EXCLUDES them — so cache reads/writes are summed in / split out at the two buffered translation seams rather than lost. On the openai-kind path only, both the buffered mapper and the translated SSE stream pass through `tool-use-ids.ts` so a host that reuses a tool-call id cannot make the client drop its own tool calls — announced as `x-llm-relay-tool-use-ids` (buffered) and as the `toolUseIdRewrites` log counter (streamed). The REQUEST direction's sibling is passed at the same seam: the target's resolved `toolCallIds` mode reaches `anthropicRequestToOpenAi`, and its count is announced as `x-llm-relay-tool-call-ids` on BOTH buffered and streamed responses (the figure is final before egress) plus the `toolCallIdRewrites` log counter — forwarded across the Responses front's rebuild like its response-direction twin. The target's resolved `thoughtSignature` mode rides the same seam, but its count (`thoughtSignatureSentinels`) travels ONLY as process-local metadata into the log: it is vendor-protocol padding on the relay's own outbound shape, not a change to the caller's data, so there is no header for a client to read. ⚠ **A `max_tokens` stop reason reaches a Responses caller as `status: "incomplete"` with `incomplete_details: { reason: "max_output_tokens" }` (2026-09-09):** buffered in `formatOpenAiResponses`; streamed by `tapAnthropicStopReason` (reads the Anthropic-shaped stream's `message_delta` before llm-bridge translates it) plus `markResponsesIncompleteOnMaxTokens` (rewrites only the terminal `response.completed` frame to `response.incomplete`), because llm-bridge's own translator drops the stop reason. Until then every capped answer was announced complete; see the `responses-request.ts` row for the capture that found it. The Chat protocol already carried `finish_reason: "length"`. |
-| `backend/envelope-validator.ts` | Is a provider's response envelope structurally usable by the response mappers? `invalidEnvelopeReason` plus the `ResponseProtocol` vocabulary and the private `ANTHROPIC_STREAM_EVENT_FIELDS` table, moved out of `backend.ts` byte-identically (HOTSPOT-10). It answers about FORM only — whether the discriminator the mapper switches on is present, and whether it carries the field that discriminator promises — which is the same side of the repair boundary as the tool-call validator. ⚠ It imports `isRecord` and NOTHING else, deliberately: it sits beneath the transport it validates for, so a dependency pointing back at `backend.js` would be a cycle. ⚠ The reason strings are not debug text — a streamed refusal reaches `stream-commit.ts`, decides whether the walk fails over, and is carried into the served error — so `test/backend/envelope-validator.test.ts` asserts every one of them VERBATIM through the protocol-by-streamed-by-shape table the item asked for: 31 rows, 23 of them expecting a reason string and 8 expecting `null`, plus one test that the refusals are distinguished rather than one catch-all. Mutation-checked twice — accepting a missing `choices` array, and accepting an unknown Anthropic event type, each fail exactly one row. Before the move every branch was reached only through a whole fetch, which proves the transport works and not that the validator does: a branch returning the wrong reason, or `null` where it should refuse, was invisible from outside. |
-| `backend/health-prober.ts` | Did a provider stream open with a usable response, and what did it say it was? `preflightResponseStream` reads up to `STREAM_PREFLIGHT_LIMIT` bytes looking for the first data event, validates it through `envelope-validator.ts`, then REPLAYS every consumed byte to the consumer — so failing a stream that opens with an in-band error lets the candidate walk reach a member that answers, rather than spending the whole pool inside one member's 200. `captureReportedModel` and the `UpstreamResponseMetadata` shape ride the same pass, because provenance is read from the same bytes. Moved out of `backend.ts` byte-identically (HOTSPOT-10); `backend.ts` keeps the `WeakMap` that binds the metadata to a `Response`, since that record is process-local state and never a wire header. ⚠ Nothing here imports `backend.js`, and nothing may — same leaf rule as `envelope-validator.ts` beside it. |
-| `openai-request.ts` | `anthropicRequestToOpenAi()` — the Anthropic-Messages → OpenAI-Chat REQUEST mapper, mirror of `backend.ts`'s response-direction `anthropicMessageToOpenAi`. (Its `ToolCallIdMode`/`ThoughtSignatureMode` types are imported from `config-types.ts` since 2026-09-04; it used to restate both unions, a third copy.) It exists because llm-bridge's `universalToOpenAI` has no case for a `tool_call`/`tool_result` block and stringified its own IR envelope into the OUTBOUND prompt — models read the bogus notation and echoed it back as their answer, results were triplicated and no `role:"tool"` message was ever produced (docs/tool-call-dialect-leak.md §"Second mechanism"). `tool_use` → `tool_calls`; each `tool_result` → its own `{role:"tool", tool_call_id, content}` message (carrying the caller's own function `name`, looked up from the matching `tool_use` — gemini's compat layer folds a tool message into a `functionResponse` part whose `name` is required and never resolved from `tool_calls`; an orphan result with no matching call gets no name, never an invented one), emitted before the turn's remaining blocks; `thinking`/`redacted_thinking`, `metadata` and the request-level `thinking` budget are DROPPED (no representation, and a guessed `reasoning_effort` would be an invention). ⚠ ONE opt-in exception, since 2026-09-10: under `compat.reasoning: "deepseek"` (a labelled host fact defaulting from `api.deepseek.com`) the caller's `thinking: {type:"disabled"}` is forwarded verbatim, an explicit effort or the routed pool's band maps to DeepSeek's `reasoning_effort` (`low|high|max`; `medium`→`high`, `xhigh`→`max`), and a caller that sent NO thinking control and routed no effort defaults to `thinking: {type:"disabled"}`. ⚠⚠ **But a routed POOL stamps an effort band on nearly every call, and that rule is checked first — so pool-routed DeepSeek traffic runs with thinking ON by default** (this row claimed the opposite until 2026-09-10, when 18 `thinking mode does not support this tool_choice` refusals on `deepseek-v4-pro` and 2 on `deepseek-flash` showed it). What keeps a request out of DeepSeek's 400s is two OVERRIDES applied after `deepSeekThinkingSpec`, in `applyDeepSeekReasoning` (F10/F11): a FORCED tool choice (`"required"` or a named function) turns thinking off, because DeepSeek accepts only one of the two; and a conversation that replays an assistant tool-call turn carrying no reasoning the relay can pass on turns thinking off for that request rather than risk "reasoning_content must be passed back". A replayed `thinking` block's own text (never `redacted_thinking`'s opaque `data`) IS carried onto that turn's `reasoning_content`, byte for byte. An override is announced as `x-llm-relay-thinking-disabled` (`DEEPSEEK_THINKING_HEADER`, `backend.ts`) on buffered and streamed responses alike (docs/history/deepseek-responses-truncation-2026-09-09.md). An image inside a `tool_result` has no OpenAI tool-message representation and is carried losslessly rather than refused — text on the tool message, the image as an `image_url` part on the user message that follows the turn's tool messages (refusing it was a LOCAL 400, which `server.ts` does not fail over, so one screenshot killed the whole request). Anything with no representation at all — an unmodelled block type — is REFUSED as a clean local 400 (`RequestMappingError`, the `documents.ts` precedent), never stringified: the body the relay sends must be the caller's conversation, not the relay's internals. Under a target resolved to `compat.toolCallIds: "strict9"` (mistral) every outbound `tool_calls[].id` AND its answering `tool_call_id` are rewritten through ONE per-run map to mistral's stated `^[a-zA-Z0-9]{9}$` — deterministic SHA-256/base62, no randomness, an already-conforming id kept as-is, collisions resolved by a suffixed counter in first-appearance order, the `name` lookup still keyed by the ORIGINAL id; under `"preserve"` (everyone else, and the default) the outbound bytes are unchanged. Under `compat.thoughtSignature: "sentinel"` (gemini on `generativelanguage.googleapis.com`) EVERY emitted `tool_calls[]` entry additionally carries the raw string `skip_thought_signature_validator` at `extra_content.google.thought_signature` — Google's documented opt-out for a replayed call with no signature, since echoing a real one would need a conversation store (`tool-use-ids.ts`'s "no reverse map, by construction") or a fabricated `thinking` block; counted as `thoughtSignatureSentinels` with deliberately NO response header, and under `"none"` (everyone else, the default) the bytes are unchanged. |
-| `responses-request.ts` | `openaiResponsesRequestToAnthropic()` — the OpenAI-Responses → Anthropic-Messages REQUEST mapper, the Responses-front sibling of `openai-request.ts`. llm-bridge's `openaiResponsesToUniversal` models `function_call_output` and nothing else, so an assistant `function_call` (no `role`) was flattened into an empty user turn — the tool call vanished and the `tool_result` after it had nothing to answer, breaking every Responses tool conversation past the first call on BOTH backend kinds — an assistant `output_text` reached the backend as `JSON.stringify(part)`, a `reasoning` item became a bogus user turn, and `instructions` was read by nobody. Ids round-trip unchanged (`function_call.call_id` → `tool_use.id` → `tool_calls[].id`), consecutive same-role items merge into one turn (assistant message + its `function_call`s; consecutive `function_call_output`s, whose `tool_result` blocks lead the user turn), `reasoning` items and `reasoning.effort` are DROPPED (llm-bridge's `budget_tokens: 10240` was an invented figure) — except that under a RESOLVED `reasoning: "deepseek"` option (2026-09-10, F11) a `reasoning` item's own `summary_text` becomes a LEADING `thinking` block on its assistant turn (never `encrypted_content`, never an empty block), so `openai-request.ts` can carry it onward as `reasoning_content` — hosted tool declarations are dropped as before, and `previous_response_id`, a `text.format` structured-output contract, and any unmodelled item type are REFUSED as a clean local 400 (`RequestMappingError`, shared with `openai-request.ts`) rather than silently reshaping the conversation. ⚠ **`max_output_tokens` absent carries NO `max_tokens` since 2026-09-09.** It used to carry llm-bridge's 1024, and a capture ([docs/history/deepseek-responses-truncation-2026-09-09.md](docs/history/deepseek-responses-truncation-2026-09-09.md)) found **19 of 68** DeepSeek answers cut at exactly that figure (20 ended `finish_reason: "length"`; the twentieth was a one-token probe) while all 44 `response.completed` events the relay emitted carried NO `incomplete_details` — every capped answer announced whole; the aggregate is re-derivable from that document's own capture files and is tabulated in its "Aggregate over all 68 captures" section, added after an independent auditor found the figure cited in four places and written in none — which is how a cut tool-call argument reached Codex labelled whole, Codex replayed it, and the relay refused the replay (the five-of-five deaths of that morning). An openai-kind target now gets no cap and applies its own ceiling; an anthropic-kind target, whose API requires the field, resolves one at the target in `backend.ts` (`resolveAnthropicResponsesMaxTokens`: the learned `max-output` fact, then the catalog figure, then `DEFAULT_RESPONSES_MAX_TOKENS`, 8192, a stated default and never a provider figure). A replayed `function_call` whose `arguments` are not valid JSON is refused NAMING the `call_id` and saying the string was cut, so a harness can repair the turn instead of replaying it forever. |
-| `stream-commit.ts` | Final-wire SSE commit probe shared by both candidate loops. Buffers raw bytes until the client-facing Anthropic/Chat/Responses protocol carries meaningful text, reasoning, or a structured tool call; replays the prefix byte-exact; and classifies pre-content error/empty/cap/cancellation outcomes before any downstream head is written. The 64 KiB limit is shared with `backend.ts` structural preflight. ⚠ An in-band error event is classified `upstream` — i.e. RETRIABLE — by default, because normally it is the provider's. `relayAuthored()` is the one exception: an error carrying a relay-owned code (today `DIALECT_REFUSED_DESTRUCTIVE_CODE`) is classified `local`, so a streamed PRE-COMMIT refusal is terminal exactly like its buffered twin. Without it the same refusal would reroll across the whole pool on one lane and stop dead on the other. |
-| `sse-frames.ts` | The boundary rule for the FIVE STREAM MODULES (`openai-dialect`, `stream-commit`, `think-tags`, `tool-use-ids`, `dialect-stream`): mixed-terminator-correct boundary detection, buffered frame iteration, and raw `event:`/`data:` field extraction; each adopter keeps its own trimming/event-name policy. It also owns `parseSseEvent` — the ANTHROPIC-shaped event parse (last `event:` line wins, data lines trimmed and joined, unparseable body degrading to `data: null`, blank block declined) — because `dialect-stream` and `think-tags` held BYTE-IDENTICAL private copies of it, one layer above the extraction this file already unified. ⚠ `openai-dialect` deliberately keeps its own: FIRST event line, a leading space stripped per data line, a `[DONE]` sentinel and a non-nullable return, so sharing one would change its wire behaviour — that is the trimming/event-name boundary above, not an omission. THREE divergent semantics predated it — `dialect-stream`'s inline pure-`\n\n` scan could not match CRLF at all and swallowed such a stream whole (latent; llm-bridge emits `\n\n`). ⚠ Deliberately NOT adopted by: `server.ts` `frameEnd` (byte-level `Buffer` scan so multibyte UTF-8 never splits mid-frame), and the `backend.ts`/`sse.ts`/`usage-observer.ts` internal parsers (review finding 13, deferred). **Also owns `createSseTransformStream` (P1-04 / CLONE-20, 2026-09-05)** — the ONE read loop, error tail and lifecycle for an SSE-rewriting `ReadableStream` transform. `stripThinkTagsInStream` and `rewriteToolUseIdsInStream` each held a byte-identical private copy of a `TextDecoder`, a `TextEncoder`, a `BufferedSseFrames`, an empty-suppressing `push`, a `for(;;) reader.read()` loop, the end-of-stream drain, `push(frames.takeRemainder())`, a catch that drains then emits the `event: error` frame, and `controller.close()` in `finally`. Only the frame policy and one OPTIONAL `flushHeld` ever differed, and the scaffold calls that hook at exactly one point in BOTH tails — which is where think-tags always called it and where tool-use-ids has nothing to do, so one scaffold serves both byte-for-byte. ⚠ The error tail is the losslessness guarantee and had NO coverage before this: deleting the whole `catch` left both stream suites green. Pinned now in each caller's own suite and mutation-checked — removing the error frame fails 2 tests, removing the held-text release fails 1, and only the think-tags one. ⚠ **It lives HERE and not in `sse.ts`, which is a deviation from the P1-04 plan, stated rather than silent.** The plan's reason for `sse.ts` was that it already owns shared SSE vocabulary through `iterateDataPayloads`; that generator is PRIVATE to `sse.ts`, whose domain is rebuilding an `AssistantMessage`. This file is the leaf both callers already import and imports nothing itself, so putting a framing primitive in `sse.ts` would make two stream wrappers depend on the message reconstructor for nothing. |
-| `tool-dialects.ts` / `dialect-stream.ts` / `openai-dialect.ts` | Recovering tool calls a HOST failed to parse. Some free hosts return the model's native dialect as assistant TEXT instead of `tool_calls`, which reached the client as markup it treated as a final answer — no `tool_calls` ⇒ `end_turn` ⇒ zero `tool_use` ⇒ the validator passes ⇒ repair never engages. Parsing, not inference: a CLOSED envelope set, and prose naming a tool stays prose. An unparseable envelope yields `detected`, and the caller fails clean so failover reaches a host that parses. Anthropic-shaped translation uses `openAiResponseToAnthropic` / `dialect-stream.ts`; direct Chat uses `openai-dialect.ts`, emits native `tool_calls`, and joins the final-wire commit probe before headers. **A recovered call naming a tool in `repair.destructiveTools` is REFUSED, not committed** — `recoverToolCalls` takes the matcher as a REQUIRED parameter and returns `refused-destructive`; see the gotcha below. See [docs/tool-call-dialect-leak.md](docs/tool-call-dialect-leak.md) and [docs/history/dialect-rescue-destructive-refusal-2026-08-24.md](docs/history/dialect-rescue-destructive-refusal-2026-08-24.md). |
-| `tool-use-ids.ts` | Making a translated response's `tool_use` ids unique against the conversation that produced it. A host may reuse an id across turns (`nim/moonshotai/kimi-k3` emits `<ToolName>:<index in this response>`, so `Read:0` recurs), and Claude Code's request-time normalizer DROPS a `tool_use` whose id it has already seen — mangling the model's context and eventually emptying the fresh turn to `[Tool use interrupted]`. Protocol FORM, not judgment: `knownToolUseIds()` reads the request's own `tool_use.id` / `tool_result.tool_use_id`, `uniqueToolUseId()` mints the smallest free `<id>_relay<k>` (deterministic, no randomness), and `rewriteToolUseIds()` / `rewriteToolUseIdsInStream()` apply it to a buffered content array or an SSE `content_block_start`. Pure — no store and no reverse map, because the client echoes the minted id back in both the `tool_use` and the `tool_result` and `openai-request.ts` forwards both verbatim. Wired at the openai-kind seam in `backend.ts` ONLY; a native Anthropic response stays byte-exact. |
-| `lane-manifest.ts` / `lane-probe.ts` | Cached CLI-lane roster/support evidence plus the operator/background probe that refreshes it. Command recognition covers AGY/Codex directly and through wrapper args. Only positive fresh evidence can evict a model or unsupported argument; missing, corrupt, unprobed or stale negative evidence becomes `unknown`. Listed models remain servable even when the roster ages, and observed rejected arguments remain existence facts. Request handling never runs a roster probe. |
-| `lane-quota-probe.ts` / `lane-cadence.ts` | The quota re-probe (2026-08-29): is a `cli` lane's BALANCE alive, and the relay's own background loop that re-tests recorded deaths. `lane-quota-probe.ts` is the classifier + spawner seam: one minimal real completion through the rung's own command (`{task}` → probe prompt, args ONLY — env values stay verbatim, the placeholder security rule), fail-safe in BOTH directions — only a real answer (exit 0, non-empty) retracts a death; only an explicit rate/quota statement records one (quota patterns tested FIRST — "the word quota wins", the 0.28.0 lesson); timeout/empty/unrecognized ⇒ inconclusive ⇒ NOTHING changes. A vendor-stated "try again in N units" window is honoured against a closed unit vocabulary; anything else gets the outcome default. `lane-cadence.ts` rides `PingLoop.tickOnce` via the `onTick` hook (fire-and-forget behind an in-flight latch — a minutes-long lane command must never delay an HTTP probe tick): CATALOG re-probes per `catalogIntervalMs` (24h default, no quota cost), QUOTA probes ONLY buckets carrying an ACTIVE recorded death per `quotaIntervalMs` (6h default) — an alive lane is re-tested by real use for free, and a bucket FIRST SEEN dead is stamped, not probed (the report itself is fresh evidence). Config: `routing.laneProbe` (bool or object; unknown key = hard load error; **default ON**, the owner's 2026-08-29 decision). ⚠ Under vitest the cadence no-ops unless BOTH seams are injected and the default spawner refuses outright — the `winenv.ts` guard; a suite must never spend real lane quota. ⚠ Disabled rungs are probed too: disabled is a dispatch choice, not a statement about the balance. |
-| `dispatch-exhaustion-persistence.ts` | Durable exhaustion state for the ladder (`dispatch-exhaustion.json`, cache-kind) — `breaker-persistence.ts` applied to `dispatch.ts`'s cooldown map, because the report route accepts vendor-stated cooldowns up to 30 days and a restart forgot them (fail-open, so the cost was spend, not availability). Future-only restore, field-by-field row validation (one bad row dropped alone), never overwrites what the live process already learned, and the write boundary also drops lapsed rows so dead cooldowns do not linger in the JSON after the next flush; debounced through the shared `WriteBehindTimer`. The CLI's cold `dispatch` fallback restores read-only (no listener ⇒ no write-back), narrowing — not closing — its live-state gap. `flushDispatchExhaustionPersistence()` (2026-09-08) is its shutdown flush, called by `runProxy` beside the sibling flushes; until then the timer lived in a closure nothing could reach. |
-| `dispatch-lane-stats.ts` | Advisory per-lane execution stats for the ladder (`dispatch-lane-stats.json`, cache-kind) — the OTHER half of what a lane run teaches the relay beside the cooldown half in `dispatch.ts`: calls, successes, failures, timeouts and a bounded (25-sample) wall-clock window per lane, held per-Config. `POST /dispatch/telemetry` records both lane kinds here, but this series NEVER touches `runtime-telemetry.json` — a CLI wall-clock includes process launch and tool execution and would poison HTTP pool scoring — and never reorders the ladder. Fail-closed report parser (exact keys; `kind`/`status` validated against the `as const` arrays they are typed from), field-by-field row validation (one bad row dropped alone), restore never overwrites what the live process already learned, debounced through the shared `WriteBehindTimer`. `medianWallClockMs()` is the pure median-of-window helper the view calls (empty window ⇒ null, never 0), and `p95WallClockMs()` is its nearest-rank sibling, added 2026-09-06 because the MEDIAN HIDES THE TAIL and the tail is what an operator giving up on a lane is looking at (live store: median 111.5 s, p95 900 s, max 1500 s — three figures supporting three conclusions, of which the ladder printed only the smallest). ⚠ Nearest-rank, so the answer is an OBSERVED sample rather than an interpolation between two: a percentile reporting a duration nothing ever took would be a fabricated measurement. ⚠ REPORTED, never acted on — nothing demotes a lane on a wall-clock threshold, because the recorded window mixes several sessions' traffic; the demotion that DOES happen is first-party walk evidence in `lane-affinity.ts`. ⚠ `DISPATCH_LANE_STATUSES` gained a FOURTH member, `abandoned` — the relay's own walk stopped this lane because it did not answer inside the budget, which IS lane evidence and so is recorded, unlike an operator `cancelled` which is discarded. Distinct from `timed_out` (the lane exceeded its OWN 35-minute ceiling): conflating them would report a 90-second miss as a 35-minute one. Adding it was a compile error at `recordLaneRun`'s `default: never` AND at `TELEMETRY_FAILURE_KIND` in `routes/admin.ts`, which is the discipline working. The report also gained `tier`, because the daemon's routing memory is keyed by it. ⚠ `MAX_LANE_STAT_SAMPLES` rose 25 → 100 on 2026-09-08 when lane history began driving dispatch decisions; the retired attempt-budget consumer is gone, while the same bounded window still supports time-to-answer reporting and outlier demotion. Raising it is backward compatible in the direction that matters — `isLaneStatsRow` rejects a window LONGER than the bound, so an old 25-sample file still loads, while LOWERING it later would drop every existing row. This constant only ever grows. `quantileWallClockMs(samples, q)` is the ONE nearest-rank helper (`p95WallClockMs` is a thin wrapper over it); nearest-rank keeps every reported percentile on an OBSERVED sample rather than fabricating a duration by interpolation. ⚠ Its `Math.max(Number.EPSILON, q)` is NOT protection against a quantile of 0 and the header claimed it was until 2026-09-08: at EPSILON `Math.ceil(q * n)` is 1, at 0 it is 0 which `Math.max(1, rank)` lifts to 1, so both return `sorted[0]` — the fastest sample, precisely the outcome the comment said it prevented. Configuration callers validate their own live quantiles (for example outlier `historyQuantile`); the helper itself still bounds direct calls defensively. ⚠ An `abandoned` run contributes NO duration sample: its wall clock is the relay's own idle-stop decision, not a time-to-answer measurement. The COUNT still lands (`failures`) because the attempt did not answer. ⚠ The window is keyed by (tier, mode, lane) — `statsKey` — since 2026-09-09 (tier) and 2026-09-10 (mode); a row written before either loads unchanged with that part null. ⚠⚠ **Since 2026-09-10 ONLY a `completed` run adds a duration sample**: a `failed` or `timed_out` run's wall clock says nothing about the time to ANSWER (a window of 900 s timeouts had made one lane's timeout its own budget), and an `abandoned` run's never did. Each live row keeps `consecutiveFailures` (failed or timed out; an answer resets it) and `lastSuccessAt`; the persisted loader still accepts the old optional `abandonedSinceSuccess` field for backward compatibility but new rows do not write or restore it. ⚠ And such a row whose samples outnumber its successes restores with an EMPTY window (`restoredWindow`): at least one of its durations is provably not an answer, and nothing says which — found by the live proof, where `anthropic` read "usually answers in 0s" at 0 of 24 answered. The rendered label says "runs on record", not "completed runs", because a kept older window cannot be proved clean. The report gained `mode` (validated against `DISPATCH_MODES`), which the MCP server sets to the mode the lane RAN in — `answer` only for a `relay` lane in answer mode. `flushDispatchLaneStatsPersistence()` (2026-09-08) is its shutdown flush, called by `runProxy` beside the sibling flushes. |
-| `lane-activity.ts` | A dispatch lane's LIVE TRAFFIC as the daemon sees it (2026-09-17): the MCP server tags each lane it starts, the lane sends the tag as `x-llm-relay-lane-activity` (`LANE_ACTIVITY_HEADER`), and `server.ts` `trackLaneActivity` touches the tag at request start, on every `res.write`/`res.end`, and at close — one choke point for both fronts. `GET /dispatch/activity?tag=` (a control route: token required) answers `{ inFlight, requests, lastActivityAt }` or `activity: null`, which the MCP server reads as NO signal, never as idle. In memory only, at most `MAX_LANE_ACTIVITY_TAGS` (1000) tags; overflow evicts the least-recently-active INACTIVE tag first so a live request's later write cannot recreate itself with a false `inFlight: 0`, falling back to the oldest tag only when all retained tags are active; tags are validated to a closed alphabet, and the header is on `INTERNAL_REQUEST_HEADERS` so it never reaches a provider, a passthrough target included (pinned by `test/lane-activity.test.ts`). |
-| `lane-launch-env.ts` | Shared environment policy for MCP-owned and D1 daemon-broker-owned lane processes. Starts from the launcher's normal user environment, scrubs every relay-owned provider credential name, then applies only operator-authored lane env deltas (including explicit null unsets); Windows name matching is case-insensitive. This is the one owner of the credential-scrub rule so daemon ownership cannot drift from the existing MCP launcher. |
-| `lane-execution-broker.ts` | D1 daemon-owned lane execution protocol/store. Closed `start|status|cancel` vocabulary; start is idempotent by execution id and stores only a request hash, never task text for comparison. The relay daemon installs the configured broker by default, owns each spawned agent-lane process tree, retains bounded terminal output/activity, and cancels its owned trees on daemon shutdown. `POST /mcp/lane-execution` is control-token-gated; fresh MCP agent attempts use it by default and may fall back locally only before any broker start could have been sent. |
-| `configured-lane-execution-launcher.ts` | D1 daemon-side configured launcher used by the production broker. A broker start names only a lane id + execution facts; this module resolves that forced lane through `buildDaemonDispatchView(requester=mcp, mode=agent)`, reuses the cwd/read-only/AGY/env/depth/activity/spawn machinery, and exposes liveness as output + relay traffic + process-tree CPU without exposing PIDs. A stale MCP process cannot supply command/argv/env. |
-| `lane-affinity.ts` | Per-config, per-tier routing memory for pins, demotions and recent-vs-history outlier demotion. State is persisted with bounded TTLs; expired rows disappear on read/restore. A pin promotes but never resurrects an unavailable lane, a demotion never removes a lane, and recording one memory retracts the opposing memory so newest evidence wins. The daemon owns writes; MCP processes report outcomes. |
-| `mcp/job-journal.ts` / `mcp/readonly-boundary.ts` | `job-journal.ts` is the shared cache-kind journal for running MCP jobs: rows carry owner PID/instance and bounded recovery metadata; broker-backed rows carry only an opaque daemon execution id. Cross-process transactional mutations preserve foreign rows, live foreign owners are not adopted, local orphans surface as `killed`, and broker-backed orphans can be claimed/reconciled with the daemon. `readonly-boundary.ts` enforces read-only dispatch at both cwd and supported harness-tool boundaries: Claude/Codex are bound to read-only mechanisms; unsupported harnesses are skipped rather than run under a false guarantee. |
-| `mcp/persistence-lock.ts` | One contention budget for the cross-process MCP journal/archive transactions. The storage layer's generic file lock waits 5 s, but a timed-out journal mutation is intentionally best-effort and therefore silently loses a running-job row. MCP shared persistence uses a 30 s lock budget instead; the real multi-process regression also holds the lock for >5 s and proves the row survives once contention clears. |
-| `mcp/job-archive.ts` | Shared cache-kind archive for terminal MCP jobs. Terminal rows are written eagerly, bounded to the newest 100, and output tails are capped only in the archive representation. Cross-process transactions merge the latest disk state and preserve unrelated rows; lookup reads current disk state so another host process can return a completed result. Job ids are process-randomized plus monotonic, avoiding shared-counter allocation races. |
-| `mcp/process-cpu.ts` | Lane-owned process-tree CPU as a fallback liveness measurement for spawned dispatch lanes that do not expose relay traffic or output. `defaultProcessCpuReader` reads cumulative CPU for the registered root pid(s) plus descendants: PowerShell/CIM (`KernelModeTime` + `UserModeTime`, 100 ns units) on Windows, `ps -A -o pid=,ppid=,time=` on POSIX. The first sample is only a baseline; `mcp/server.ts` decides whether a later increase is activity. Null means no signal, never idle. Under vitest the real reader performs no process enumeration. Pure parsers and tree/sum helpers are pinned by `test/process-cpu.test.ts`. |\n| `mcp/tree-delta.ts` | What an agent-mode lane changed in its git working tree — REPORTED, never reverted (2026-09-17). `McpDispatchServer.startTreeDelta` reads `git status --porcelain=v1 -z --untracked-files=all` (plus `rev-parse --show-prefix`) before the walk's first spawn, and `recordTreeDelta` reads it again BEFORE the walk marks the job terminal, so the archived row carries `LaneJob.treeDelta`; a cancelled job gets it asynchronously through `LaneJobStore.noteTreeDelta`, which re-archives a terminal job. `jobAnswer` appends the block (`tree delta (<cwd>): N paths`, `+`/`~`/`-` lines, at most `MAX_TREE_DELTA_LINES`, or `tree delta: none`). The `dispatch` argument `scope` (paths or globs relative to `cwd`; `*`, `**`, `?`) marks every other path `OUT OF SCOPE`, and a path outside `cwd` itself is always outside a declared scope. ⚠ A STATUS comparison: a file already modified before the lane and modified again keeps its status and is not listed. ⚠ `defaultTreeSnapshot` returns null under vitest (a suite inside a real checkout would otherwise append that checkout's live status to every answer it asserts on); tests inject `McpServerDeps.treeSnapshot`. Answer mode reads nothing, a cwd outside a git tree records nothing, and a `killed` job carries no delta (backlog). Pinned by `test/mcp-tree-delta.test.ts`, mutation-checked. |
-| `mcp/lane-execution-client.ts` | D1 MCP-side strict client for `POST /mcp/lane-execution`, used by fresh agent-mode dispatch attempts and restart recovery. Loads the existing control capability, never performs real broker HTTP under vitest without an injected fetch seam, and distinguishes a reachable daemon rejection (notably 404 unknown execution) from transport/auth unavailability and malformed 2xx responses. Successful responses must contain exactly one versioned execution snapshot; `createLaneExecutionId` mints an opaque 128-bit id with no task/lane meaning. |
-| `mcp/agy-quota-log.ts` | Reading the quota death AGY states only in ITS OWN LOG (`~/.gemini/antigravity-cli/cli.log`, 2026-09-10). AGY retries a spent quota in silence, so a lane the walk stopped after going idle, or one that hit its own timeout, printed nothing, and `agy-claude-opus` stayed `ready` through 34 failed runs until one forced 604 s run recorded the death ([docs/history/dispatch-giveup-diagnosis-2026-09-10.md](docs/history/dispatch-giveup-diagnosis-2026-09-10.md) §4). `readAgyLog` reads the file — never under vitest without an explicit path, because the operator's real log is not a fixture. `agyQuotaStatement(snapshot, model, startedAtMs)` returns `{ outcome, retryAfterMs, line }` or null, and REFUSES everything it cannot attribute: ⚠ the log is shared by every AGY run and AGY truncates it per run, so EVERY run header in it must name the lane's own `--model`, and the file must have changed after this lane started (a non-finite mtime proves nothing). The LAST `RESOURCE_EXHAUSTED … Resets in <Go duration>.` line wins; `quota` in the line ⇒ `quota_exhausted`, else `rate_limited` — the 0.28.0 "the word quota wins" rule. `parseGoDurationMs` consumes the WHOLE duration or returns null, from ONE unit table (`GO_DURATION_UNIT_MS`) whose keys build its regex, so no duration is ever invented. The MCP server (`agyLogReport` in `mcp/server.ts`) consults it only for an AGY lane (`laneOfRung`) that did not answer, and reports through the same `reportExhaustion` seam a lane's own output uses. |
-| `mcp/protocol.ts` | JSON-RPC 2.0 over stdio — the MCP wire, hand-rolled, ZERO new dependencies. Four methods (`initialize`, `tools/list`, `tools/call`, `ping`) plus notifications, newline-delimited. `splitMessages` is mixed-terminator-correct (the `sse-frames.ts` rule: a CRLF client must not leave a stray `\r` glued to the JSON) and skips blank padding rather than failing a healthy connection. `negotiateProtocolVersion` echoes a revision only from the closed `SUPPORTED_PROTOCOL_VERSIONS` list — echoing an unimplemented one would claim a capability we lack, the closed-vocabulary defect this file records eight times. ⚠ **NOTHING may be written to stdout except protocol messages**; a stray `console.log` corrupts the stream and the host drops the connection with no useful error, which is why `logStderr` exists. ⚠ The known cost, stated so it is not rediscovered: hand-rolling means owning a spec that moves, so only the stable core is implemented. Extensions (Tasks, Apps, sampling) are deliberately absent — [docs/history/mcp-dispatch-prior-art-2026-08-30.md](docs/history/mcp-dispatch-prior-art-2026-08-30.md) §3.1 measured that NO client ships Tasks support today, and the official client matrix does not even list it. |
-| `mcp/lane-runner.ts` | Lane/job state plus process execution mechanics. `JobStatus` distinguishes running, completed, failed, cancelled, timed out and killed; walk attempts additionally support pre-spawn `skipped`. Spawning centralizes shell-free Windows npm-shim resolution, stdin closure, hidden-window handling, output limits, timeouts and owned process trees. Terminal transitions reap locally owned processes and report survivors. The store also owns journal/archive integration, structural empty-output checks, cwd/allowed-root validation and attempt diagnostics consumed by MCP status rendering. |
-| `mcp/windows-npm-shim.ts` | Shell-free Windows fallback for npm-generated command shims. It resolves only supported `.cmd`/`.bat`/`.ps1` shim metadata to a verified Node entrypoint, then invokes Node with the original argv; unknown batch files fail closed instead of sending task text through a shell. |
-| `mcp/server.ts` | Five-tool MCP surface: `dispatch`, `dispatch_status`, `dispatch_result`, `dispatch_cancel`, and `dispatch_lanes`. One job handle represents the whole walk. The server applies host-aware wait ceilings, per-attempt telemetry, read-only/cwd boundaries, explicit liveness snapshots and idle-only walk advancement; last/no-reliable-next lanes are not idle-stopped. D1 uses the daemon lane-execution broker for restart-safe ownership/recovery/cancellation, and transport uncertainty is never invented as death. Terminal status polling includes the result. Active hard-cap continuation is not enabled yet: absolute lane timeout behavior remains until a harness passes the live exact-resume + isolation gate. |
-| `validator.ts` | Deterministic Ajv2020 tool_use validator. Verdicts: pass / fail / **uncheckable** (declared tool with no `input_schema`, e.g. built-in `bash`). |
-| `reshaper.ts` | The repair model client. Contract: reshaper returns ONLY **corrected inputs per tool_use id** (`{"inputs":{"<id>":{...}}}`); proxy reconstructs + re-validates. `HttpReshaper` (anthropic|openai) + `FailoverReshaper` (ranked candidates from `reshaper: { pool }`; advances on transport failure only — a refusal is returned as-is, never retried elsewhere, and **exhausting every candidate throws `ReshaperTransportError`**, it does not return a refusal). |
-| `repair.ts` | Repair orchestrator. Destructive-refusal check → reshape ≤ maxAttempts → re-validate each attempt. `destructiveMatcher()` matches the tool name **exactly** (case-insensitively), with `name*` as an opt-in prefix form; `guardReshaped()` re-checks the reshaped message for destructive calls and for structural conservation (same block count/order, same tool_use `id`+`name`) — an added, dropped or re-pointed call is a contract violation, not a repair. `withEnvelopeOf()` re-attaches the BACKEND's `id`/`model`/`stop_sequence`/`usage` to whatever the reshaper returned — same reasoning as the guard: `Reshaper` is an interface, and a repair changes the tool arguments, never whose answer this is. |
-| `sse.ts` | `reconstructFromSse()` — rebuild an AssistantMessage from a captured SSE stream (to validate it). |
-| `emitSse.ts` | `emitSse()` / `emitSseTail()` — serialize a (repaired) message back to Anthropic SSE. `emitSseTail` re-emits only trailing blocks (streaming repair). Cache usage fields re-emit on `message_start` exactly as reported — never in `message_delta`, never zero-filled when absent. |
-| `anthropic.ts` | Minimal Anthropic Messages shapes + `toolSchemaMap()`. Only the fields the proxy inspects. `usage` carries Anthropic's cache fields (`cache_creation_input_tokens`/`cache_read_input_tokens`) alongside input/output, all optional. |
-| `documents.ts` | `transcodeDocuments()` — Anthropic `document` blocks → markdown text via **MarkItDown** (optional external Python CLI), applied to openai-kind targets before the request mapper. The walk covers the top level of a turn **and** the content of a `tool_result` (one level is the whole schema — nothing nests a `tool_result`), because a document a tool returned is otherwise never reached and the mapper refuses the turn. Refuses (`DocumentError` → 400) rather than letting an unconvertible document through; the pre-mapper path stringified it and injected raw base64 into the prompt. Its refuse-don't-mangle rule is the precedent `openai-request.ts` follows for every other unrepresentable block. Uses a **temp file, not stdin** — pdfminer needs a seekable stream and every piped PDF dies with "No /Root object". |
-| `log.ts` | Metadata-only logger (never headers/bodies). "Metadata only" is enforced **at the sink**: `write()` projects each record through the `LOG_FIELDS` allow-list, and the bounded `attempts` walk through its own nested allow-list, so a caller that hands over a wider object cannot leak it and a new field is logged only when someone adds it deliberately. Rotates to one `.1` predecessor when the next record would exceed `maxBytes` (default 50 MB) — deliberately NOT token counters: the accounting store is the per-request ledger (see `accounting-store.ts`). Log-write failure is swallowed — a full disk is a logging problem, never a request failure. Records the deployment that ANSWERED (`servedProvider`/`servedModel`, required), status-only `{provider,model,status,ms}` attempts, and `upstreamReportedModel` only when the raw response disagrees with the routed model; upstream claims never replace authoritative routed identity. The model the client asked for is deliberately not a field. Three translation COUNTERS ride the allow-list — `toolUseIdRewrites` (response-direction mint), `toolCallIdRewrites` (outbound `strict9` rewrite) and `thoughtSignatureSentinels` (gemini's stamped sentinel, the one with no response header, so this is its ONLY surface) — counts, never ids or signatures. |
-| `catalog.ts` | Dynamic `/models` catalog cache (`ModelCatalog`) with stale-while-revalidate strategy (`models-cache.json`). Also harvests **per-(provider, model) limits + pricing** (and published rate limits rpm/rpd/tpm/tpd, spec §4 rung 2 — expected near-empty) via `limitsFromRecord()` — generic field-alias lists (`context_window`/`max_context_length`/…), never a per-provider switch. `limits()` returns null when a provider publishes nothing (NIM), and that null must not be filled with another provider's numbers; `publishedRateLimits()` reads the harvested block cache-only, with deliberately no `reference` rung — another provider's allowance is meaningless here. ⚠ The DISK loader gates `fetchedAt` on `Number.isFinite`, not `typeof … === "number"` (2026-08-28): `Infinity` passes the latter, and `now - Infinity` is `-Infinity`, which is `< ttlMs` — so a corrupt entry read as **permanently fresh** and never refreshed. (`NaN` was already safe: `NaN < ttlMs` is false, so it fell through to the stale branch.) The disk path also applies `MAX_CATALOG_MODELS` and `MAX_MODEL_ID_CHARS`, which only the wire path enforced. ⚠ A fixture for this CANNOT be built with `JSON.stringify` — JSON has no Infinity literal, so `JSON.stringify({fetchedAt: 1e309})` emits `{"fetchedAt":null}` and the test silently stops testing anything. Write raw JSON text. ⚠ **It refreshes on EVIDENCE as well as on the clock since 2026-09-10** (owner direction: *"if we get a hint that our model catalog might be stale, we update it"*). `noteProviderStale(name, cfg, opts)` re-fetches one provider behind a per-provider cooldown (`MODEL_MISSING_REFRESH_COOLDOWN_MS`, 60 s) and returns whether it actually started a refresh. ⚠ It TRIGGERS a re-fetch and never edits the catalog: the endpoint is the measurement, so a model that 404s and is then re-listed stays exactly where it was, and a failed re-fetch leaves the previous list standing (fail-open — a catalog hint must never turn one failing request into two). ⚠ The cooldown is a floor on FREQUENCY, not a claim about staleness, and an unusable clock (a `NaN` `now`) is "no cooldown recorded" rather than a comparison that answers false forever. ⚠ **The signal is narrower than "something went wrong", and the containment lives at the call site** (`server.ts` `catalogStale`, wired through `CandidateRunnerHandlers.catalogStale`): the refusal must be a **404** whose provider STATES the model does not exist (`statesModelDoesNotExist` in `refusal-interpretation.ts`, sharing `STATED_MODEL_ABSENCE` with the `not-servable` seed so classifier and interpretation cannot drift) AND the model must be one the catalog CURRENTLY LISTS (`cachedModels`, cache-only). A 400 carries the same wording and is deliberately excluded — it is a request-validation error, and the phrase there is likelier about the request than a roster; it still records its `not-servable` fact and still fails over, it just does not re-fetch. A 404 for a model the catalog never listed contradicts no roster, and refreshing on it would let a caller naming a typo drive the provider's `/models` endpoint. ⚠ Two closed sets met here and one was collapsed: `statesModelDoesNotExistInAny` deliberately does NOT re-test the status — a second copy of that rule guarding the candidate loop would pass the mutation check while silently drifting, so the status is checked once, inside the classifier, on every candidate. ⚠ The refreshed roster reaches pool membership through the existing `getRevision()` signature in `materializeDynamicPools`, pinned end to end in `test/dynamic-pools.test.ts`. |
-| `circuit-breaker.ts` | Dynamic failure and rate-limit (HTTP 429) circuit breaker. ⚠ **`CircuitBreaker.orderByUsability()` has ZERO `src/` callers** — it is a test-only seam, as is the `orderByUsability` re-export in `server.ts`; the LIVE ordering is `targetUsability()` + `orderDeploymentGroupsByUsability()` in `server.ts`, which additionally consult quota demotion and cost-class facts. This row used to call the breaker method "the ordering API", which is how the two could drift with nothing in production to notice. The method still states the banding contract: it DEMOTES without deleting, into four health bands — ready → credential-faulted → cooling → cooling-and-faulted — and preserves within-band order. ⚠ It deliberately does not re-rank by measured stability; `server.ts` records why (that would be a second ranking pass competing with deployment fitness). Measurement is read separately through `getDeploymentMeasurement()`, whose `stabilityScore` is **null when nothing has been measured**, and every `src/` consumer passes that null through rather than substituting the ordering-only `UNMEASURED_STABILITY` band. A `number` return cannot say "unmeasured", so a scalar accessor gave every caller a plausible score and none could tell a guess from an observation. Credential faults (401/403) are a **separate axis** (`recordCredentialFault` / `hasCredentialFault`) that demotes without tripping and expires, because a revoked key is neither a sick backend nor a healthy one. A 429/503's `Retry-After` sets the cooldown in place of the flat guess; a 429 WITHOUT one escalates through a fixed ladder (`RATE_LIMIT_ESCALATION_MS`: 2m → 10m → 1h → 24h per consecutive unexplained 429), and 402 cools 1h. **Repeated generic failures/5xx and 402s now also have a relay-invented recovery floor** (`FAILURE_ESCALATION_MS`: failures 3/4/5/6+ → 10m/1h/6h/24h). Generic failures use the longer of that floor and `failureCooldown(elapsedMs)`; 402 keeps its existing 1h floor until the ladder becomes longer. The source is `failure-escalation` only when that ladder actually wins, so failures 1–2 and longer measured waits retain their old provenance. ⚠⚠ **A cooldown must OUTLAST the failure that caused it, so `DEFAULT_COOLDOWN_MS` (60s) is a FLOOR, not the answer** (`failureCooldown`, 2026-08-30). Measured live: `nim/deepseek-ai/deepseek-v4-flash-0731` hung on **43 consecutive attempts**, each burning the full 120000 ms provider timeout, and its breaker read `closed` every time anyone looked — so the relay walked into the same 120-second hole on every request, which is the best explanation yet of the ~17-minute offload lane. ⚠ **Nothing was broken in the charging path**, and that is the part worth remembering: `PROVENANCE_REACHES_HEALTH_PATH["deadline"]` is `true`, a 504 passes the 4xx filter, and the trip fired exactly as written — the CONSTANT was just smaller than the failure it punished (60s cooldown for a 120s waste, against requests arriving 78-139s apart), so the cell was always closed again by the next walk. A slow failure now cools for the time it actually wasted, `source: "elapsed"`, clamped to `MAX_RETRY_AFTER_MS` so a 30-minute `timeoutMs` cannot buy a 30-minute cooldown off one sample. ⚠ Fast failures are unaffected BY CONSTRUCTION (a 341 ms error keeps the 60s default — the floor wins), and every other rung is untouched: a stated `Retry-After`, the 429 ladder and 402 all still win where they did. ⚠ The duration is MEASURED (`elapsedMs`), never invented, which is the standing that permits setting one at all. ⚠ **`CooldownSource` is now DERIVED from `COOLDOWN_SOURCES`** — `breaker-persistence.ts` `isCooldownSource` hand-listed all five members, so adding `elapsed` type-checked clean while every persisted row carrying it was silently dropped at load; that is the "runtime list hand-copied from the type" defect this file records against `UNTIL_BASES`, met a fourth time. ⚠⚠ **A cancellation now teaches the cell what it actually proves, and the old flat `if (outcome.terminal === "cancelled") return;` could NOT simply be deleted** (`CANCELLATION_REACHES_HEALTH_PATH`, 2026-08-30). That one line carried THREE different events, so deleting it would have made three routing changes nobody asked for at once: `PROVENANCE_REACHES_HEALTH_PATH["client-cancellation"]` already answers `true`, so every ordinary client disconnect would have charged provider health; every hedge loser would have been charged, silently repealing a documented hedging invariant; and cancelled attempts' quota headers would have started merging into routing state. So `AttemptCancelled` gained a REQUIRED closed `cause` (`kernel/contracts.ts`) routed by a second total table, the `PROVENANCE_REACHES_HEALTH_PATH` sibling — `client-gone-before-response` true, `client-gone-mid-response` and `relay-abandoned` false. ⚠ **The cause is DERIVED from `HealthAttempt.committed`, never from the `reason` prose**: when a client disconnects during a live hedge race the relay still retires the hedge with the fixed string `"hedge loser aborted"` whatever the true cause, so a discriminator read off that text would misclassify exactly the case this exists to catch. `server.ts` therefore exposes TWO named entry points over one body — `completeAttemptCancelled` (classifies by commit state) and `completeAttemptAbandoned` (`relay-abandoned`, used only by `retireHedgeLoser`) — so no call site hand-types a cause. ⚠ An admitted cancellation must also clear `CANCELLATION_EVIDENCE_MS`, which is DERIVED from `DEFAULT_COOLDOWN_MS` rather than picked: one tunable, and the property that an admitted cancellation has by construction wasted more than the default cooldown, so `failureCooldown` necessarily returns `source: "elapsed"` and the cooldown equals the measured waste. ⚠ The finite test is explicit (`!Number.isFinite(x) || x <= floor`) because `NaN <= floor` is FALSE — a comparison alone would fall through and CHARGE, and an unusable measurement must fall to the weaker claim. ⚠ `status` is deliberately absent, so `outcomeCode` records a statusless failure exactly as a transport failure does; that keeps it OUT of `MEASURABLE_CODES`, so an attempt of unknown true duration moves uptime and never enters a latency statistic. ⚠ Two accepted consequences, stated so they are not read later as bugs: an admitted cancellation CREATES a `CircuitState` row where none existed before, which surfaces that deployment in `availability-snapshot.ts`, `telemetry.ts`, `candidates.ts` and the breaker export; and `MAX_FAILURES_BEFORE_TRIP` is 2, so ONE long cancellation records a failure and a ping but sets no cooldown — deliberate, matching this repo's standing rule never to act on a single request's latency. ⚠ Still NOT fed: `onServedLatency` stays gated to serve+success, so a cancelled attempt reaches neither `probe-cache.json` nor the `routing.latency`/`hedge-trigger` datasets — correct, because a cancellation has no token count and `CLAUDE.md` already records that such a sample reaches NEITHER latency statistic. `clearCooldownState()` resets only addressed cooldown/fault fields and the unexplained-429 ladder; backend failure, ping/stability, and quota-observation history remain evidence. ⚠ **A PROBE that answers 200 ends a relay-invented recovery cooldown it directly disproves (`endRateLimitCooldown`).** Two gates, because source alone cannot decide: `PROBE_SUCCESS_ENDS_COOLDOWN` is total over `CooldownSource` (default/escalation/retry-after/loopback/failure-escalation true; quota/elapsed false), then the status must match the source — legacy guessed sources require 429, while `failure-escalation` requires 402 or 5xx. A credential fault (its own axis), quota cooldown, ordinary second-failure default cooldown, measured elapsed cooldown, and operator hard cap are untouched. ⚠ `unexplained429s` is deliberately NOT reset by a probe — the ladder counts what REAL traffic saw and only a real success resets it — so a cell that keeps 429ing real requests while passing one-token probes still escalates its nominal rung, and the probe cadence sets the effective floor; that is the stated cost of polling for recovery. `rateLimitCoolingCells` is the SECOND total table (`REPROBE_TARGETS_COOLDOWN`): the ping loop proactively probes the relay's guessed 429 rungs and `failure-escalation` 402/5xx rungs, never a stated `Retry-After`, quota, loopback, or elapsed cooldown. Mutation-checked: a new `CooldownSource` member fails `tsc` at both tables until classified. Also owns the per-cell attempt-start log `pacing.ts` reads (`beginAttempt(target, { at, estimatedInputTokens })` → `attemptsInWindow`), which is pacing's dataset and NOT health state — see that row. |
-| `breaker-persistence.ts` | Durable state for EVERY breaker cell (`~/.llm-relay/breaker-state.json`, cache-kind). `circuit-breaker.ts` performs NO file IO, so a restart used to discard every cooldown and the whole unexplained-429 escalation ladder — measured here as a 19.9h cooldown learned from 7 consecutive 429s on `nim/moonshotai/kimi-k3` and another from 26 on `gemini/models/gemini-3.6-flash`. The first version (2026-08-30) carried the COOLING half only. ⚠ **Since 2026-09-08 it carries the WHOLE cell, by OWNER DECISION** — cooldown + `cooldownSource` + `unexplained429s` + `lastStatus` as before, plus `consecutiveFailures`, `lastFailureTime` (which also carry the `failure-escalation` ladder position), the credential fault (`credentialFailures`/`lastCredentialStatus`/`credentialFaultUntil`), the served-request `pings` window and `quotaObservations`. Measured with the released v0.76.0 binary against a mock upstream ([docs/history/breaker-persistence-audit-2026-09-08.md](docs/history/breaker-persistence-audit-2026-09-08.md)): after a hard kill and restart the cooldown came back, the credential fault was GONE (`candidates` read `closed` where it had read `AUTH 401`), and `GET /telemetry` reported `stabilityScore null, observedTargets 0` for a deployment it had scored a moment earlier. The three former exclusions, and why each is now carried: `pings` is the served-request window `telemetry.ts` scores from, and `probe-cache.json` holds the PROBE dataset — a different series, so this is not a second home; a `quotaObservation` is discarded at READ time by the `availability.ts` staleness ladder once its period has passed, so persisting it is safe; a credential fault is active only while `credentialFaultUntil` is in the future (5 min), and the stated cost — a key rotated during a restart reads as faulted for at most that long, cleared by the first success or by `cooldowns clear` — was accepted by the owner. ⚠ **Restore is FAITHFUL, not future-only.** The old loader dropped a row whose cooldown had lapsed, and with it the ladder index, arguing that a resurrected counter would "send the next single 429 to the top of the ladder". The running process does exactly that — in memory a lapsed cooldown keeps its `unexplained429s`, the counter alone demotes nothing, and only a FRESH 429 applies it; a restart is not a success. A lapsed cooldown restores as lapsed and the cell reads ready. ⚠ `restoreState` never touches a cell this process already created (at startup that is every row) — the `recordQuotaCooldown` rule generalised. ⚠ `CURRENT_BREAKER_STATE_VERSION` stays 1: every added field is OPTIONAL on the wire, so a v0.76.0 file loads with fresh-cell defaults and a file written now still loads on v0.76.0, which reads only the cooling fields; bump it when the MEANING of an existing field changes, never for an added optional field. ⚠ Corrupt/absent/wrong-version ⇒ restore NOTHING; every row and every array element is validated field by field and one bad row is dropped alone (the `lane-manifest.ts` regression, where shallow validation let a malformed entry EVICT a healthy lane — a test asserting only "does not throw" would pass on that bug, so assert the restored count). ⚠ Every outcome now dirties the file — the old "notify only on a cooling change" saving is gone because the ping window moves on every request — and `WriteBehindTimer` bounds that to one write per 250 ms of quiet and one per 2 s under load. `installBreakerPersistence` returns a handle with `flush()`, and `flushBreakerPersistence()` flushes every installed handle; `runProxy` calls it beside the sibling flushes in both shutdown sites. ⚠ On Windows that closes the window only for a shutdown that delivers a signal (Ctrl+C in a console); the logon-started daemon dies by `TerminateProcess`, which runs no handler, so the 2 s bound is the real guarantee there — measured on v0.76.0: a kill 50 ms after a request lost that request's outcome. The breaker keeps the IO-free half (`exportState`/`restoreState`/`onStateChanged`); this module owns the file. |
-| `cooldown-clear.ts` | ONE operator mutation seam for live cooling state. The ordinary path applies provider/model/credential selectors to breaker cooldowns, the unexplained-429 escalation ladder, credential faults, and active cooling facts. Optional exact `kinds:["credential-fault"]` narrows rotation to breaker credential faults plus `credential-invalid` facts and touches nothing else. Both paths retain failure/ping/stability history, measurements, eviction facts, and accounting; fact mutation still requires whole atomic-scope containment, and results contain counts plus non-secret identifiers only. |
-| `benchmarks.ts` | Pool ranking. `getStrength()` resolves a target's 0-100 CAPABILITY strength and **reports which** of exactly two bases it used: synced snapshot → neutral 50 (`StrengthBasis`, no third rung). ⚠ Runtime telemetry deliberately does NOT enter it — telemetry measures whether a deployment *answers*, not whether the model can *reason*; `deploymentFitness()` consumes it on the operational axis, after capability eligibility is decided. `rankTargetsWithProvenance()` (and the thin `rankTargetsByBenchmark()` over it) sorts by `fitness.score`, then `strength.score`, then basis confidence, then signal count — stable, so ties keep config order. The old hardcoded `BENCHMARK_DB` was **deleted in 0.6.0** — every pattern it held was already in the snapshot, so it only contributed a stale provenance-free number that outranked synced data. Don't reintroduce one. |
-| `tier-data.ts` | Reads the synced capability snapshot (`docs/tier-data.json`). Memoized on mtime (`npm run sync:tiers` lands without a restart). `findTierModel()` matches a spec's last segment — exact against OpenRouter ids, fuzzy only as a last resort, and it says which. Separate module purely to avoid an import cycle: `config.ts` → `benchmarks.ts` → here, so this must never import `config.ts`. ⚠ **A PRICE suffix resolves to the base SKU's row (2026-09-09, backlog item 13):** `findTierModel` strips ONE trailing member of `PRICE_SUFFIXES` (`-contributor-free`, `-free`; longest first) and retries the base as an EXACT match, reporting `priceSuffix`; a base miss returns null with no fuzzy fall-through, so a suffixed id can never borrow a different model's scores. An EFFORT suffix is never stripped — that is the borrowed-score bug `normName()` exists to avoid — and the row lends weights only; the price still comes from the catalog. The snapshot held no `muse-spark-1.3` row on the day this landed, so the contributor SKU still needs a `preferred` pin until a sync brings the base row in. |
-| `telemetry.ts` | Aggregates live provider/runtime telemetry for `GET /telemetry`: breaker-derived stability/observed-target data, accounting writer health, running daemon version and config staleness. Breaker persistence carries the served-request window across restarts. Config staleness compares the loaded source mtime with disk; successful `llm-relay reload` updates the live config and loaded mtime for reload-safe fields, while restart-only changes remain reported/refused by the reload transaction. `ProviderTelemetry.tierType` stays `null` when no provider/preset tier is known. |
-| `metadata.ts` | `resolveMetadata()` — per-FIELD limit/price resolution with provenance: the serving provider's own published value (`provider`) → another provider's figure for the same id (`reference`, indicative only) → **null**. There is no hardcoded-table rung: the old blanket 128k/4096 guess was deleted in 0.7.0 because a caller cannot tell a guess from a measurement. Also `estimateTokensFromCharacters()` — the ONE chars/4 rounding convention shared by request and output estimates; `estimateRequestTokens()` walks `system`/`messages`/`tools` AND the Responses `instructions`/`input`, counts tools, and skips base64 — both the Anthropic `data` field and OpenAI's inline `data:` URLs (guardrail on both fronts + local `count_tokens`) — and `assessCost()` — the ONE definition of free/paid/unknown (dynamic pool admission + the `freeOnly` guard both resolve through it; `unknown` is its own class and the guard treats it as paid). |
-| `kernel/` | Pure contracts + implementation for the **attempt lifecycle** — the typed begin/complete handshake (`AttemptLifecyclePort`, branded `AttemptHandle`, outcome shapes) that `CircuitBreaker` implements and both request paths account through. Depends only on ECMAScript types; `test/kernel-architecture.test.ts` enforces purity and acyclicity. ⚠ A much larger aspirational contract surface (canonical IR, transport/credential/transcoder ports, lease budgets, `tier-snapshot`) lived here unadopted and was **deleted 2026-08-04** — do not rebuild it; see the history note in `contracts.ts` and [docs/history/suggestion-review-2026-08-04.md](docs/history/suggestion-review-2026-08-04.md). |
-| `storage/` | Shared JSON persistence primitives. `file-lock.ts` provides cross-process transactional locking; `json-store.ts` provides schema-validated reads, strict transactional updates and nonced temp-file atomic replacement. Windows replacement retries are bounded and limited to transient `EPERM`/`EACCES`/`EBUSY` failures while the transaction lock remains held; destination files are never unlinked first. |
-| `accounting-state.ts` | Decoupled per-request accounting lifecycle and price port bridge (`RequestAccountingState`, `withRepairAccounting`, `recordEarlyTerminalAccounting`). |
-| `candidate-runner.ts` | Executes the resolved provider/credential candidate walk: usability ordering, probation/pacing, retries, first-byte/total deadlines, hedging and streamed commit detection. Failover and eligibility interpretation share one status-policy table. Relay-authored mapping/protocol failures are kept distinct from provider failures for breaker/accounting purposes. Catalog-stale hints are contained to models already listed by the catalog, and response announcements describe the actual serving/tried targets. |
-| `stream-pipeline.ts` | Pure stream I/O, watchdog wrappers (`withStallWatchdog`), fail-closed responses (`failClosed`), body buffering (`readBody`), and SSE frame builders. Owns `BODY_TOO_LARGE_CODE`, the tag `readBody` sets when it refuses an oversized body, and `bodyReadStatus` — 413 for that tag, 400 for anything else — the data plane's classifier since 2026-09-04 (contract review DR-005): `server.ts` used to decide 413 with `message.includes("too large")` while the dashboard route already compared the code, and this module imported that code FROM `dashboard-routes.ts`, a data-plane module depending on the dashboard. The dependency now points the other way and `dashboard-routes.ts` re-exports the tag. ⚠ **`withCrawlWatchdog` (backlog item 18, 2026-09-09) sits beside `withStallWatchdog`, is installed at the same site on both fronts, and is ON by default** (`routing.crawl`; `false` is a byte-for-byte revert — the watchdog is never installed). The rule: `minTokens` (20) output tokens observed SINCE COMMIT before any judgement; a window judged only once FULL (elapsed ≥ `windowMs`, 30 000); tokens counted inside the trailing window only, and a full window holding zero tokens is NO opinion — silence is the stall watchdog's job and this one never pre-empts it; otherwise `windowMs / tokensInWindow` above `msPerToken` (1000, four times the 250 ms/token demotion ceiling measured 2026-08-30) aborts through the attempt's own `AbortController` carrying a `CrawlAbortedError`, whose `message` IS the client-visible frame text. ⚠ The first pairing of defaults (50 tokens inside a 20 s window) could never exceed 400 ms/token and so could never fire — check a threshold triple by arithmetic before shipping it. `candidate-runner.ts` reads the reason off `AbortSignal.reason` (never off the caught exception, which may be an opaque `AbortError`) and logs `errorKinds: ["backend_stream_crawl"]` at the `deadline` provenance, so `failureCooldown` cools the member for what it wasted; BOTH fronts must pass `controller.signal` to `handleMidStreamError`, and the Anthropic front did not until the continuation lane fixed it. The e2e pin seeds one prior failure on the breaker because `MAX_FAILURES_BEFORE_TRIP` is 2 — the same rule the stall tests already pin. |
-| `routes/admin.ts` | Control-plane handler for model/registry/ping/health/candidate reads, cooldown clearing, offload/dispatch state, dispatch activity/telemetry, daemon lane-execution broker calls, telemetry, reload and stop. Mutations rely on the server's control-route admission before changing state. `/v1/models` advertises context only when supported by observed/published evidence. Dispatch telemetry records lane stats/affinity and avoids double-accounting relay traffic already seen by the HTTP pipeline. `/reload` is transactional; `/stop` uses the same admitted shutdown path as signals. |
-| `routes/messages.ts` | Anthropic Messages endpoint (`/v1/messages`) handler: request validation, transparent streaming, and tool-call repair pipeline (`anthropicMessagesPath`). |
-| `routes/openai-front.ts` | OpenAI frontend protocol handler: Chat Completions (`/v1/chat/completions`) and Responses (`/v1/responses`) endpoints (`openAiFrontPath`). ⚠ **llm-bridge's stream emitters SWALLOW the relay's own watchdog abort (found 2026-09-09):** the Responses protocol always, and the Chat protocol whenever the target is not a native OpenAI-chat passthrough, go through llm-bridge's `emitOpenAIStream`/`emitOpenAIResponsesStream`, whose loops sit in a catch that writes one in-band error frame and closes NORMALLY — so a `withStallWatchdog`/`withCrawlWatchdog` abort never threw out of this front's read loop, and a committed stream the relay itself killed was logged as a clean `backendStatus: 200` with no `errorKinds` and no breaker charge, while the Anthropic front (which reads the raw fetch stream) logged `status: "committed"` plus `backend_stream_failed`. `watchdogAbortedThisAttempt(res, controller)` after the loop — the total deadline is already cleared by then, so the watchdogs are the only remaining abort source, and a client disconnect is tested first — routes the outcome through the SAME `handleMidStreamError` the Anthropic front uses with an inert frame builder (the client already holds llm-bridge's error frame). One classifier, never a second log path; the native Chat passthrough was never affected. Pinned by one two-front suite in `test/pool-failover.test.ts`. |
-| `control-authorization.ts` | Per-install capability token for admitted control-plane mutations. The server combines it with exact bound `Host`, exact present `Origin`, and JSON content-type checks. Token-protected surfaces include offload/dispatch mutations, dispatch telemetry/activity/broker execution, cooldown clearing, reload and stop; tokenless control reads are a separate closed set. Comparisons are timing-safe and errors/logs never expose the token. |
-| `request-log.ts` | `baseLog()` (metadata-only log record construction) and `logSafePath()` (query param names + value lengths, never values) — shared by the data plane and admin routes. |
-| `self-update.ts` | Version currency: checks npm (cached 6h, 2.5s timeout) before mutating commands; a stale GLOBAL install downloads and replaces itself and re-execs (with a suppression marker against loops); dev/managed installs just get told the upgrade command. |
-| `registry.ts` | Assembles composite `/registry` payload combining providers, live models, routing, and leaderboard capability data. Re-exports `loadTierData` from `tier-data.ts`. `joinCapability()` reports `match: exact\|fuzzy` + `matched_name` because a substring join can borrow a different SKU's scores (`glm-5.2` → `glm-5.2-max`). |
-| `key-checker.ts` | Pre-flight key validator. Providers are checked **concurrently** (a dozen-plus providers checked serially, one of them a dead local daemon, turns a status command into a multi-minute one). A 200 from `/models` is NOT accepted as proof: several providers serve that endpoint publicly, so it is re-probed anonymously, and only a genuine 401/403 there makes it evidence. Otherwise it escalates to an authenticated completion **on a model this config actually routes to that provider** — a catalogue's first entry is often a premium SKU the key legitimately cannot touch. A 401/403 on that probe is compared against the same request sent anonymously: a *different* status proves the key authenticated (the wall is the model's plan), an *identical* one proves nothing and reports `unverified` rather than accusing a working key. ⚠ `valid` requires POSITIVE evidence (2026-08-27): 2xx, or a 400/404 that proves the request reached the model-aware layer behind auth. Everything else — every 5xx included — is `unverified`. The old condition was `status !== 401 && status !== 403`, which called a 503 "Key verified" while its own comment named only 2xx/400/404. The initial GET probe's 400/404/405 admission was closed the same way. ⚠ **The escalation probe prefers a FREE-CLASS model of the provider (2026-09-09, backlog item 14).** `chooseProbeModel` picks a routed model the slot allows that `assessCost` calls free — handed the provider's `tierType`, so a null catalog row on a free-tier provider still reads free — then such a model from the `/models` listing, else EXACTLY the previous choice (`routed[0]` when the slot allows it, else the slot's own first declared model, else the first listed id). `validateProviderKeys` takes an optional `catalog` seam and builds a `ModelCatalog` itself otherwise; `cachedLimits` reads the disk cache and never fetches. A billing-gated free account whose routed SKU is paid therefore reports `valid` instead of `unverified`, and a 401 still never reads as valid on its own: the free-model probe goes through the same anonymous comparison. |
-| `onboarding.ts` | Interactive CLI setup wizard for free provider keys (`~/.llm-relay/.env`). Honours `leave_me_alone` — and ONLY here: a suppressed provider stays visible in `llm-relay keys`, `/registry`, telemetry and `candidates`, because silencing a nudge is not hiding state. Entries matching no known provider are legal on purpose; the list stores the negative space, so validating it against the configured providers would reject its main use case. |
-| `setup-claude.ts` | Configuration generator for Claude Desktop MCP dispatch (`claude_desktop_config.json`) and directly routed Claude CLI wrappers. ⚠ The Desktop entry is named `llm-relay-desktop` (`DESKTOP_MCP_SERVER_NAME`, 2026-09-17): Desktop hands its local servers to every Code tab session under their own names, so an entry named `llm-relay` HID the Code tab engine's own `llm-relay` server and the session got Desktop's 60 s tool-call limit instead of Claude Code's long wait. `withDesktopServer` moves an entry this command wrote as `llm-relay` (exact shape only) and keeps any other. Both targets install the custom `relay` agent definition (`~/.claude/agents/relay.md`) so Claude Workflow and Agent tool calls can dispatch to llm-relay lanes. Desktop setup also removes only the exact stale proxy env values written through v0.68.4; Desktop pins its own API base, so those values never routed its sessions. ⚠ **The relay agent pins `model: haiku` as of v8 (2026-09-16, owner direction: the wrapper must never run on the calling session's model), and `inherit` is refused by name** — `DEFAULT_RELAY_AGENT_MODEL`, overridable per install with `llm-relay setup --relay-model <alias>` (`SetupOptions.model`), validated by `relayAgentModelRefusal` both in `installRelayAgent` and at the CLI. This reverses v4 (2026-09-04, "I don't want to hard code a model name"), which wrote `model: inherit` after `haiku` on the v1 template answered an echo task itself; on the v7 template `haiku` was measured obeying (2026-09-16: two tool calls, verbatim answer, real provenance line), and under `inherit` a Workflow fan-out paid the session model's rate for every wrapper poll. The full two-direction record is the comment above `DEFAULT_RELAY_AGENT_MODEL`. `installRelayAgent`'s marker-prefix ownership test (any versioned `<!-- llm-relay:relay-agent vN -->`) upgrades an older file in place. Codex gets the analogous fix in `scripts/install-skill.mjs` — see `scripts/CLAUDE.md` — because that script, not this one, already owns `~/.codex/agents/`; the two templates carry the same pass-through contract, ported to each host's own subagent-file schema and MCP tool-naming convention. |
-| `ping/cadence.ts` | Adaptive background monitoring loop (`PingLoop`) with dynamic mode transitions (`speed`, `normal`, `slow`, `forced`). Also hosts the slow per-credential spend-headroom poll (`pollSpendHeadroom`, `SPEND_POLL_INTERVAL_MS`) that feeds `spend-headroom.ts` — egress only where a provider publishes the figure (`fetchProviderQuota` fetches for an OpenRouter base and no-ops for everyone else), gated per credential slot, stamped before the fetch so a failing endpoint is not re-asked every tick, and contained so a poll failure can never break the ping loop. ⚠ **A probe that answers 200 RETRACTS this cell's cooling conditions** (`recordPing` → `clearFacts`, 2026-08-30). The probe is a REAL completion — `ping.ts` posts one user message at `max_tokens: 1` — sent with the exact credential slot the loop selected, so its success is the same first-party proof a served request is: the deployment exists and the credential has allowance RIGHT NOW. Until this landed, `clearFacts` had exactly ONE caller (`server.ts`), so a long-window `allowance-exhausted` fact survived its whole window unless real traffic happened to reach the demoted candidate — which made an operator-asserted multi-day reset unsafe to record, because nothing could disprove it early. That is now the mechanism behind the 7-day mistral reset accepted 2026-08-30. ⚠ Measurements are untouched (`clearFacts` excludes them — a success disproves a condition, never a measurement), a non-200 clears NOTHING, and one credential's probe never speaks for another's; all three are pinned as negative controls in `test/ping.test.ts`. ⚠ Unlike the served path it does NOT also clear the breaker's credential faults — those carry their own 5-minute TTL, and the loop's only reach into the breaker is the narrow `rateLimitRecovery` port. ⚠ **That port (`RateLimitRecoveryPort`, 2026-09-15) is how a 200 probe ends a 429 cooldown and how the loop finds cells worth probing for it.** `recordPing` on a 200 calls `endRateLimitCooldown` for the exact credential × model; `reprobeRateLimited` (from `tickOnce`, beside the spend poll — HTTP probe work, unlike the lane hook that only the self-scheduled loop may fire) probes the cells `rateLimitCoolingCells` names, at most `MAX_RATE_LIMIT_REPROBES_PER_TICK` (3) per tick and one per cell per `RATE_LIMIT_REPROBE_INTERVAL_MS` (60 s), soonest-lifting first, openai-kind only. It exists because `DEFAULT_PROBE_TTL_MS` is 24 h: a cell cooled by 429s on REAL traffic would otherwise never be re-probed inside three of the four escalation rungs. A probe that still 429s goes through the ordinary `recordPing` path and never reaches the breaker's ladder, which counts real traffic only. `server.ts` passes the breaker itself as the port (it satisfies it structurally) and builds the breaker BEFORE the loop for that reason; an injected `deps.pingLoop` keeps its own wiring. Pinned in `test/rate-limit-recovery.test.ts` with negative controls and through `GET /ping` against a real backend. |
-| `spend-headroom.ts` | Provider-stated PAID-SPEND headroom for one credential — asked for, never inferred (owner decision 2026-08-28: "OpenRouter publishes metadata and we can explicitly request the missing information"). `classifySpendHeadroom` is pure over the figures the provider stated (`limit`/`usage` from the key endpoint): `exhausted` at `usage >= limit` (inclusive, the hard-cap convention; a zero limit has no paid headroom), `headroom` below it, `unknown` when no limit is stated — and unknown has NO effect in either direction. `applySpendHeadroom` feeds the FACT store, not the quota ladder, and that is a design decision: spend is not a `QuotaAxis`, and the credits answer states no reset, so under "the relay never invents a cooldown duration" a spend bucket could never demote through `quota-demotion.ts`. Instead it records the SAME fact the accepted OpenRouter weekly-limit interpretation produces — `allowance-exhausted`, scope `credential`, `costClasses: ["paid"]`, kind-default TTL — so every demotion consumer behaves identically whichever evidence arrived first, and the boundary now updates in BOTH directions: bought credits un-demote on the next poll with no operator action and no lucky paid success. ⚠ Stated headroom retracts ONLY paid-only-filtered rows (`clearPaidAllowanceFacts` in `target-facts.ts`): a paid-credit statement cannot disprove a free-tier exhaustion, so unfiltered and free-filtered rows survive — the "out of free credits is NOT paid" rule facing the other way. |
-| `ping/metrics.ts` | Latency statistics (average, p95, jitter, uptime, spike rate) and the composite Stability Score (0-100). ⚠ The composite is **latency quality SCALED by availability**, not latency quality plus a 20% uptime term. `MEASURABLE_CODES` is a LATENCY set (`200`/`401`), so 403/404/429/5xx leave p95/jitter/spike entirely — under the old additive form a mostly-failing deployment kept a clean latency profile and paid only a fifth. Measured live: 1 success in 12 scored **81** while 3 of 3 scored **27**, and 27 zero-success deployments scored above 50; recomputed after the change that last figure is **0**. Every pool here is `{include: "free"}`, so this score IS the pool order. ⚠ `401` deliberately STAYS in the latency terms (the response really did time the network path); the multiplier, not a narrower code set, is what stops a revoked key reading as healthy. ⚠ `-1` means **never probed**, not "no measurable sample" — twelve consecutive 402s is evidence of failure, and returning -1 there made consumers read "unmeasured" and the ordering substitute a neutral 50, ranking an exhausted deployment above one that answered every probe. |
-| `ping/ping.ts` | Single probe executor for model latency, status codes, and rate-limit header quota extraction. |
-| `ping/probe-cache.ts` | Disk-cached background probe results (`probe-cache.json`) with TTL checks. Each entry keeps a **rolling window of samples** (`MAX_SAMPLES`) plus lifetime `totals` that outlive the window — a scalar `ms`/`code` made p95, jitter and spike rate all restatements of the most recent request. `loadPersistedSamples`/`loadTotals`/`persistedModels` are the read side `cadence.ts` rehydrates from. Under vitest the default path is redirected to a temp dir, because the suite was writing `openai_mock` entries into the user's live health data. ⚠ **The loader validates shallowly on purpose (re-learnable cache), so the CONSUMERS guard — read AND write** (2026-08-28). `loadPersistedSamples`/`loadTotals` were returning `?.samples ?? []` / `?.totals ?? null` with no shape check, and `dynamic-pools.ts` feeds samples straight into `getStabilityScore` and `samples.length / 5`, which decide POOL ORDER — so a corrupt cache fabricated the health evidence routing was ranked on. ⚠ The WRITE guard in `recordProbeResult` is the half a read guard cannot cover: spreading a corrupt `samples: "abc"` makes it three character samples and PERSISTS them, after which the read guard sees a genuine array and passes it through. Degrade to empty; never launder corruption into a measurement. `countRequestSamples(provider, model)` (2026-09-09) counts the SERVED-request samples only (`source === "request"`; an absent source means a probe) — the figure the probation band reads; an unknown or corrupt entry counts 0. |
-| `write-behind.ts` | `WriteBehindTimer` — the one debounced write-behind scheduler (short re-armed delay + max-age clock so steady touches can't defer a flush forever), shared by the catalog, probe cache, runtime telemetry and the four persistence modules (`breaker-persistence.ts`, `dispatch-exhaustion-persistence.ts`, `dispatch-lane-stats.ts`, `lane-affinity.ts`) instead of hand-copies. `flushNow()` runs the armed flush at once when a touch is unflushed — the SHUTDOWN seam every store trades its bounded crash window against — and `WriteBehindRegistry` remembers the timers one store installed so its `flush<Store>Persistence()` can reach them without the installer handing back a handle (the count-returning `install*` signatures are pinned by tests). ⚠ Until 2026-09-08 `runProxy` flushed six stores at shutdown and NONE of the four persistence modules: each armed a timer inside a closure nothing could reach, so whatever they learned in the last two seconds before a graceful stop died with the process. `test/write-behind.test.ts` pins the seam. |
-| `usage-observer.ts` | Observes provider-reported token usage plus a separate chars/4 estimate over model-authored text, thinking/reasoning, and tool-argument JSON by wrapping the response body in a byte-exact `TransformStream` — never changes, buffers, or rechunks the response data the client sees. Bounded SSE/JSON parsing and bounded per-field text/tool fragment state skip framing/base64; a skipped content-capable frame taints the estimate back to unknown. Tool-argument JSON is counted whole, including keys and punctuation, while request-side `estimateRequestTokens()` walks string values only. Covers anthropic-messages / openai-chat on both fronts plus reshaper calls (no `openai-responses` — Responses traffic is translated before it is proxied); observer failures are isolated so they can never fail the request. |
-| `quota-observation.ts` | Typed quota observations extracted from response headers (`{axis, period, limit, remaining, resetsAt, observedAt, basis: "provider-stated"}`), replacing the old bare `quotaPercent`. Deliberately refuses ambiguity: a generic or malformed header name is declined rather than guessed into an axis/period, and only explicitly attributed limit+remaining pairs become observations. `headroomPercent` is a render-time derivation, never stored. |
-| `quota-demotion.ts` | The Gap 12 demotion term as PURE resolution (`createQuotaDemotionFn` → `QuotaDemotionFn`): per credential×deployment cell, resolve every (axis, period) bucket with evidence through the §5.1 ladders, and return ONE spent-and-gateable verdict — soonest lift wins — or null. Gateable = `provider-stated` / `derived:provider-stated` / `derived:configured` by default (a stated limit minus measured local usage stays first-party); `derived:learned` only under `routing.quota.enforceLearned`; `derived:published` never; unknown ⇒ null, no effect whatsoever. No cooldown with a resolvable expiry is refused a duration for (no invented reset ⇒ no demotion). The wrapper never throws (a routing hint must not fail a request) and logs nothing. The server's `cooledByQuota` registers the returned `resetsAt` on the breaker so `/candidates` and the dashboard Cooldowns panel see source "quota". ⚠ Its ledger memo caches the RAW `UsedInWindowReading` per period and projects onto an axis AFTER the lookup. It used to cache an already axis-projected value under an axis-free key, and `bucketRank` puts requests before tokens — so any period carrying both buckets resolved the TOKENS axis from the REQUESTS count and failed to demote a spent token allowance (fixed 2026-08-27; `hard-cap.ts` had always keyed `scope:period:axis` correctly). `projectLocalUsed` in `availability.ts` is now the ONE projection all three ledger consumers share. |
-| `latency-demotion.ts` | Sustained MEASURED latency as a demotion term — the sibling of `quota-demotion.ts`, same pure-resolver + `create…Fn` + label shape. ⚠ **It reverses a rationale recorded in place, by OWNER DECISION 2026-08-30 — it is NOT drift, and a later reader must not "restore" the old behaviour as a regression fix.** `server.ts` argues against re-ranking on stability ("two ranking passes means neither decides the order"; "live health then PROMOTES on evidence that is often a single request's latency"); the owner was shown that cost and chose this anyway. The objection still BOUNDS the design, and every bound answers one of its clauses: **demote only** (never promote, drop or re-sort — a one-way term inside `targetUsability` that places demoted candidates in a `slow` band, not a second pass, so fitness still decides the order; 2026-09-03, owner-approved: latency-demoted members form a `slow` band above the failure bands, because measured walks reached the only answering member after 6 to 9 failing ones); **never one request's latency** (`getP95` over at least `minSamples` MEASURABLE samples); **unmeasured has NO effect** (`getP95` answers `Infinity` for "nothing measurable was sampled", and `Infinity` is an UNMEASURED deployment, never an infinitely slow one — treating it as slow would demote every never-probed member at once). ⚠ The sample floor counts the same MEASURABLE set (200/401) that `getP95` measures — and for the absolute statistic that set is now PROBE-measurable, so request samples cannot unlock a ceiling they are not judged by — never `pings.length` — and it IMPORTS `MEASURABLE_CODES` from `ping/metrics.ts` rather than re-declaring it, because a hand-copied second copy of a closed set is this file's most-repeated defect class and the drift here would silently WIDEN the floor: fifty 429s plus one slow 200 would otherwise clear a floor of 5 on the strength of ONE measurement. ⚠ **NO breaker cooldown is registered, and that is the design.** Quota can register one because its evidence STATES a `resetsAt`; latency states no reset and this relay never invents a duration — so the term is re-resolved from the rolling window every request and lifts BY ITSELF when the measurement recovers. Cost, stated: a latency demotion is invisible to `/candidates`' cooldown column and the dashboard Cooldowns panel, which read breaker state; `x-llm-relay-latency-demoted` is its only surface. ⚠⚠ **DATASET — the answer CHANGED once, same day, so read this before assuming.** It reads the **PROBE dataset** (`probe-cache.json`, via the injected `readPings` seam = `PingLoop.getModelPings`), which persists across restarts and is what `llm-relay candidates` displays. It briefly read the BREAKER's pings instead — request-path only, in memory only, never written by `PingLoop` and deliberately not persisted by `breaker-persistence.ts` — so the term went INERT after every restart and could disagree with the surface the operator reads. Owner decision 2026-08-30: use the probe dataset, and **EXPAND it to carry request latency too** (`probe-cache.ts` `recordRequestSample`, fed from `RequestAccountingState.complete()` for SERVED+SUCCESS attempts only). ⚠ That writer touches **nothing that schedules probing** — `lastProbedAt`, `status`, `probeVersion`, the scalar `ms`/`code`, `quotaObservations` and `totals` are all left alone, because refreshing `lastProbedAt` would silently stop probing exactly the deployments carrying real traffic; and an unknown deployment is SKIPPED, never created, rather than inventing probe fields. ⚠⚠ **TWO STATISTICS, and per-token is PRIMARY and FINAL.** Absolute latency cannot compare a `max_tokens: 1` probe with a 500-token generation, so `getP95MsPerToken` runs over REQUEST samples only and, **when it has `minSamples` evidence, its verdict stands — it does NOT fall through to the absolute ceiling.** A test caught that: a member answering in 40 s with 1000 tokens is 40 ms/token (healthy) yet the 30000 ms absolute ceiling would have demoted it anyway, which would make "primary" meaningless and punish exactly the fast deployment that merely produced a long answer. Absolute (`getP95`) is the FALLBACK, used only when per-token has too little evidence — and it reads **measurable PROBE samples ONLY**. ⚠⚠ **That half was WRONG on ship and was measured breaking routing the same day (2026-08-30).** The fallback read every measurable sample, request samples included, which put a probe-calibrated ceiling in front of generation data — the very comparison the paragraph above says cannot be made — and the per-token guard could not save it, because per-token engages only at `minSamples` REQUEST samples, so EVERY deployment passes through a 1-to-4-sample window where the wrong ceiling judges it. Live: `nim/nvidia/nemotron-3-ultra-550b-a55b`, which had served **59 of this machine's 62** successful requests, answered one request with 632 tokens in 34863 ms — **55.2 ms/token** against a 250 ceiling, healthy — and that success alone pushed its mixed absolute p95 to 34863 and DEMOTED it. Probe-only it reads 23478 ms and is not demoted. **A deployment demoted itself by succeeding, and the term demotes the busiest server first, because the busiest server produces the longest answers.** ⚠ A request sample with NO token count therefore reaches NEITHER statistic, deliberately: it is a generation of unknown length, so it is neither normalisable nor what `p95Ms` describes. A test asserting it "still measures absolute latency" was pinning the defect and was flipped in the same commit as the fix — the repo's standing protocol. Evidence: [docs/history/latency-demotion-regression-2026-08-30.md](docs/history/latency-demotion-regression-2026-08-30.md). ⚠ A probe must NEVER enter the per-token rate — its ms/token is nearly all fixed overhead, so admitting one would demote every healthy deployment with probe history; pinned by a test. ⚠ Thresholds are TUNABLE DEFAULTS (**250 ms/token** primary, 30000 ms absolute fallback, 5 samples), which the provenance invariant permits — it forbids inventing an unpublished provider limit, price or context ceiling — and BOTH are calibrated against real measurement rather than picked. **250 ms/token** comes from 68 real requests on this machine (2026-08-30): population p50 40.4, p75 70.5, p90 292.0, p95 967.1, and per deployment a healthy `nemotron-3-ultra` at a median 36.3 and `minimax-m3` at 57.3 against `gemini-3.6-flash` at **687.8** — a clean separation, with 250 sitting ~3.5× above the healthy band. **30000 ms** comes from the same window's absolute figures (served member 23478 ms, walk-burner 70364 ms). Re-run the calibration from `~/.llm-relay/usage/recent.json` by dividing `latencyMs` by `tokens.reported.reportedOutput.value`. ⚠ `MAX_SAMPLES` (25) bounds the rolling window per deployment in `probe-cache.json`, so `minSamples` must stay well under it. Config: `routing.latency` (bool or object; unknown key = hard load error; **default ON**). Settings SHAPE is owned by `config.ts`, imported not re-declared. |
-| `pacing.ts` | Self-pacing against a STATED rate limit — the third demotion term beside `quota-demotion.ts` and `latency-demotion.ts`, same pure-resolver + `create…Fn` + label shape, folded into `targetUsability` as the `paced` band (owner direction 2026-09-10: *"use rate-limited messages to calculate when it might need to slow something down"*; built 2026-09-15). It answers a DIFFERENT question from quota demotion, stated so the two are not read as one policy in two homes: quota demotion is the ALLOWANCE view (a bucket's `remaining` — stated, or a stated limit minus the ledger's usage in the current UTC period — is spent ⇒ `cooling` until the stated reset); pacing is the RATE view — how many attempts THIS relay itself started against the cell in the trailing window of the stated period, held against the stated ceiling. ⚠ **The dataset is the breaker's per-cell attempt-start log** (`CircuitBreaker.beginAttempt` → `attemptsInWindow`), recorded at the ONE choke point every egress on both fronts passes through (`beginHealthAttempt`, whose `estimatedInputTokens` parameter is REQUIRED so the compiler enumerates both fronts), so every client on the machine that routes through the relay — a Codex session and a Claude Code session alike — is counted against one cell's window. ⚠ The log is NOT `CircuitState`: beginning an attempt creates no health state (a pinned rule — a relay-local fault must create none), and it is in memory only, never carried by `breaker-persistence.ts`; a restart forgets at most one window, in the direction of LESS pacing. ⚠ A SLIDING window, deliberately: a count that never exceeds L in any trailing window cannot exceed L in a provider's fixed window either, whichever alignment the provider uses — the ledger's UTC-minute cell that quota demotion reads lets a boundary burst run 2L in 61 s. ⚠ **Three ceilings pace, ranked by `resolveLimit` (`availability.ts`): the provider's header `limit`, the operator's `limits` block, and a LEARNED `rate-limit-*` fact — the learned rung WITHOUT `routing.quota.enforceLearned`.** That is the owner's direction and the backlog property ("a 429 that states a window updates that pacing without a human verdict"): `rate-limits.ts` records the fact at the 429 on both fronts, and the next `targetUsability` reads it — no `eligibility accept`, whose queue is for UNINTERPRETABLE wording and is untouched. `quota-demotion.ts`'s own M2 gate is untouched too. `published` never paces; `PACES_ON_LIMIT_BASIS` is a total table over `LimitProvenance` closed with `satisfies`. ⚠ **A limit nobody stated has NO effect**, and there is no tunable margin — the relay steps aside exactly at the stated figure, because "approaching" would need a number nobody stated; only `minute` and `day` periods are paced; a token window with an unestimated member, or a saturated log (`MAX_ATTEMPT_STARTS`) below the ceiling, is NO opinion. ⚠ **Demote only; never drop, refuse or delay.** `paced` sits behind `live` and `slow` (a slow member most likely answers; one at its ceiling most likely 429s) and ahead of the failure bands; with no alternative the cell is still walked. Refusing on a count stays `hard-cap.ts`'s, and only an OPERATOR figure may do that. No breaker cooldown is registered (the `latency-demotion.ts` rule: nothing stated a reset), so it lifts by itself as the window drains and `x-llm-relay-paced` — written only when the walk's FIRST choice was displaced — is its only surface. Config `routing.pacing` (`{ enabled }` only; unknown key = hard load error; **default ON**; `false` a byte-for-byte revert; pinned in `test/config/routing-parser-order.test.ts` between `probation` and `crawl`). ⚠ Stated residue: the count is the relay's OWN attempts — a probe (`ping.ts`, one token) and traffic from outside the relay do not enter it, and token windows sum the request's INPUT estimate only — so it is a floor of what the provider meters, the fail-safe direction, and the provider's 429 still teaches the cell. Pinned in `test/pacing.test.ts`: the log, every gate, the band order, a sticky pin bypassing a paced member, and both fronts end to end including the window shared ACROSS fronts and the live 429-body update. |
-| `hedge-trigger.ts` | When an in-flight attempt is slow enough to start the NEXT candidate BESIDE it, rather than after it — the decision layer for hedged attempts (owner proposal 2026-08-30, *"if an attempt is taking longer than p90 for that endpoint (normalized by number of tokens), we pass the task off to the next source, but still allow for the possibility of the first source returning a useful result"*). ✅ **WIRED on BOTH fronts** since 2026-08-30 (stage 2). `server.ts` `runAttemptWithHedge` reads `h.hedgeDelay`, which is this module's `hedgeDelayDecision` bound to the PROBE ping seam and `costClassOf` — the same probe dataset `latency-demotion.ts` reads, deliberately, because two latency opinions on two datasets is the v0.65.1 defect. `hedgeDelayDecision` is the scalar `hedgeDelayMs` plus the RUNG that produced it, split out so the shipped signature is untouched and `HEDGED_HEADER` can state the basis; without that an operator cannot calibrate three declared placeholders. ⚠⚠ **Hedging DUPLICATES, and it is the first behaviour here that does not merely REORDER** — the `CLAUDE.md` invariant says acting on counts "may only reorder", so the duplication is bounded three ways, all owner decisions ([docs/history/hedged-attempts-design-2026-08-30.md](docs/history/hedged-attempts-design-2026-08-30.md) §7): confined to deployments `assessCost()` calls FREE (D1 — and `unknown` counts as PAID, so it is fail-safe and will silently not fire on many members, which is the stated cost), the loser aborted the moment a winner commits, and the response announcing it. ⚠ **WHY a timeout is not the answer, measured:** successful `nim` requests ran 559 ms to 96959 ms while the hang sat at the 120000 ms timeout, so the working band reaches almost to the timeout — a 25000 ms cap would have cut **22.5%** of real successes, and 100000 (the only value the data supports) buys 20 s. A timeout must choose between abandoning a slow success and waiting out a hang; a hedge does not choose. ⚠ **The ladder is per-token → absolute → floor, and the FIRST rung with evidence is FINAL** (`hedgeThreshold`, with exactly ONE `elapsed > threshold` comparison in the module so a rung cannot grow its own). Per-token reads REQUEST samples, absolute reads PROBE samples — both directions of the v0.65.2 defect, since a request-fed absolute bar would fire on the busiest healthy deployment first. ⚠ **On the hedge path the per-token rung is INERT by construction (audit DR-002, verified 2026-09-04):** the race settles at commit and no output token exists before commit, so `hedgeDelayDecision` passes `tokensSeen: 0` and the ladder always falls through to absolute or the floor — the first rung with EVIDENCE is final, and per-token never has any there. It stays in the module for a post-commit consumer that can hand it output tokens; none exists today. Do not describe per-token as the production-primary rung. ⚠⚠ **An UNMEASURED deployment IS hedged — the OPPOSITE of `latency-demotion.ts`, deliberately.** Demotion punishes, so unmeasured must mean no opinion or a cold cache demotes everything; a hedge only starts an attempt the walk was already going to make, so the cost of hedging a deployment that was about to answer is ONE wasted free request against the 120 s the measured hang cost 43 times running. The asymmetry runs the other way, so the fallback does too. ⚠ **Every threshold is floored by `max(minFloorMs, msPerInputToken × estimatedInputTokens)`, not a flat number (owner direction 2026-09-04).** A large prompt is not hedged against the time it simply takes a healthy deployment to read it — the floor now GROWS with the request's own estimated INPUT size (`estimateRequestTokens` in `metadata.ts`, the same estimate the context guardrail already computes, threaded in rather than re-estimated) — while a small prompt still gets the flat `minFloorMs` protection against a fast pool duplicating nearly every request. `floorMs` survives as a LEGACY ALIAS of `minFloorMs`, resolved in `resolveHedgeSettings` (an operator config written before this date, `{"floorMs": 8000}`, keeps meaning exactly what it always meant). Only the rung reporting NO per-deployment evidence renames its basis to `input-size` and carries the token count; a `per-token`/`absolute` rung with its own evidence keeps its bare basis even when the size-scaled floor is the larger `Math.max` operand — evidence, not size, decided a statistic applied at all. ⚠ **`margin` and `minSamples` are still PLACEHOLDERS awaiting calibration; `msPerInputToken` now IS calibrated** — unlike `DEFAULT_LATENCY_MS_PER_TOKEN`, which earned its 250 from 68 real requests, the population `margin`/`minSamples` need ("how long did an attempt run before its first token") is still not recorded. `msPerInputToken` is different: `scripts/calibrate-hedge-floor.mjs`, run 2026-09-04 against this machine's `~/.llm-relay/usage/recent.json` (100 successful serve attempts, 55 carrying ≥10,000 input tokens), fit the p25 of latency÷inputTokens ratios among those large-prompt requests at 0.036 ms/token — OUTSIDE the accepted [0.05, 0.5] band, so the script REJECTED its own fit and shipped the built-in `DEFAULT_HEDGE_MS_PER_INPUT_TOKEN = 0.15` instead, the same fail-safe direction as an unmeasured latency elsewhere in this relay. Re-run the script as traffic accumulates; do not quote `margin`/`minSamples` as measurements. ⚠ **Measured 2026-09-04, BEFORE this landed:** every hedge on a restarted v0.69.0 daemon reported basis `floor` — `pool/medium` slow primaries answered in 9–38 s, the hedge member answered about 1 s after starting, and the operator raised `routing.hedge.floorMs` to 8000 by hand rather than by calibration. |
-| `hedge-race.ts` | The CONCURRENCY of a hedged attempt, and nothing else — deliberately ignorant of HTTP, of `server.ts`, and of what it races. `raceWithHedge` waits `delayMs` for a primary, starts the second entrant only then, and returns whichever settles as a WIN, aborting the loser. Five rules, each pinned: a primary settling inside the delay starts NO hedge (so a healthy pool never duplicates, and a FAST failure is left to the existing failover rather than doubled); the hedge's candidate is resolved LATE, at the moment it is needed, because a hard cap or breaker trip may have landed meanwhile; a LOSING settlement does not end the race, which is what makes a hedge useful against a primary that fails slowly; and when neither wins the PRIMARY's settlement is reported, so every existing error path and header keeps its meaning. ⚠ Isolated on purpose: "which promise won and who gets aborted" is precisely what an end-to-end proxy test covers by accident, so every timer is injected and the semantics are proven in unit tests. Mutation-checked twice — dropping the losing-settlement rule fails 3 tests, dropping the loser abort fails 2. ⚠ **The race is decided at COMMIT — the first meaningful content — since 2026-09-04** (owner direction the same day: the hedge exists for wedged requests). Until then it was decided at RESPONSE RESOLUTION, and `fetchBackend`'s structural preflight makes that resolve at the first VALID DATA EVENT — so a provider that sent headers and then nothing was already hedged, but one that sent headers plus a metadata event (a role-only chunk, a `message_start`) and THEN went silent — the way hidden-reasoning providers open a stream — had "resolved", was called the winner, and waited out the provider timeout. `candidate-runner.ts` `withCommitProbe` now runs the stream-commit probe inside each attempt's own promise and `attemptWon` requires a `ready` verdict, so that shape starts a hedge too; both fronts consume the attached verdict through `takeCommitProbe`. `test/hedge-wiring.test.ts` pins it on both fronts, and the mutation check is recorded: with the wrapper disabled the case stayed GREEN until the test backend sent that metadata preamble, which is how the real gap was found. ⚠ A stream that commits and then stalls or crawls POST-commit still cannot be replaced by a hedge — the client already holds that stream's bytes. The post-commit policy now exists: the stall and crawl watchdogs abort the committed stream and let the client retry; no hedge replaces a committed stream. ⚠ An aborted loser still teaches the breaker NOTHING, so hedging HIDES the slowness it routes around; that is acceptable only because v0.65.3 makes the non-hedged requests cool a slow deployment for as long as it wasted. ⚠ **The MECHANISM of that changed on 2026-08-30 and the old sentence is wrong now**: it is no longer "cancellation returns before the provenance table" — cancellations reach a table of their own, and this is the `CANCELLATION_REACHES_HEALTH_PATH["relay-abandoned"] = false` entry, reached through `server.ts` `completeAttemptAbandoned`. So the cost is now a stated decision at a named entry rather than a side effect of a flat early return, and flipping it needs owner instruction. ✅ **WIRED on BOTH fronts** since 2026-08-30, through `server.ts` `runAttemptWithHedge` — ONE policy shared by `handle` and `openAiFrontPath`, because two fronts with two policies is the shape the pool-failover incident already cost this repo. `isWin` is the loop's OWN failover expression (`walkWouldFailOver`), extracted so there is one definition: a primary answering 429 has NOT won, since the walk was going to move on anyway, and treating it as a win would abort a hedge about to answer 200. |
-| `accounting.ts` | The accounting event vocabulary: typed request/attempt lifecycle packets (`request-started`, `attempt-started`, `attempt-completed`, `request-completed`) with reported vs estimated tokens kept as SEPARATE accumulators that are never summed into one number. `spend` is priced at attempt completion from PUBLISHED per-(provider, model) prices injected through an `AccountingPricePort` (server builds it from `catalog.cachedLimits` + `resolveMetadata`; no fetch): integer micro-USD, per-kind half-up rounding summed as integers, four-cell provenance (`provider_published`/`reference` x `reported`/`estimated`) with `coverage` full/input_only/partial and unpriced cache kinds counted beside the amount — a null price is UNPRICED, never $0. Request spend projects only the winning serve attempt. ⚠ **Plus `abandonedSpend`, a LIST beside it** (owner decision D3, 2026-08-30): the spend of serve attempts the RELAY abandoned — a hedge loser. A LIST and never merged into `spend`, because `AccountingSpend` carries ONE `pricesUsed`/`priceSource`/`tokenBasis`, so summing two deployments into one record is the provenance defect the invariant forbids; the four-cell aggregate is keyed BY provenance and is the only place they may legitimately be added. ⚠ The `abandonedByRelay` marker is STATED by the caller at completion, never inferred: at this layer a hedge loser and a client disconnect are BOTH `cancelled`/`aborted` from one call site, so "cancelled inside a successful request" would be exactly the counting-based guess the fact rules forbid. `server.ts` threads it from the same closed `AttemptCancelled.cause` the breaker reads, so ledger and breaker can never disagree about which attempt was abandoned. |
-| `accounting-store.ts` | THE per-request ledger — event-sourced into `~/.llm-relay/usage/` (`lifetime.json`, `recent.json`, `YYYY-MM-DD.json` day shards with minute cells), with dedup, coverage/loss markers, bounded samples, optional day retention and a shutdown close. This superseded spec Gap 3's plan of widening `LOG_FIELDS`: do NOT duplicate token counters into the metadata log. Unknown stays `null` + an `unknown` counter, never 0. Spend aggregates into the four contract cells per aggregate (attempt-side `spend`, request-side `requestSpend`, integer micro-USD) plus `unpricedRequests`/`partiallyPricedRequests`; pre-spend shards carrying `spend: null` still load as empty cells. Also `usedInWindow()` — the availability lane's narrow synchronous in-memory read of current-period usage for one credential (minute/day from the in-memory day shard; month DECLINES BOTH requests and tokens because the lifetime rollup is ROOT-aggregate across all credentials, so neither figure can be narrowed to one slot until the rollup is per-credential; never disk, never the request path). An estimated-basis token scalar includes estimated input + output, correcting the pre-M4 input-only undercount; quota demotion and hard caps read that completed scalar. Also: a window whose requests mix reported and estimated token bases reports NO token number (`tokens: null`, basis `mixed`) unless every measured request carried a report — then the reported figure stands alone as basis `reported`. Uses the shared atomic JSON writer (`atomicWriteJsonSync` from `storage/json-store.ts`) rather than a custom write-ahead journal (DR-020, 2026-09-03). `SnapshotMutationResult` and the `ioHooks` read seam (`AccountingReadHooks`, `beforeRead` only) name only mechanisms that exist after DR-020 — the dead `recovered`/`recovery-loss` statuses, `transactionId`, `quarantinedPath` and the journal step hooks were removed 2026-09-04. Accepted trade (2026-09-03): a crash between file writes can leave files from two different snapshots; the next flush re-converges them; there is no replay or quarantine. Also `readOnly: true` construction for OUT-OF-PROCESS readers (`llm-relay cost`): no writes performed, observes committed snapshots only. ⚠ **`writerHealth()` (2026-09-09, audit DR-006) is how the store says it STOPPED metering** — until then `writerStatus`/`lastWrite` had no consumer, the store kept accepting events after a refused lease, and a null `snapshots()` silently stopped persistence while the relay served on, so "no spend since noon" read like "no traffic since noon". It reports one member of the closed `WRITER_STATES` (`dashboard-contract.ts`: `writing`, `lease_refused`, `flush_failed`, `schema_refused`, `read_only`, each mapped to a real branch of `flush()`), ISO timestamps or `null` (never a fabricated time), and a bounded reason with the store's own directory scrubbed to `<store>`. `GET /telemetry` carries it as `accounting`; `llm-relay cost` prints one footer line per non-writing state naming the consequence through a total `WRITER_FOOTER_LINE` table (a new state is a compile error there), and `--json` carries it under `writer`. Serving never stops on a persistence failure — the property is that the stop is STATED. `lease_refused` has no single-process producer today; its tests reach the branch through the store's returned `writerStatus` reference. Under vitest the directory redirects to a temp dir. ⚠ **`abandonedSpend` is a THIRD request-owned cell group** (D3, 2026-08-30), summed in `addRequest` from `RequestCompletedEvent.abandonedSpend` and deliberately touching NO counter: `unpricedRequests + partiallyPricedRequests <= requests` is enforced by the persisted schema, and breaching it does not throw — `snapshots()` returns null and the store SILENTLY STOPS PERSISTING while the relay keeps serving, so a test asserting only in-memory values would sail straight through it. ⚠ It stays out of `requestSpend` for measured reasons, not tidiness: an abandoned attempt is estimated-basis with coverage `input_only`, so folding it would flip the `partiallyPricedRequests` LOWER-BOUND marker on for essentially every hedged request with no amount changing, and winner and loser are priced from the SAME request-level estimated input count. So `requestSpend` still means "what the answer you received cost", and "what this request cost" is `requestSpend + abandonedSpend`. ⚠ The fold reads `event.abandonedSpend ?? []` although the field is REQUIRED on the type — `AccountingRecorder` is a public interface, so this is an external boundary that must degrade rather than throw, while the required type still makes the compiler enumerate every in-tree producer. |
-| `accounting-store-schema.ts` | The persisted accounting schemas (`accounting.day.v1`, `.lifetime.v1`, `.recent.v1`, …) and their size/cap constants — deliberately separate from the dashboard wire contract, so the on-disk format can evolve without breaking clients. The 2026-08-22 spend fields are ADDITIVE: the guards accept both the legacy `spend: null` shape and the new aggregate spend cells (any subset of the closed optional-key set), so old shards load instead of quarantining. ⚠ **`abandonedSpend` joined `AGGREGATE_OPTIONAL_KEYS` on 2026-08-30 (D3)**, with its own `=== undefined ||` branch in `isAggregateFields` and an explicit rejection on attempt-kind rows, which carry no request-scoped facts. ⚠ That optional set is the ONLY additive seam in the file: every other shape is guarded by strict `hasExactKeys`, which has no optional concept and rejects an added field in BOTH directions. ⚠ Forgetting either half fails SILENTLY — the snapshot build returns null and persistence stops with the relay still serving — so a schema addition needs a RELOAD test, not just an in-memory one; dropping the key from the list kills exactly those two tests. |
-| `dashboard-contract.ts` | The versioned server-safe wire contract for the analytics dashboard (`dashboard.snapshot.v1`, media type, query spellings) — platform-free by rule, so route/auth/retention/pricing decisions stay with their owners. All request/response bounds are explicit constants here. `SpendTotalsV1` carries the four priced cells plus `unpricedRequests` AND `partiallyPricedRequests` (>0 ⇒ every amount is a LOWER BOUND); the producer ships with the validator, so the field is required, not tolerated-absent. Also `dashboard.cost.v1` (`CostReportV1`/`CostRowV1`/`RepairShareV1` + `assertCostReportV1`) — the `llm-relay cost` roll-up's shapes, closed over the same four cells; its repair share is ATTEMPT-scoped and deliberately carries no lower-bound count, because per-attempt price coverage is not persisted. ⚠ **`CostReportV1.abandoned` (D3, 2026-08-30) is the same four cells and is NOT inside `total`** — `total` answers "what the answers you received cost", the two added answer "what those requests cost", and the renderer states that in prose so they cannot be read as one number. Never null, unlike `repair`: all-zero cells honestly mean nothing was hedged, which is also every pre-D3 shard. ⚠ `SHARE_CELL_KEYS` is exported as the ONE list of those four names — they had been written out in the type, the projection and two validators, and a runtime list hand-copied from a closed set is this repo's most-repeated defect. It is closed with `satisfies readonly (keyof RepairShareV1["spend"])[]`, so a renamed cell is a compile error rather than a silently missing column. |
-| `dashboard-auth.ts` | In-memory bootstrap/session authority for the dashboard: a control-authorized launcher mints a one-time bootstrap, exchanged exactly once for a read-only session (idle TTL 30m inside an absolute 8h cap; replay gets its own distinct failure). Only SHA-256 digests are retained, every candidate hashes to a fixed length before comparing, and a restart revokes everything. |
-| `dashboard-routes.ts` | Dependency-injected, platform-neutral dashboard API routes (`bootstrap`/`session`/`logout`/`snapshot`/`requests/:id`). The server owns socket admission, Host checks and body streaming; this module owns only endpoint policy and the wire contract — keeping it free of `IncomingMessage` makes its check order testable and stops a future catch-all becoming an API. ⚠ `DashboardErrorCode` is IMPORTED from `dashboard-contract.ts`, never re-typed — this module used to restate all ten codes as its own local union, two definitions of one closed set drifting invisibly. Pinned by a source grep, the `destructive-coverage` precedent. ⚠ `bodyReadErrorCode` reads a DECLARED `BODY_TOO_LARGE_CODE` off the rejection; it used to regex the error MESSAGE, i.e. the relay inferring 413-vs-500 from prose it wrote itself. The code is owned by `stream-pipeline.ts` since 2026-09-04 and re-exported here. |
-| `dashboard-snapshot.ts` | The bounded read-only projection from the accounting store to dashboard views. Knows only the persisted read model — quota/cooldown facts are injected as one already-captured snapshot (built per snapshot read by `createAvailabilityProducer` in `availability-snapshot.ts`), so the projection neither owns the store nor reaches into live provider/breaker state. Projects real spend totals from the aggregates (summary, every dimension row, request rows/detail), keeping unpriced cells amount-null — "Unpriced", never "$0" — and surfacing the lower-bound marker when `partiallyPricedRequests` > 0. Also `readCostReport` (the `llm-relay cost` roll-up, exposed on the same read port): the TOTAL folds root minute-cell aggregates (exact under every row cap) while per-value rows walk dimension rows capped; repair spend is folded from role:"repair" attempt rows directly, never by subtraction (failed serve attempts also carry attempt-side spend); the `lifetime` window declines the split because its month rollups mix serve and repair in one figure; absence — every day shard ABSENT or a MISSING `lifetime.json` — is `empty` ("no accounting data yet"), only a thrown read, corrupt shard or corrupt lifetime rollup is `unavailable`. A THROWN reader must never render as either "absent" or a zero-total success. **`coverage: "partial"` means the store held data this projection omits** (dropped/overflowed counters, capped reads, corrupt shards) — a token/latency/commit kind that was simply never REPORTED (`unknown > 0` alone, no `lost`/`overflow`) nulls that one cell with provenance `"unknown"` but leaves the panel `"complete"`; only an unknown count in EXCESS of what the outcome already explains (`hasUnexpectedMetricLoss`) promotes it to loss. ⚠ `MutableStats` carries `abandonedSpend` BESIDE `spend` (D3, 2026-08-30) and `addRequestAggregate` merges the shard's `abandonedSpend` into it, never into `spend`; `readCostReport` projects it as `CostReportV1.abandoned` through the same `repairShareCells` the repair share uses. The dashboard SNAPSHOT deliberately does not project it — owner decision: `llm-relay cost` is the chosen surface, and the SPA reads `dashboard.snapshot.v1`, so it stays untouched. |
-| `dashboard-static.ts` | Serves the SPA's static shell and manifest-owned assets with a locked-down CSP/security-header set. Owns the filesystem boundary deliberately, so a future catch-all route cannot accidentally serve the SPA. |
-| `json-shape.ts` | Shared JSON shape predicates — `isRecord` plus the exact-keys checks — retiring 20 per-module copies and a naming trap where THREE contracts shared two names. ⚠ Its two exact-keys exports are different contracts on purpose: `hasExactKeys` is the strict `unknown` guard (rejects symbol keys, non-enumerable own props, non-plain prototypes), `hasExactKeysWithOptional` is the keystore's historical looser form (own enumerable keys only) — an empty optional list does NOT make it the strict one. Bundled into the browser SPA via `dashboard-contract.ts`, so it must stay import-free and platform-global-free (pinned transitively by `test/dashboard/contract.test.ts`). |
-| `winenv.ts` | Recovers Windows User/Machine-scope environment variables a **long-running** process never received (a User-scope var enters a process only at start; the relay launches at logon and runs for days). Fills gaps only — the real environment always wins, same contract as `dotenv.ts`. ⚠ Never imports `PATH`: the User scope holds a fragment, and importing it wholesale breaks executable lookup. ⚠ **Under VITEST it never spawns `reg` unless the `read` seam is injected** — the same guard `secret-file-acl.ts` and `os-keyring.ts` carry, added 2026-08-25 because this was the last unguarded real-world side effect in `src/`. Two `execFileSync` spawns at `timeout: 5000` each sat on the `loadOrExit()` path inside vitest's own 5000ms budget: ~50-70ms idle, 2806-4045ms under full-suite process contention, which is what intermittently timed out two CLI tests. It also merged the developer's real registry environment into worker `process.env`. `test/winenv.test.ts` injects `read`, so the merge/skip/never-import policy keeps full coverage. |
-| `ping/quota.ts` | Provider-specific quota balance fetcher (e.g. OpenRouter key auth endpoint). ⚠ Recognition is an EXACT-host test on the provider's own configured base, and the request URL is REBUILT from that same parsed base (path/query/fragment/userinfo cleared), so a declared credential can never egress to a host the operator did not configure. It used to match a SUBSTRING of the provider's name or base and then post the key to a hardcoded `openrouter.ai` — so `openrouter-proxy` pointing elsewhere, and a base like `openrouter.ai.example.test`, both leaked. Exact host, not the mistral suffix form: the auth/key endpoint exists on one host only. An unparseable base fails closed to the generic branch. |
-| `ping/runtime-telemetry.ts` | Real-world proxy request telemetry storage (`runtime-telemetry.json`) and real-world quality scoring. |
-| `process-safety-net.ts` | Process-level safety net for LATE transport errors: undici resolves `fetch()`, the request path moves on, then a CDN edge or a discarded failover candidate resets the socket, and the listener-less stream error escalates to an uncaughtException that would exit the whole proxy. Swallows ONLY a closed allow-list of transport codes/messages (pure `classifyProcessError`); everything else keeps Node's fail-fast so genuine bugs still crash loudly. Installed at the top of the serve path, idempotent. |
-| `think-tags.ts` | Conservative stripping of one message-opening `<think>…</think>` block from translated OpenAI text (native Anthropic thinking blocks never reach it). A bounded rollback buffer makes an unclosed/nested candidate lossless — every uncertain shape is released byte-for-byte as ordinary text rather than deleted; also the SSE variant `stripThinkTagsInStream`. ⚠ `flush()` decides through a total `FLUSH_RELEASES_HELD` table `satisfies Record<FilterState, boolean>`, not a two-member `if` with a bare `return ""` (2026-08-28): a future HOLDING state would have taken that return and silently deleted the bytes it was holding — a truncated answer that looks successful, in the one module whose whole stated purpose is losslessness. `push()` keeps its two-member test deliberately: its fall-through goes to the HOLDING path, which is the safe direction. |
-| `delegate-gate/` | The `llm-relay delegate-gate <diff-file> --repo <root> [--fix]` CLI (wired into `cli.ts`) — a HOST-SIDE quality gate over a diff a delegated agent lane returned, run before judgment/merge. `dispatch.ts`/`lane-manifest.ts` decide the lane order; this reads what a lane already produced, same "the relay never spawns/executes a lane" boundary. `diff-parser.ts` parses unified diffs (raw-line-indexed, for the auto-fixer); `post-image.ts` reconstructs each changed file's post-patch content from `--repo`'s pre-image so every AST detector can restrict itself to lines the diff actually ADDED; `file-driver.ts` owns the per-file prelude (`findingPreamble`) and the per-file loop (`runFileAnalyzer`) all three AST detectors ran privately before (CLONE-16 + CLONE-27); `minimality.ts`, `test-assertions.ts`, `cast-necessity.ts` and `shared-state.ts` are the four detectors (indentation churn / non-minimal diffs, tautological test assertions via the `typescript` compiler API, unnecessary `as` casts, module-scope mutation from inside a function); `gate.ts` folds them into one `Verdict`; `fix.ts` auto-repairs only the two MECHANICAL classes (a fully-paired whitespace-only hunk is dropped whole; a trivially-redundant literal cast is rewritten in place) into `<diff-file>.fixed.patch`, never touching the target repo. Full checks list, verdict schema and evidence: [docs/delegate-gate.md](docs/delegate-gate.md). ⚠ Pulls classic `typescript` into `dependencies` (not just `devDependencies`) because the AST-based detectors need the real Compiler API at run time in an installed package. **Since D5-e (2026-09-20), that runtime API and the build compiler are deliberately split:** root `typescript` stays on the classic 5.9 line (also satisfying typescript-eslint/Madge peers), while build/typecheck scripts use `@typescript/native` 7.0.2 explicitly. TypeScript 7.0 has no stable replacement in-process API; do not collapse the two packages for version symmetry. Revisit only when the native API is stable AND the API-consuming peers support it. |
+| `cli.ts` | Commands, argument validation, startup composition and host-facing setup/status. |
+| `keys-cli.ts` | Local credential lifecycle commands and secret-safe input/output. |
+| `config-edit.ts` | Validate complete config edits; preserve unrelated fields and reject unsafe paths. |
+| `state-paths.ts` | Shared XDG/default path policy with per-artifact legacy fallback. |
+| `dotenv.ts` | Load environment-file values without overwriting existing environment values. |
+| `pool-health.ts` | Probe actual deployment access; keep auth, denial, missing and empty outcomes distinct. |
+| `authEnv.ts` | Declared/curated credential resolution and source provenance; no heuristic key discovery. |
+| `credential-id.ts` | Stable, validated identity for configured credential slots. |
+| `credential-fleet.ts` | Normalize slots and enforce enablement, model restrictions and exact env names. |
+| `resolved-attempt.ts` | Bind a target, slot and one credential-resolution result to an attempt. |
+| `credential-select.ts` | Rank slots within a deployment and manage request-local offer/start/outcome state. |
+| `configured-limits.ts` | Validate and resolve operator-declared limits and their scope. |
+| `hard-cap.ts` | Compare explicit caps with scoped local usage; no invented usage or reset. |
+| `availability.ts` | Pure remaining/reset/provenance ladders and shared local-usage projection. |
+| `availability-snapshot.ts` | In-memory quota/cooldown projection; no provider calls or disk reads. |
+| `key-import.ts` | Parse supported imports through declared/curated names, never value-shape guesses. |
+| `keystore.ts` | Encrypted credential storage, guarded mutations, caching and lifecycle. |
+| `os-keyring.ts` | OS-backed or passphrase key protection through secret-safe process seams. |
+| `secret-file-acl.ts` | Best-effort Windows secret-file access hardening. |
+| `presets.ts` | Configurable onboarding/provider defaults. |
+| `spec.ts` | Import-free routing-spec vocabulary; split provider/model at the first slash. |
+| `config/routing-parser.ts` | I/O-free routing validation; preserve its tested validation order. |
+| `config-types.ts` | Shared config types/constants, re-exported by the loader. |
+| `config.ts` | Load/resolve config, enforce loopback, resolve targets and report disk staleness. |
+| `config-reload.ts` | Transactionally apply supported policy changes or reject restart-only differences. |
+| `session-pin.ts` | Bounded in-memory session affinity, constrained by live routing policy. |
+| `offload.ts` | Targeted live offload updates and persistence status. |
+| `dispatch.ts` | Build/select the ordered lane view without executing a lane. |
+| `daemon-dispatch-view.ts` | Shared daemon view for dispatch reads and configured broker launches. |
+| `context-limits.ts` | Learn explicitly stated context/output ceilings for the exact deployment. |
+| `target-facts.ts` | Scoped conditions and measurements, expiry, cost filters and selective clearing. |
+| `rate-limits.ts` | Learn explicitly attributed rate ceilings; a parse miss learns nothing. |
+| `refusal-interpretation.ts` | Signature lookup, unknown queue, accepted interpretations and catalog-stale evidence. |
+| `network-block.ts` | Display-only advice for evidenced network refusals; no routing or fact mutation. |
+| `executable-lookup.ts` | Shell-free PATH/PATHEXT lookup. |
+| `installed-hosts.ts` | Positive installation evidence, distinguishing binaries from weaker config evidence. |
+| `host-routing.ts` | Determine the calling host's routing relationship in the caller, not the daemon. |
+| `claude-hook.ts` | Owned offload hook installation/removal; preserve user hooks and fail open. |
+| `dynamic-pools.ts` | Materialize configured prefixes and evidence-ranked catalog tails. |
+| `candidates.ts` | Separate capability, health, cost and quota dimensions with provenance. |
+| `server.ts` | Compose admission, request services, policy, persistence, reload and lane broker. |
+| `backend.ts` | Backend transport and Chat/Responses wire translation; preserve failure provenance. |
+| `backend/envelope-validator.ts` | Structural envelope validation without depending on transport. |
+| `backend/health-prober.ts` | Structural stream preflight and model evidence with consumed-byte replay. |
+| `openai-request.ts` | Anthropic-to-Chat request mapping and target-resolved compatibility. |
+| `responses-request.ts` | Responses-to-Anthropic request mapping, including multi-turn tool linkage. |
+| `stream-commit.ts` | Final-wire meaningful-content commitment and pre-commit failure classification. |
+| `sse-frames.ts` | Shared SSE framing/transform lifecycle; callers retain protocol-specific field policy. |
+| `tool-dialects.ts` | Closed-envelope tool recovery and required destructive-name refusal. |
+| `dialect-stream.ts` | Dialect handling on Anthropic-shaped streams. |
+| `openai-dialect.ts` | Dialect handling on direct Chat responses/streams. |
+| `tool-use-ids.ts` | Deterministic response-side collision repair without a conversation store. |
+| `lane-manifest.ts` | Cached lane roster/support evidence and freshness rules. |
+| `lane-probe.ts` | Operator/background lane metadata probes. |
+| `lane-quota-probe.ts` | Minimal completion probes with conclusive-success/explicit-exhaustion classification. |
+| `lane-cadence.ts` | Background lane catalog and recorded-exhaustion re-probing. |
+| `dispatch-exhaustion-persistence.ts` | Restore/persist unexpired dispatch exhaustion and flush on shutdown. |
+| `dispatch-lane-stats.ts` | Per-tier/mode/lane counts and bounded completed-run duration history. |
+| `lane-activity.ts` | Bounded execution-tagged relay traffic; internal tags never reach providers. |
+| `lane-launch-env.ts` | Shared credential-scrub and operator env-delta policy for lane launches. |
+| `lane-execution-broker.ts` | Daemon-owned idempotent execution, cancellation, activity and bounded results. |
+| `configured-lane-execution-launcher.ts` | Resolve configured lanes and apply cwd/read-only/env/depth/spawn policy. |
+| `lane-affinity.ts` | Bounded persisted pins/demotions; neither resurrect nor remove candidates. |
+| `mcp/job-journal.ts` | Shared running-job ownership and bounded restart-recovery metadata. |
+| `mcp/readonly-boundary.ts` | Enforce cwd and supported harness read-only mechanisms. |
+| `mcp/persistence-lock.ts` | Shared journal/archive transaction contention policy. |
+| `mcp/job-archive.ts` | Bounded terminal archive and cross-host result lookup. |
+| `mcp/process-cpu.ts` | CPU measurements for owned process trees; unavailable is not idle. |
+| `mcp/tree-delta.ts` | Git-status change reporting and dirty-file activity evidence; never revert edits. |
+| `mcp/lane-execution-client.ts` | Strict broker client and opaque execution IDs; distinguish rejection from uncertainty. |
+| `mcp/agy-quota-log.ts` | Fresh, attributable AGY log evidence; ambiguous/shared-log data proves nothing. |
+| `mcp/protocol.ts` | Supported JSON-RPC/MCP stdio methods and version negotiation. |
+| `mcp/lane-runner.ts` | Jobs, local process ownership/reaping, output bounds and journal/archive integration. |
+| `mcp/windows-npm-shim.ts` | Resolve supported npm shims to Node entrypoints without shelling task text. |
+| `mcp/server.ts` | Dispatch tools, whole-job walks, wait/liveness contracts and broker reconciliation. |
+| `validator.ts` | Tool-schema validation: pass, fail or uncheckable. |
+| `reshaper.ts` | Corrected-input client and transport-only repair-model failover. |
+| `repair.ts` | Destructive refusal, bounded repair, structural conservation and revalidation. |
+| `sse.ts` | Reconstruct Anthropic-shaped messages for validation. |
+| `emitSse.ts` | Emit repaired Anthropic SSE while preserving reported usage semantics. |
+| `anthropic.ts` | Inspected message/tool/usage shapes and schema lookup. |
+| `documents.ts` | Convert supported documents before mapping; refuse unrepresentable content. |
+| `log.ts` | Sink-enforced metadata allow-lists, bounded attempts and log rotation. |
+| `catalog.ts` | Cached provider rosters/metadata, bounded validation and evidence-triggered refresh. |
+| `circuit-breaker.ts` | Attempt outcomes, separate credential faults, recovery cooldowns and pacing starts. |
+| `breaker-persistence.ts` | Restore/persist full validated breaker cells without overwriting fresh live evidence. |
+| `cooldown-clear.ts` | Selector-scoped live cooldown clearing; narrow credential-rotation mode. |
+| `benchmarks.ts` | Capability and deployment fitness ranking with distinct evidence bases. |
+| `tier-data.ts` | Synced snapshot loading and explicit exact/fuzzy/price-suffix match provenance. |
+| `telemetry.ts` | Daemon version, config staleness, health and accounting writer diagnostics. |
+| `metadata.ts` | Per-field price/limit provenance, cost classification and shared token estimates. |
+| `kernel/` | Pure adopted attempt-lifecycle contracts; not a speculative transport or IR framework. |
+| `storage/` | Validated JSON reads, cross-process transactions and atomic replacement. |
+| `accounting-state.ts` | Per-request accounting lifecycle and price-port integration. |
+| `candidate-runner.ts` | Production candidate policy/walk, deadlines, hedging, commitment and announcements. |
+| `stream-pipeline.ts` | Body bounds, stall/crawl watchdogs, stream helpers and typed failure responses. |
+| `routes/admin.ts` | Admitted control endpoints, including broker, reload, stop and live state. |
+| `routes/messages.ts` | Anthropic Messages front. |
+| `routes/openai-front.ts` | OpenAI Chat/Responses fronts and translated-stream terminal handling. |
+| `control-authorization.ts` | Per-install control capability; timing-safe checks and secret-safe failures. |
+| `request-log.ts` | Shared metadata records and safe route/query summaries. |
+| `self-update.ts` | Bounded update checks for mutating invocations and global-install re-execution. |
+| `registry.ts` | Provider/catalog/routing registry with labelled capability joins. |
+| `key-checker.ts` | Evidence-based credential checks, including anonymous comparison and model entitlement. |
+| `onboarding.ts` | Local account/key setup; suppression changes nudges, not visibility or routing. |
+| `setup-claude.ts` | Owned Desktop MCP entries, routed CLI setup and relay-agent installation. |
+| `ping/cadence.ts` | HTTP probes, recovery probes, spend polls and self-scheduled background hooks. |
+| `spend-headroom.ts` | Provider-stated paid allowance; clear only the paid-only facts it disproves. |
+| `ping/metrics.ts` | Sample-aware latency/availability statistics; keep unmeasured distinct from failed. |
+| `ping/ping.ts` | One HTTP completion probe and quota-header observation. |
+| `ping/probe-cache.ts` | Persist validated probe/request samples without conflating their scheduling metadata. |
+| `write-behind.ts` | Debounce plus maximum-age flush scheduling and shutdown registry. |
+| `usage-observer.ts` | Byte-preserving usage observation with separate reported/estimated accumulators. |
+| `quota-observation.ts` | Unambiguous provider-stated axis/period observations. |
+| `quota-demotion.ts` | Allowance-based reordering with evidence-gated limits and resolvable resets. |
+| `latency-demotion.ts` | Sustained latency demotion: request per-token evidence, then probe-only fallback. |
+| `pacing.ts` | Sliding-window attempt-rate demotion against stated/configured/learned ceilings. |
+| `hedge-trigger.ts` | Evidence-labelled hedge delay with an input-size floor. |
+| `hedge-race.ts` | Concurrent attempt race and loser cancellation, independent of HTTP. |
+| `accounting.ts` | Request/attempt events and separately attributed token/spend cells. |
+| `accounting-store.ts` | Bounded persisted ledger, in-memory usage reads and writer health. |
+| `accounting-store-schema.ts` | On-disk validators and explicit additive compatibility seams. |
+| `dashboard-contract.ts` | Platform-free, versioned analytics wire vocabulary and bounds. |
+| `dashboard-auth.ts` | One-time bootstrap exchange and digest-only read-only session authority. |
+| `dashboard-routes.ts` | Injected dashboard endpoint policy, separate from socket admission. |
+| `dashboard-snapshot.ts` | Read-only bounded projections, coverage and shared cost roll-up. |
+| `dashboard-static.ts` | Manifest-owned static assets and security headers; no catch-all file serving. |
+| `json-shape.ts` | Platform-free shared shape guards; strict and optional-key guards differ intentionally. |
+| `winenv.ts` | Windows environment gap-filling; real env wins and PATH is never imported wholesale. |
+| `ping/quota.ts` | Quota fetches restricted to the exact configured provider host. |
+| `ping/runtime-telemetry.ts` | Proxy-request telemetry; not a home for whole-agent wall-clock samples. |
+| `process-safety-net.ts` | Narrow late-transport-error handling; other uncaught errors remain fail-fast. |
+| `think-tags.ts` | Conservative leading-reasoning removal with lossless rollback of uncertain shapes. |
+| `delegate-gate/` | Host-side review of returned diffs; mechanical fixes write a separate patch, not the repo. |
 
-**Request flow:** `handle()` in `server.ts` → `orderByUsability()` → a candidate loop (BOTH paths —
-`openAiFrontPath` for the OpenAI front, the inline loop for `/v1/messages`) → `fetchBackend()` →
-then either `repairPath` (repair mode, invalid tool call) or `transparentPath` (detect/passthrough). Repair splits into
-`repairStreamingPath` (SSE: stream text through, buffer from first tool_use) and
-`repairBufferedPath` (non-streamed JSON). The validate/repair layer **always sees Anthropic
-Messages** regardless of backend kind — translation is isolated in `backend.ts`.
-
-## Invariants (keep these true)
-- **Provider knowledge is data, not routing configuration.** Provider URLs, models, and
-  credentials that decide routing come from config. Labelled provider facts in `src` — such as
-  env-var aliases, parameter quirks, refusal wording, and preset defaults — are allowed when
-  config can override them.
-- **Provenance:** a guess must never be labelled a measurement. Reported figures use
-  `provider-stated`, `derived`, `estimated`, or `operator-declared`; a total mixing bases shows its
-  split rather than quietly reporting one undifferentiated number. Unknown stays `null`, never `0`.
-  Tunable defaults are allowed, but unpublished provider limits, prices, and context ceilings may
-  not be invented.
-- **Accounting metering, not custody:** per credential and deployment, record used, left, and
-  rate. Counting is unconditional and needs no published limit. Acting on counts is optional,
-  always announced, and may only reorder — **except a HEDGE, which may also DUPLICATE** (owner
-  amendment 2026-08-30, `docs/history/hedged-attempts-design-2026-08-30.md` §7). The exception is narrow and
-  carries its own three bounds, all owner decisions: it is confined to deployments `assessCost()`
-  calls FREE, the loser is aborted the moment a winner commits, and the response announces it
-  (`x-llm-relay-hedged`). ⚠ It is an amendment, not a repeal: nothing else here may duplicate, and a
-  future term that wants to must be argued on its own, not by pointing at this line. The ledger
-  meters keys the operator already holds and never obtains, stores, mints, or centrally proxies
-  credentials.
-- **No hosted relay or pooled consumer accounts:** the relay never operates a login, never asks
-  anyone to paste a Claude token into it, and never centrally proxies another person's subscription
-  traffic. Each operator runs their own instance with their own keys; this still permits several
-  keys belonging to that operator.
-- **The repair boundary:** the relay fixes protocol form, never judgment. No LLM opinion enters the
-  request path; routing comes from config and deterministic classification.
-- **Health demotes, never drops.**
-
-- **Never assert a key is bad without evidence that distinguishes it from an entitlement
-  wall.** Free-tier rosters list premium models; a 401/403 on one of them says nothing about
-  the credential. `unverified` exists precisely so the check can decline to conclude — a false
-  "your key is broken" sends the user to rotate a perfectly good key.
-- **Loopback only.** Startup refuses a non-loopback bind (it holds a provider key, does no auth).
-  But **loopback is not authorization** — see the admission gotcha below.
-- **Logs are metadata only** — never request/response headers or bodies. That includes URL
-  *values*: `logSafePath()` keeps the route and each parameter's NAME and replaces its value with
-  the value's length, so a long `?task=` cannot write user prose into the log.
-- **Destructive tool calls are refused, never fabricated** (repair output may run under
-  `--dangerously-skip-permissions`). Unrepairable → fail-clean (502, or a mid-stream SSE `error`).
-  The refusal set is `DEFAULT_DESTRUCTIVE` in `config.ts` — **the single definition**; the CLI
-  template spreads it, and `config.example.json` is asserted equal to it by
-  `test/destructive-coverage.test.ts`. Don't hand-copy the names anywhere.
-- **Persistent storage directory:** Local configurations, keys, and caches are persisted under
-  `~/.llm-relay/`: `config.json`, `.env`, `keystore.json` (the encrypted credential store),
-  `models-cache.json`, `probe-cache.json`,
-  `runtime-telemetry.json`, `control-token` (control-plane capability), `target-facts.json`,
-  `refusal-interpretations.json`, `lane-manifest.json`, `breaker-state.json`,
-  `dispatch-exhaustion.json`, `dispatch-lane-stats.json`, `lane-affinity.json`,
-  `update-check.json`, the `hooks/` script
-  (the Agent hook), and the accounting subtree `usage/` (`lifetime.json`, `recent.json`,
-  `YYYY-MM-DD.json` day shards).
-  ⚠ **`~/.llm-relay/` is the DEFAULT, not the only answer — every artifact honours XDG** since
-  2026-08-27, through the one policy in `state-paths.ts` (config-kind → `XDG_CONFIG_HOME`,
-  cache-kind → `XDG_CACHE_HOME`). Until then three policies coexisted and the state directory
-  SPLIT whenever either variable was set. ⚠ The legacy fallback means an install whose state is
-  already at `~/.llm-relay/` keeps using it: honouring XDG never moves anything that exists. See
-  the `state-paths.ts` row, and `docs/reference.md` "Where state actually lives" for users.
-  Under vitest every default path
-  redirects to a temp dir. ⚠ That sentence was FALSE until 2026-08-27 — seven artifacts honoured
-  it and six did not (`.env`, `models-cache.json`, `update-check.json`, the config dir holding
-  `control-token`, the hook script, and `config.json`, whose resolver CREATES it). `.env` was the
-  sharpest: `loadEnvFile` READS it into `process.env`, so a test run imported live credentials.
-  Each resolver now guards itself AT THE RESOLVER — a call-site guard is how the control-token one
-  came to be half-covered. `test/persistent-paths-vitest.test.ts` pins the NINE that share the
-  `llm-relay-vitest` temp root as one table; the other four — `keystore.json`,
-  `target-facts.json`, `refusal-interpretations.json` and the `usage/` subtree — guard themselves
-  at their own resolvers into their own temp namespaces (per worker, per PID, per run), which is
-  deliberate: they hold cross-test state that a shared root would let one test leak into another.
-  ⚠ So the table is not the whole set. A new artifact using the shared root is caught; one that
-  invents its own namespace is not, and must carry its own guard and say so here. There is
-  deliberately no shared "test mode" helper: each guard names the real state it protects. An
-  EXPLICIT path always wins.
-  ⚠ Not the same guard as `winenv.ts` / `secret-file-acl.ts` / `os-keyring.ts`, which refuse to
-  SPAWN under vitest without an injected seam.
-- **Hand-built `Config` objects in tests must include** `repair: { maxAttempts,
-  destructiveTools }`, and every provider entry needs its `kind`
-  (`"anthropic"`/`"openai"` — load defaults an omitted kind to `"anthropic"`, so a hand-built
-  openai-kind fixture that omits it tests a different code path than it claims). The old
-  `config.backend.{base,kind}` field is gone since the registry refactor (`774ba18`) — there is no
-  top-level `backend` on `Config` any more.
-- **Commit trailer:** `Co-Authored-By: <the model doing the work> <noreply@anthropic.com>`
-  (e.g. `Claude Fable 5`). Name the model that actually authored the change.
+The browser application lives in root `dashboard/`, not `src/dashboard/`.
+The request path is resolve → order/select → execute/commit → validate or repair → account/announce.
+The internal validation shape is Anthropic Messages; wire translation belongs at the backend/front
+seams. Production ordering is the candidate runner's deployment-group path, not the breaker's
+standalone ordering helper.
 
 ## Scripts inventory (`scripts/`)
 
-Per-script purposes and prerequisites: [scripts/CLAUDE.md](scripts/CLAUDE.md) (loads when working
-under `scripts/`). The one thing to know from outside that directory: most `scripts/*.mjs` read
-`dist/` — **rebuild (`npm run build`) before running any of them** or you'll test stale code.
-(`test/scripts-inventory.test.ts` pins that inventory to the directory, on the
-`architecture-map.test.ts` precedent.)
+[scripts/CLAUDE.md](scripts/CLAUDE.md) owns script purposes and prerequisites.
+`test/scripts-inventory.test.ts` checks its coverage. Do not copy that inventory here or run a
+measurement against stale compiled output.
 
 ## Gotchas (things that will bite you)
 
-- **⚠ Never classify a CLOSED union with an unconditional `else`, a bare `default:`, or a runtime
-  list hand-copied from the type — and never let the fall-through resolve to the STRONGER claim.**
-  This is the most repeated defect in this codebase's history: **eight** instances found so far,
-  in eight different modules, each written by someone who knew the union's members at the time.
-  A provenance fallback must always fall to the WEAKER claim; every instance found fell the other
-  way, and none could produce a compile error.
-  - v0.50.0: `FactKind` — a nested ternary told the operator that six of the ten kinds meant "gone
-    from the provider — excluded from pools".
-  - 2026-08-28, all seven remaining (`aabac49`, `ab75f65`): `ContextWindowSource` → "published by
-    the serving provider"; `AuthHeaderName` → the credential sent as `x-api-key`; `FilterState` →
-    held bytes silently DELETED in the module whose stated purpose is losslessness;
-    `FactResetBasis` → an unknown basis promoted to the provider-stated rung; `OutcomeProvenance` →
-    the PROVIDER's breaker charged for a RELAY-LOCAL fault; `ErrorOrigin` → `"upstream"`, which
-    also means RETRIABLE, so the walk rerolls other members for the relay's own fault;
-    `AccountingEvent` → an unhandled event recorded as a SUCCESS THAT DID NOTHING, with no loss
-    marker.
-  - **The fix is always the same:** a total `Record<Union, …>` closed with `satisfies`, or an
-    exhaustive `switch` ending in `const _never: never = x`. Put it where a maintainer adding a
-    member is already looking. Then MUTATION-CHECK it: add a member, confirm `npm run typecheck`
-    fails AT THE TABLE, remove it. If it does not fail, the change did nothing.
-  - ⚠ **A runtime list is the same defect wearing different clothes.** `UNTIL_BASES` was a
-    `ReadonlySet<string>`, so the compiler could not connect it to `FactResetBasis`; nine
-    `dashboard-contract.ts` unions were written out beside nine `as const` arrays repeating the
-    same members. Derive the list from the type (or the type from the list) — never both by hand.
-  - ⚠ **Distinguish this from a type merely WIDER than its producers.** If every construction site
-    is centralized and validating, a maintainer would have to hand-write the bad state; that is
-    hardening, and this repo defers it (four such findings deferred 2026-08-28). The class above is
-    different precisely because it fails SILENTLY with no compile error anywhere.
-  - ⚠ **Making a classifier total surfaces live bugs the analysis missed** — it did twice on
-    2026-08-28. Expect `tsc` and the suite to find an optional field or an incomplete fixture the
-    old fall-through was quietly absorbing, and fix that rather than restoring the fall-through.
-  - Pinned by `test/closed-vocabulary-coverage.test.ts` and
-    `test/closed-vocabulary-routing.test.ts`; full ledger in
-    [docs/history/advisory-findings-verification-2026-08-28.md](docs/history/advisory-findings-verification-2026-08-28.md).
+### Configuration, credentials and local state
 
-- **Custody rotation is valid only when the keystore is the winning source.** Credential
-  precedence is process env > `.env` > keystore: `keys add` warns when the stored row is shadowed,
-  while `keys rotate` refuses byte-preservingly because changing unused ciphertext would change
-  nothing on the wire. After an unshadowed rotation, the CLI uses the admitted
-  `/cooldowns/clear` seam with `kinds:["credential-fault"]` to retract only that credential's
-  breaker faults and `credential-invalid` facts. `allowance-exhausted`, rate-limit cooldowns, and
-  the escalation ladder survive because a new key disproves authentication failure, not account
-  allowance or back-pressure; the CLI must never race the relay by editing `target-facts.json`.
+**Reload is explicit and transactional.** Disk staleness is an mtime observation, not a file watcher.
+The daemon loads a complete candidate with startup CLI overrides and materializes its dynamic
+pools before committing. Preserve the live `Config` identity; no await or fallible preparation may
+split the mutation. Unsupported differences reject the whole candidate and report paths, not values.
+`config-reload.ts` owns the reloadable/restart-only sets. Provider membership/identity, listener,
+logger, destructive matcher and startup-owned policy require restart. Config reload does not
+refresh inherited environment values. Targeted offload updates are a separate live mutation.
 
-- **An unset `${ENV}` in a provider `base` disables THAT provider, it does not abort startup.**
-  The proxy fronts every client session, so a fatal error there turns one unused optional
-  provider into a total outage. Pool members belonging to a disabled provider are dropped with
-  a warning; a member naming a provider that was never declared is still a hard error, because
-  that is a typo and silently dropping it would spend primary quota via the passthrough.
-  **The same degradation now applies to `routing.tiers`, `routing.subagents`, an ARRAY
-  `routing.default` and relay ladder rungs** — they were validated against the *post-disabling*
-  provider map, so a tier pointing at the degraded provider was reported as naming an unknown one
-  and aborted startup, reaching the same total outage by another route. Losing every provider,
-  emptying a pool entirely, or a single-spec `routing.default` naming the disabled provider is
-  still fatal — there is nowhere left to fall through to — and that last error names the unset
-  `${ENV}` rather than accusing the operator of a typo. `Config.warnings` carries all of it so
-  startup can print it; the subagent warning states the CONSEQUENCE (that traffic now falls through
-  to `routing.default`, i.e. primary quota), because a silent fall-through there looks like a
-  successful offload.
-- **Worktrees.** Work may happen in a git worktree (e.g. under `.claude/worktrees/…`). Edit and run
-  tests **in the worktree path**, not the main checkout — they have separate working trees. vitest
-  run from the wrong root will silently pick up the other copy's `src/`. (`vitest.config.ts` stops
-  the reverse case — this tree's `npm test` reaching into a worktree nested under the repo root.)
-  ⚠ **Two path-sensitive checks failed in a lap worktree and are fixed (2026-09-08):**
-  `test/os-keyring.test.ts` matched every 4-gram of an English-shaped needle against an error whose
-  stack carries the checkout's absolute path (`stdout-super-secret`'s `er-s` hit a worktree named
-  `…circuit-breaker-state…`) — the needles are high-entropy now; and the dashboard bundle graph
-  recorded `../../../Code/llm-relay/node_modules/react` because a lap worktree's `node_modules` is a
-  JUNCTION and Vite hands the plugin the resolved path — `packageRelativePath` in
-  `dashboard/vite.config.ts` maps a directory under the junction's real target back to
-  `node_modules/…`, while a directory under neither root still fails the portability check (an EMPTY
-  `node_modules` resolving upward is the case that check exists for).
-- **vitest reads `src/` directly; scripts read `dist/`.** Tests reflect your edits immediately;
-  `scripts/*.mjs` do not until you `npm run build`.
-- **Using the `claude` CLI through the proxy needs an isolated `CLAUDE_CONFIG_DIR`.** An active
-  claude.ai subscription session conflicts with the proxy token → client-side `Invalid API key` /
-  `401` with **no request sent**. The wrappers set this; without it, it looks like a proxy bug but
-  isn't. (Also keeps the subscription out of the path — the safe direction.)
-- **`count_tokens` and non-`/v1/messages` paths** are handled locally for OpenAI backends (token
-  estimate / clean 404) — they must NOT be routed to `/chat/completions`. See `server.ts` `handle()`.
-- Backends rate-limit (HTTP 429). The proxy passes it through; the client's retry/backoff handles it.
-- **Subagent detection uses THREE signals, any one sufficient — keep it that way.** `routing.subagents`
-  applies when the request carries `cc_is_subagent=true` in its `system` block (verified against
-  Claude Code 2.1.220), the documented `x-claude-code-agent-id` header (gateway protocol
-  reference: present only on requests from an agent Claude Code spawned in the session, and
-  gateways may route on it), or Codex's `x-codex-turn-metadata` with `request_kind: "subagent"`. Each covers the others' silent failure: a filtered header dies to the body marker, an attribution-block stripped by
-  `CLAUDE_CODE_ATTRIBUTION_HEADER=0` dies to the Claude header, and Codex has no Anthropic `system`
-  block at all so its marker cannot carry it. They travel in different carriers, so no single component drops all three. If all ever go, every
-  subagent falls back to normal routing — safe (passthrough) but **silent**, so nothing will alert
-  you. Re-verify with the capture recipe in
-  [docs/subagent-routing.md](docs/subagent-routing.md#re-verifying), which reports each signal
-  separately.
-- **Pool refs (`pool/<name>`) are legal in `routing.tiers`, `routing.default` and
-  `routing.subagents`,** expanded by `expandPoolSpecs()` at resolve time and validated at config
-  load (pool-aware `assertSpecResolvable`). Pool members themselves must be provider specs —
-  pool-in-pool is rejected at load.
-- **Reshaper transport failures THROW (`ReshaperTransportError`), refusals return.** That
-  distinction is what makes `FailoverReshaper` real: it advances only on throws. Converting a
-  timeout/5xx into a `refuse` result (the pre-0.8 behaviour) silently disabled reshaper failover.
-  `repair()` catches the throw and fails clean (`outcome: "failed"`).
-  **Exhausting every candidate throws too** — nobody answered, so there is no judgement to report.
-  Returning `refuse` there labelled a total outage as a model's decision and logged the turn as
-  `refused` (a model declined) rather than `failed` (nothing was reachable). The two outcomes must
-  stay distinguishable in the log, because they call for opposite responses.
-- **The destructive-tool match is EXACT (case-insensitive), not substring** — a trailing `*` in a
-  configured pattern is the opt-in prefix form (`git_*`). Substring matching was wrong in both
-  directions at once: none of the old fragment patterns (`rm`, `delete`, `remove`, …) occur in the
-  harness's real destructive tools, so the "never fabricate a destructive call" guard covered none
-  of the tools that can destroy anything; meanwhile `push` matched `PushNotification` and `reset`
-  matched `ResetZoom`, refusing safe calls. `DEFAULT_DESTRUCTIVE` therefore now leads with the
-  first-party mutation tools — Claude Code's `Bash`, `BashOutput`, `Write`, `Edit`, `MultiEdit`,
-  `NotebookEdit`, and Codex's `shell_command`, `apply_patch` — before the conventional names.
-  ⚠ **User-visible behaviour change:** repairs of malformed `Bash`/`Write`/`Edit`/`MultiEdit`/
-  `NotebookEdit`/`BashOutput`/`shell_command`/`apply_patch` calls that used to succeed are now
-  refused (`repair: "refused_destructive"`), and calls whose names merely *contain* a pattern
-  (`PushNotification`, `ResetZoom`, `ForceRefresh`) are now permitted. An **empty**
-  `repair.destructiveTools` refuses nothing — there is no hidden built-in set in `src/`, so
-  coverage is always traceable to config.
-- **The destructive refusal binds at the DIALECT-RESCUE commit point too, and it is TERMINAL
-  there (2026-08-24).** Until then `destructive` appeared in exactly five `src/` files — `cli.ts`,
-  `config.ts`, `log.ts`, `repair.ts`, `server.ts` — and in NONE of `tool-dialects.ts`,
-  `openai-dialect.ts`, `dialect-stream.ts`, so the guard bound only inside `repair()`. A
-  **well-formed** destructive call the relay reconstructed out of assistant prose validated cleanly
-  and reached the client unfiltered; the real guarantee was only fail-clean refusal of a
-  **malformed** one. A backend emitting native `tool_calls` has stated its own protocol intent and
-  is untouched — rescue is different because it is the relay deciding that model TEXT is a tool
-  call, which for `Bash`/`Write`/`Edit` under `--dangerously-skip-permissions` is the fabrication
-  the invariant forbids.
-  ⚠ The policy lives in ONE place: `recoverToolCalls` takes `isDestructive` as a **required**
-  parameter and returns `{ status: "refused-destructive", dialect, refused }`. Required, not
-  optional — there are **four** rescue commit points (buffered/streamed × Anthropic-translated/
-  direct-Chat) and an optional parameter would let a fifth silently omit the policy, which is the
-  failure mode being fixed. The matcher threads from `createProxy`'s one `destructiveMatcher(...)`
-  through `fetchBackend`/`fetchOpenAiFront` args, both required, so the compiler enumerates callers.
-  ⚠ **Refused WHOLE, never partially** — committing the surviving calls and dropping the destructive
-  one silently changes the model's intent, the reasoning `guardReshaped`'s structural conservation
-  rests on.
-  ⚠ **Terminal: it never fails over and never charges the deployment.** An unparseable envelope
-  fails over on purpose (`origin: "upstream"`, retriable) to reach a host that parses; a refusal is
-  a CONFIG decision, so it carries `origin: "local"` — `localFailure` true, `tryNext` false, walk
-  outcome `{ kind: "local" }`. Same line the hard cap draws ("a cap never registers on the breaker
-  — it is config, not health") and same shape as `refused_destructive`, which "remains a fail-clean
-  502 and never rerolls another candidate". ⚠ On a **streamed pre-commit** refusal that terminality
-  depends on `stream-commit.ts` `relayAuthored()` reading the relay-owned error code as `local`; an
-  in-band error is retriable by default, so without it one lane would reroll and the other would
-  not. Both are pinned in `test/dialect-destructive-refusal.test.ts` (every proxy test there walks
-  ≥2 candidates and asserts the second backend's `calls()` is 0 — with one candidate "refused and
-  stopped" and "refused and had nowhere to go" are the same observation).
-  ⚠ **Announced**, like every other automatic fix on this path: buffered refusals carry
-  `x-llm-relay-tool-dialect: refused-destructive` plus an error body typed
-  `tool_dialect_refused_destructive`; a streamed refusal past the head sends the same code as a
-  mid-stream SSE `error`. The refused NAMES travel (they are the operator's own configured list);
-  the recovered ARGUMENTS never do. There is deliberately **no log field** — the header and body
-  carry it on all four seams, and the metadata log records the 502 like any other.
-  ⚠ **User-visible change:** a free host that leaks a `Bash`/`Write`/`Edit` call as dialect text now
-  yields a clean 502 (or a mid-stream error) instead of a recovered tool call, and the request is
-  not retried against another pool member. An **empty** `repair.destructiveTools` still refuses
-  nothing. Design: [docs/history/dialect-rescue-destructive-refusal-2026-08-24.md](docs/history/dialect-rescue-destructive-refusal-2026-08-24.md).
-  ⚠ `test/openai-dialect-passthrough.test.ts` carried a test named *"validates a recovered
-  destructive call without refusing or reshaping it"* asserting HTTP 200 — another case of a test
-  written to pin the defect it should have caught. It was flipped in the same commit as the fix.
-  ⚠⚠ **The destructive check runs BEFORE the argument check, over every name a parser RECOGNISED —
-  not over the calls it committed** (owner ruling 2026-09-06). Each of the four parsers returns a
-  `DialectScan`: the calls it is willing to commit, AND every tool name it recognised, including
-  names whose call it then discarded. `recoverToolCalls` refuses on that name list first.
-  ⚠⚠ **The filter was BORN with this gap, on 2026-08-24 — it is not something a recent commit
-  introduced.** Dates, because the causal story is easy to get wrong and this file got it wrong
-  first: `fromTaggedJsonForms` and its `catch { continue; }` landed 2026-08-08 (`44b0724`);
-  `fromKimiTokenForm` and its three `return []` discards landed 2026-08-13 (`0a38e42`); the
-  destructive filter itself landed 2026-08-24 (`091cf7c`, v0.46.0), reading COMMITTED calls. So on
-  the day the filter was written, two of the four parsers already discarded a malformed payload and
-  the filter already could not see those names. CLONE-26 (v0.72.3, 2026-09-05) did NOT create the
-  class — it touched `fromDeepSeekForm` alone, extending an existing hole to a third parser.
-  ⚠ What the gap cost: a `Bash` call the relay had recognised in model TEXT did not yield
-  `refused-destructive` — 502, `origin: "local"`, code `tool_dialect_refused_destructive`, the
-  `x-llm-relay-tool-dialect` header, no failover, no breaker charge — and became an ordinary
-  `detected`: 502, `origin: "upstream"`, no header, a full pool reroll and a breaker charge.
-  ⚠ The invariant was unharmed either way — no destructive call is FABRICATED on either path, which
-  is what "refused, never fabricated" actually protects — but the error code, the header, the
-  failover and the health accounting all moved, on a safety-shaped surface, as a side effect of an
-  unrelated parser fix. **The lesson generalises: a filter that reads what an earlier stage
-  COMMITTED inherits that stage's discard policy as its own trigger condition.**
-  ⚠ The rule is now the same across all four parsers, which CLONE-26 had left inconsistent: a
-  malformed payload under a destructive name refuses on the DeepSeek, Kimi and `<function=NAME>`
-  forms alike. The `<tool_call>` form carries its name INSIDE the payload, so an unparseable one
-  recognises no name and there is nothing to refuse — containment, not an exemption. Pinned by six
-  refusal cases plus two negative controls in `test/tool-dialects.test.ts`; reverting the parsers
-  fails exactly those six and leaves the controls green.
-- **Loopback is not authorization; the mutating endpoints have admission checks.** Any page the
-  user visits can POST cross-origin to the listener, and a `text/plain` POST is a CORS *simple
-  request* — no preflight. The attacker cannot read the response, but `/offload` rewrites
-  `config.json`, `/dispatch` steers the host's lane order, and `/cooldowns/clear` retracts live
-  routing state, so reads are not the risk. All three therefore reject a present-but-non-loopback
-  `Origin` (403), require
-  `content-type: application/json` on a mutating request (which is what forces a preflight a
-  hostile page cannot satisfy), and require a loopback `Host` (closing DNS rebinding). An **absent**
-  `Origin` is allowed on purpose — that is what a CLI sends, and both the no-restart `llm-relay
-  offload` toggle and live-only `llm-relay cooldowns clear` depend on it. There is a test for it;
-  don't "tighten" it into a broken CLI.
-- **Credential containment is DECLARED, not inferred from key presence.** `credentialState()` reads
-  the config declaration first: `not-declared` (a real passthrough — forward the caller's own
-  credential) / `declared-present` / `declared-missing`. The old `stripAuth = !!apiKey` was
-  identically falsy for the first and last, so a provider declaring an `authEnv` whose variable was
-  unset forwarded the caller's own Anthropic token verbatim to a third-party base URL. A
-  `declared-missing` target now throws `CredentialConfigError` rather than egressing anything.
-  **The other half of the same principle landed 2026-08-05:** passthrough itself is declarable —
-  `credentialMode: "passthrough" | "contained"` on the provider. Absence of `authEnv` alone used to
-  mean "forward the user's credential to this host", so the most consequential default in the file
-  was the one nobody opted into, and it was bounded only by the fact that the sole such provider
-  points at Anthropic. Omission still forwards (config load warns instead of failing — this proxy
-  fronts every session, so refusing to start would be an outage), `"contained"` strips for a keyless
-  backend that is not the caller's vendor, and `"passthrough"` + `authEnv` is a hard error. Scoped
-  to `anthropic`-kind: an `openai`-kind target's headers are built from scratch in
-  `buildTargetHeaders()` and can never carry an inbound credential, so warning about a keyless
-  `ollama` would be a false alarm that teaches the operator to ignore the true one.
-  Do not re-derive this from `resolveAuthEnv()` returning a name: the anthropic alias list holds
-  `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, so a provider with **no** declared `authEnv` still
-  resolves to a name whenever either is set — which would invert the one behaviour a passthrough
-  exists to provide.
-- **The breaker records failure on EVERY retriable error response (429/5xx/400/402/404),** including
-  on the last candidate — `test/server.test.ts` "circuit breaker accounting" pins that a
-  single-candidate 429 is never recorded as a success. **402 is quota exhaustion, not a client
-  error** — on the free/router providers this proxy fronts it means depleted monthly credits, so it
-  fails over like a 429 but cools the member down for 1 hour (monthly credits don't reset in the
-  2-minute 429 window); any success clears it (`test/pool-failover.test.ts`).
-- **BOTH request paths must classify outcomes through `classifyStatus()` + `recordAttempt()`.**
-  The OpenAI front (`/v1/chat/completions`) had neither failover nor breaker accounting: it was
-  handed `healthyTargets[0]` and returned before the Anthropic path's loop, and it reported to
-  runtime telemetry only. A 14-member pool served every request from the same rate-limited member
-  and returned its 429 to the client — measured, 6 consecutive 429s with `lastStatus: null` on the
-  breaker throughout. Two paths, two policies, one of them empty. Keep the policy in one place.
-  Full write-up: [docs/pool-failover.md](docs/pool-failover.md).
-- **⚠ A failover test with ONE candidate proves nothing.** With a single candidate, "fails over
-  correctly" and "cannot fail over at all" are the same observation — which is how the above
-  shipped past a suite that covered the front path. `test/pool-failover.test.ts` uses ≥2 throughout.
-- **⚠⚠ A HEDGE puts TWO attempts in flight, and everything the walk touches had a hidden
-  one-at-a-time assumption baked in.** Both were found by RUNNING, not by reading, and both would
-  have shipped throwing or hanging requests. Wired 2026-08-30; `routing.hedge` is ON by default for
-  free deployments only, announced by `x-llm-relay-hedged`, and `false` is a byte-for-byte revert.
-  - **`CredentialAttemptTrace.record` matched the LAST open entry** and only then asserted the
-    identity. That is the same check while one attempt is ever live, and wrong the moment two are:
-    entries are pushed in EGRESS order, so a PRIMARY that won against an egressed hedge was matched
-    against the HEDGE's entry and threw on a perfectly good 200. It now closes the most recent open
-    entry BELONGING to that attempt. The invariant is unchanged — an outcome for an attempt with no
-    open entry still throws; only out-of-order closure is now tolerated.
-  - **`CredentialWalk.next()` had to start re-offering a pending-but-UNSTARTED attempt** — see its
-    row above. The failover look-ahead depended on the single-slot saturation branch by accident.
-  - **`onEgress` fires ASYNCHRONOUSLY, so per-attempt state must live in a RECORD, not in loop
-    locals** (`AttemptRun`). With two callbacks in flight, one writing the loop's locals attributes
-    the hedge's health attempt, accounting row and `tried` entry to the primary — silently, and only
-    under load. The OpenAI front's `recoveryAudit` moved for the same reason: a hedge that wins must
-    log ITS OWN validation and repair outcome.
-  - ⚠ **A hedge LOSER is `recordAbandoned`, never `record`.** A `cancelled` outcome sets `#stopped`
-    and would end the walk for the request the hedge just rescued. The loser is also charged NOTHING
-    on the breaker, so **hedging HIDES the slowness it routes around** — a stated cost, tolerable
-    only because a non-hedged request still cools a slow deployment for as long as it wasted
-    (v0.65.3). ⚠ Since 2026-08-30 that is a DECISION at a named entry, not a side effect: the loser
-    goes through `completeAttemptAbandoned`, whose `relay-abandoned` cause the breaker's
-    `CANCELLATION_REACHES_HEALTH_PATH` answers `false`. Retiring it through
-    `completeAttemptCancelled` instead would classify it by commit state, and a loser that committed
-    nothing would read as a deployment that failed to answer a client — charging the very attempt
-    hedging exists to abandon for free. A test kills exactly that mutation.
-  - ⚠ `isWin` is the loop's own `walkWouldFailOver` expression, extracted so there is ONE
-    definition. A primary answering 429 has not won; the walk was going to move on anyway, and
-    calling it a win would abort a hedge about to answer 200.
-  - ⚠ An anthropic-KIND target can never be hedged: `costClassOf` answers `paid` for it, because the
-    vendor passthrough spends primary quota. A test that varies "front" must vary the PATH and keep
-    the provider openai-kind, or every case silently proves nothing.
-- **A credential fault (401/403) is neither health data nor a success.** It lives on its own axis
-  (`credentialFailures` / `credentialFaultUntil`), fails over when another candidate exists, and
-  DEMOTES rather than trips the breaker — so the operator still sees the 401 in `/candidates`
-  (`AUTH 401` in the table) instead of it hiding behind a "target unhealthy" skip. It expires
-  (5 min) and clears on any success, so a rotated key recovers with no restart. Don't fold it back
-  into `recordOutcome`: recording a failure opens the breaker on a *config* problem, recording a
-  success launders a permanently broken member into a healthy one, and both were tried.
-- **Health DEMOTES candidates; it never drops them.** `orderByUsability()` returns every candidate,
-  ordered probation → live → slow → paced → credential-faulted → cooling. 2026-09-03, owner-approved:
-  latency-demoted members form a `slow` band above the failure bands, because measured walks reached
-  the only answering member after 6 to 9 failing ones. 2026-09-15: a member at a STATED rate
-  ceiling forms a `paced` band behind `slow` (`pacing.ts`) — healthy, merely full for the moment. Within the cooling band, candidates are ordered by
-  soonest known lift time (ascending; `cooldownUntil` from the breaker or target-facts); unknown
-  lifts sort last. The old `filter(isHealthy)` deleted cooling candidates whenever any healthy one
-  remained, so a pool could narrow to one member and then have nothing left when that member failed
-  too. Only an unset credential removes a candidate, and that happens in `resolveTargets` for a
-  different reason.
-- **Quota is a demotion term, never a drop (Gap 12, spec §5.4).** A spent quota (`remaining <= 0`,
-  basis `provider-stated`, `derived:provider-stated` (a STALE observation's stated limit minus
-  locally measured usage — first-party enough to gate, same rule as `availability.ts`
-  `routingEligible`) or `derived:configured`) demotes a candidate to the same cooling band,
-  with breaker source `"quota"`, expiring at the resetsAt the evidence stated. **Learned limits
-  never gate unless opted in** via `routing.quota.enforceLearned` (`derived:published` NEVER gates)
-  — a regex over vendor prose must
-  not throttle a healthy deployment on a number nobody stated. **Unknown has no effect whatsoever**
-  (same rule as the context guardrail). **The relay never invents a cooldown duration**: if neither
-  a stated reset nor a derivable period boundary exists, there is NO demotion at all — the walk
-  learns the truth from the provider's own 429 instead. Demotion reorders only: failure counters
-  are untouched, any success clears it through the ordinary cooldown path, and a pool whose every
-  member is quota-spent still serves from the cooling band. When a walk's ranked first choice was
-  displaced this way and someone else led instead, both fronts announce it in
-  `x-llm-relay-quota-demoted: "<spec> (requests/minute remaining 0, provider-stated)"`.
-- **A hard cap is the only thing that may refuse on an OPERATOR-DECLARED number; everything
-  derived still only demotes (G2).** The provenance line is the whole design: a cap lives under
-  the operator's own hand in config, so refusing on it enforces their instruction, while a
-  provider header, a learned parse or a published figure may never black-hole a candidate. So:
-  caps read usage ONLY from the relay's in-memory ledger (`usedInWindow`) — unknown ⇒ no refusal,
-  ever — and month/hour spellings are rejected at CONFIG LOAD, because the window read declines
-  month and a cap that could never fire would bound nothing while looking like it did. The cap is
-  inclusive (`used >= cap`; 450 admits 450). ⚠ **A cap's SCOPE is part of the cap and comes from
-  where it was DECLARED, not from what the caller happens to pass:** a flat `limits.hard` cap
-  (provider or slot) is compared against that credential's usage across every model; a
-  `limits.models.<id>.hard` cap against that deployment's usage alone. Reading the second at the
-  first's scope refuses `m/x` for requests spent entirely on `m/y` — a false refusal on an
-  operator-declared number — and it is exactly how enforcement and `/candidates` came to disagree
-  while sharing an evaluator: the *evaluator* was shared, the *ledger read* was not. `hardSource`
-  decides it inside `evaluateHardCap`, and the callback signature carries the scope so no caller
-  can choose. In the walk (`nextUncappedAttempt`, BOTH fronts,
-  before egress AND before `recordStarted()`), a capped attempt is skipped with no provider byte,
-  no LRU touch, no breaker mutation and no accounting attempt — but it is not dropped: it counts
-  as `Nxcapped` in pool-attempts and stays listed. Only an ALL-CAPPED walk refuses the request
-  (429, `x-llm-relay-capped`, native error body, Retry-After from the soonest UTC period
-  boundary — omitted, never invented, when no boundary resolves); any real provider outcome in
-  the walk means the last upstream error is the more honest body. ⚠ A cap never registers on the
-  breaker or reorders anything by itself — it is config, not health. ⚠ Refusing must not consume
-  the cap: a synthesized 429 produces an unattributable request row (`credentialId: null`), which
-  is exactly why the ledger skips it — otherwise every refusal would spend one request of its own
-  allowance and the cap would be a countdown.
-- **`Retry-After` sets the cooldown; the proxy never sleeps on it.** `parseRetryAfterMs()` handles
-  both RFC 9110 forms and returns null (never 0) for garbage. For a pool the right answer to "retry
-  in 20s" is "use another candidate now" — blocking the request path would trade one symptom for
-  another. `fetchBackend()` must keep carrying the header onto the error Response it synthesizes;
-  it builds a NEW Response, so the header was being destroyed there.
-- **A conforming error body is passed through BYTE-EXACT.** `normalizeOpenAiErrorBody()` exists only
-  for shapes that break an OpenAI client — gemini's array envelope `[{"error":{…}}]` (no `choices`,
-  so `response.choices[0]` is `undefined` and a plain 429 reads as "the model returned garbage"),
-  and non-JSON bodies. It is not there to reword providers.
-- **A pool routes to fewer members than it lists.** `resolveTargets` drops targets whose declared
-  `authEnv` is unset, so a 14-member pool can resolve to 7 — and `benchmarkSort` then ranks that
-  smaller list, which is why a pool's *tenth* config entry can legitimately be the one that answers.
-  ⚠ This also excludes free providers that would serve WITHOUT a key but declare an unset `authEnv`.
-- **Offload is off by default.** An absent `routing.offload` and legacy `false` are off; the object
-  form is independently keyed by client and each rule defaults to subagents-only. Never infer
-  enabled state from the presence of a `subagents` map. Tests pin legacy and client-specific state
-  (`test/config.test.ts`, `test/offload.test.ts`).
-- **Sticky sessions are off by default and never outrank a guardrail.** `routing.sticky` accepts a
-  boolean or bounded `{enabled, ttlMs, maxSessions}` object. A pin is created only after a
-  multi-candidate route succeeds, lives only in memory, and may promote only a live member without
-  crossing a pool's degrade boundary. The only base keys are the relay-defined
-  `x-llm-relay-session` and a 16-hex first-user-message hash; `x-claude-code-agent-id` compounds
-  either but is not a base session id. Do not add plausible-looking client headers without repo
-  evidence that a supported client actually sends a session identifier.
-- **An offload rule is only ever consulted under a `clientForPath()` name** (`claude`, `codex`,
-  `openai`, `default` — `FRONT_DOOR_CLIENTS`). A rule keyed anything else ("claude-desktop" was the
-  real case) is dead config: the toggle succeeds, status shows it ON, and every request falls
-  through to the `default` rule. Creating one is therefore refused — CLI exit 1 and `POST /offload`
-  400, both via `unroutableOffloadClient()` — and the CLI must pre-check because `tryServer` treats
-  a server 400 as "no proxy" and falls back to writing the file. An already-configured dead key
-  stays visible and togglable (turning it OFF must work); status flags it ⚠ and a targeted
-  `OffloadState` carries `warning`. `test/offload.test.ts` pins the valid-name set to
-  `clientForPath` so they cannot drift apart.
-- **`freeOnly` binds RESOLVED candidates, refuses loudly, and outranks `@relay:`.** A rule with
-  `freeOnly: true` filters what `subagentSpec`-rerouted traffic may reach down to deployments
-  `assessCost()` calls `free` — enforced after pool expansion, because a pool lists free and paid
-  members side by side. `unknown` cost counts as paid (a guess must not spend money), the
-  Anthropic passthrough is never free, and nothing free resolving is a clean 503 with zero
-  egress — never a fall-through to `routing.default`, which is exactly the spend being guarded.
-  It applies to a per-call `@relay:` directive too, even with the rule disabled: the flag is the
-  owner's standing "this lane never spends money", and a subagent prompt must not outrank it.
-  A toggle (`setOffload`) must not strip rule fields it was not asked about — that was a real bug.
-  ⚠ **It also covers a DIRECTLY ADDRESSED `pool/<name>`, not just offload-rerouted traffic** (fixed
-  2026-08-08). Gating it on `subSpec !== null` meant it never ran for the case it most needed to:
-  a dispatch `cliLane` runs `claude -p --model pool/<name>`, whose requests are a MAIN conversation
-  — no subagent marker, no directive — so the free-lane traffic the flag bounds walked straight
-  past it. A `pool/` spec is by construction relay-routed free-lane traffic and never the vendor
-  passthrough, and the guard can only refuse to spend. ⚠ It now also honours what a deployment
-  STATED about itself (`isCostBlocked`), which outranks a price table calling it free — but an
-  exhausted free allowance is deliberately NOT such a fact; see the eligibility gotchas below.
-- **All-429 exhaustion serves the pool's EARLIEST `Retry-After`, and only then.** The body stays
-  the last candidate's real error (a true upstream error beats a synthesized one — same maxim as
-  the context guardrail), but when every walked candidate 429'd, the served `Retry-After` is the
-  minimum across them: the earliest reset is when the POOL next has capacity. A mixed walk (any
-  non-429 among the failures) never overrides. Both fronts, one policy
-  (`test/pool-failover.test.ts`).
-- **Pool depth is not quota independence, and membership is an ASSUMPTION until a deployment
-  corrects it.** `assessCost()` admits any unpriced model from a `tierType: "free"` provider on the
-  `provider-tier` basis — correct as a default, but it is a claim about a *roster*, and a roster
-  holds subscription-gated SKUs and models de-listed behind the scenes. Measured 2026-08-08:
-  `pool/xhigh`'s 15 members were 6 huggingface + 4 ollama-cloud + 3 nim + 2 gemini, i.e. **four
-  independent quota domains**, so failover spent 13 round-trips to discover 4 facts and the pool
-  went from serviceable to zero survivors in one step. `target-facts.ts` now records what
-  the deployments themselves stated and feeds it into pool admission and ordering. Full diagnosis
-  and probe evidence: [docs/pool-eligibility.md](docs/pool-eligibility.md).
-- **An exhausted effort band degrades to weaker MEASURED members — automatically, and never
-  silently.** Each effort pool is banded members first, then a degrade tail of everything clearing a
-  LOWER band, strongest band first. The tail is reached only after every in-band member has actually
-  failed, so a healthy pool is unaffected. When the answer comes from the tail the response carries
-  `x-llm-relay-degraded: "<spec> (below <band>)"` — automatic degradation is only acceptable because
-  it is announced; an unflagged capability downgrade is indistinguishable from getting what you
-  asked for. ⚠ **A model clearing NO band is admitted nowhere, tail included** — unassessed is not
-  weak, and sweeping it in would quietly reverse the evidence-aware admission rule. Consequence to
-  expect: every effort pool now has near-identical MEMBERSHIP and differs only in order, so
-  `{contextWindow}` converges across pools — correct, since the minimum is taken precisely because
-  failover can land anywhere, which is now more true than before.
-- **Pool order interleaves PROVIDERS within a rank band,** so the first N attempts cover N quota
-  domains instead of N members of one. Ranking by fitness alone clustered them: `pool/xhigh` opened
-  huggingface, gemini, huggingface, huggingface — three of four behind one credit balance. ⚠ Not the
-  "two ranking passes" mistake `orderByUsability` warns about: that is a REQUEST-time re-sort on
-  live health competing with deployment fitness; this runs once at materialization, is
-  deterministic, never reorders within a provider, and leaves the top-ranked candidate first. It
-  only decides who is tried second.
-- **A fact's SCOPE is part of the fact, and it comes from evidence — never from counting.** Scope
-  and storage keying kept drifting apart independently in every store that learned something: a
-  HuggingFace credit balance is stated per ACCOUNT but was rediscovered per model; a revoked key is
-  a fact about the CREDENTIAL but `credentialFaultUntil` is keyed per deployment, so every model
-  discovers the same 401 on its own clock. `target-facts.ts` makes scope explicit
-  (deployment → group → provider → model, resolved most-specific-first) so a new fact kind cannot
-  invent its own keying again. ⚠ **Never promote by inference.** "Three models on this provider
-  returned 401" is equally three gated models under a working key — the false accusation
-  `key-checker.ts` exists to avoid. A provider-scoped fact requires wording that STATES an
-  account-level condition; a bare 401/403 produces no fact at all and stays on the breaker's
-  credential axis. ⚠ **A group carries its own member list** — no registry, no prefix inference
-  (that is the heuristic `authEnv.ts` refuses), and the reviewer sees exactly which models a group
-  verdict will cover before accepting it.
-  ⚠ **Credential-scoped eviction facts now reach admission and the free-only guard per slot**
-  (2026-09-03): previous call sites in `dynamic-pools.ts` and `server.ts` hard-coded null for the
-  credential id, which hid credential-scoped eviction facts (`subscription-required`, `not-servable`)
-  because `covers()` requires `credentialId !== null`; both sites now evaluate
-  `isCostBlockedForEverySlot()` across every enabled slot.
-  ⚠ **A scope must match the SURFACE the evidence covers, not the noun the message names** (owner
-  correction, 2026-08-28). OpenRouter's `403 Key limit exceeded (weekly limit)` names the KEY, which
-  reads as a credential-scoped `allowance-exhausted`. It is not: that limit is a **SPEND** limit, so
-  its surface is the PAID subset. Measured on one credential inside one minute —
-  `cohere/north-mini-code:free` **200**, `dots-studio/dots-3-note-preview:free` **200**,
-  `deepseek/deepseek-v4-flash-0731` **403**. A credential-scoped fact would have demoted all 398
-  OpenRouter deployments, 18 of them free and answering. This is the mirror of the
-  "out of free credits is NOT paid" rule below: collapsing a paid-tier exhaustion onto the free tier
-  is the same defect facing the other way.
-  ⚠ **No SCOPE can express a dynamic cost subset** — attempt → group → deployment → credential →
-  provider → model carry no cost dimension, and a `group` member list goes stale because a provider
-  moves models between free, discounted and paid on its own schedule.
-  ⚠ **So a fact carries a COST FILTER instead, and it references the CLASSIFIER, not a list**
-  (2026-08-28). `StoredFact.costClasses` narrows a fact to `free` / `paid` / `unknown`, and
-  `factsFor(..., { costClass })` intersects it with what the CALLER resolved through `assessCost()`
-  — which reads catalog prices that refresh on a 10-minute TTL, so a model moving free → discounted
-  moves with it and no fact needs editing. Set it with
-  `llm-relay eligibility accept <n> --class … --scope … --cost-class paid`.
-  - **ABSENT means every class.** Every pre-existing row and every unwired caller behaves exactly as
-    before; only the three consumers that DEMOTE pass a class (`dynamic-pools` admission, the
-    `freeOnly` guard, and `cooledByAllowance` via the `costClassOf` resolver threaded like
-    `quotaDemotion`).
-  - ⚠ **A filtered fact matches NOTHING when the caller supplies no class.** A filter is a claim
-    about a subset; a caller that cannot say which subset it is in has not shown the fact applies.
-    Declining costs one walked request the breaker learns from — demoting a healthy free deployment
-    on an unproven classification does not recover as cheaply.
-  - ⚠ An EMPTY filter is dropped at load (it would bound nothing while looking like it does — the
-    `configured-limits` precedent), and a filter containing an unrecognised class is dropped WHOLE,
-    never per-entry: a partially-understood filter would cover a different subset than the reviewer
-    accepted. Neither ever fails the load.
-  - ⚠ `target-facts.ts` takes a type-and-const import from `metadata.ts` (which has no imports, so
-    no cycle) and **must never call `assessCost` itself** — the class is passed in, exactly as
-    `availability.ts` is handed the facts it reasons over.
-  - ⚠ Every narrowing flag must appear in `eligibilityAcceptCommand` AND in `VALUE_FLAGS`. The
-    propose output is copy-pasted, so a flag it omits is silently WIDENED at accept time; and a
-    value-taking flag missing from `VALUE_FLAGS` puts its value in command position, which the
-    arity guard then rejects. Both were caught during development, by review and by the guard.
-    ⚠ And it means EVERY call site: the STATUS listing's "accept with:" line dropped `costClasses`
-    from the flag's introduction (v0.52.0, `7412435`) until 2026-08-28, so a later `llm-relay
-    eligibility` printed a command wider than the proposal it echoed. Two different halves, two
-    different releases: v0.55.2 fixed `acceptInterpretation`'s store persistence and never touched
-    `cli.ts`; the listing display half closed with the digest work. Pinned by the listing test in
-    `test/cli.test.ts`. (The `3d2fcee` commit message misattributes the miss to v0.55.2 — the
-    independent closeout auditor corrected the history; this paragraph is the corrected record.)
-  - ⚠ **Accept is digest-keyed (2026-08-28).** The queue is addressed by list position for typing
-    convenience, but positions SHIFT between invocations (the sort is count-then-recency), and an
-    index-only accept landed a verdict on the wrong refusal twice. Every printed
-    propose/accept command now carries `--sig <digest>` (`signatureDigest` — ten hex chars of
-    SHA-256 over the signature), the listing prints each item's digest, and when `--sig` is
-    present it is AUTHORITATIVE: the entry is resolved by digest, a stale index is corrected with
-    a stderr note, an unknown digest exits 1 touching nothing. The bare index stays valid for
-    hand-typed use against a fresh listing.
-- **The breaker and the fact store COMPOSE; neither replaces the other.** Per-deployment behaviour
-  (back-pressure, timeouts, an entitlement wall on one model) stays on the breaker. Only what a
-  backend *states* about a wider scope becomes a fact: `rate-limited` fires on a 429 naming the
-  account/organization/key and an ordinary 429 produces nothing, because matching plain throttling
-  would demote whole providers on routine back-pressure. ⚠ **A proven credential clears its own
-  symptoms**: `clearFacts` returns the provider-scoped kinds it disproved, and a disproved
-  `credential-invalid` drops that provider's per-deployment credential faults together — otherwise
-  a key rotation recovers one model per expiry. Only on a disproved *stated* fact, never on any
-  success: clearing bare 403s whenever a sibling succeeds re-tries gated models forever.
-- **⚠ "Out of free credits" is NOT "paid", and collapsing the two is the defect to avoid here.**
-  A free-tier account that has spent this period's allowance is the normal state of a working free
-  lane. `allowance-exhausted` therefore demotes (a cooldown that expires on its own, cleared by any
-  success) and is structurally unable to reach the cost path: `isCostBlocked()` excludes it, only
-  `cooldownUntil()` reports it. If it could evict, the eviction would outlive the exhaustion that
-  caused it. Only `subscription-required` and `not-servable` remove a deployment from a pool.
-- **A status code does not carry its meaning — 403 alone is at least four different facts** (revoked
-  key, plan gating, license/region gating, policy refusal), distinguished only by vendor-invented
-  wording. So interpretation is a **lookup, never an inference**, on the request path: signature →
-  confirmed table, and a **miss learns nothing** (same fail-safe as `context-limits.ts`) while
-  queuing the message for offline research. ⚠ **Do not move that research inline.** The repair
-  boundary at the top of this file governs it: an LLM may author the interpretation data, the
-  request path only ever reads it, and a researched verdict binds only after `llm-relay eligibility
-  accept`. Signatures are keyed per (provider, model, message) so a verdict cannot leak to a
-  sibling SKU. ⚠ **An interpretation carries the whole RULE, not a label**: class, scope, and a
-  `reset` saying when the condition clears (`field` = a JSON key in the message, preferred because
-  it is re-read from every real response; `fixed` = a reviewer-asserted window, ranked below
-  anything the response states). Without it, learning what a message MEANS still left the relay
-  re-probing on a TTL it invented. ⚠ **`SEED_INTERPRETATIONS` is a bootstrap, not the mechanism** —
-  adding a seed per unfamiliar message means the author learned and the relay did not. ⚠ **A quota
-  is not a rate limit**: `rate-limited` is throughput and cools 2 minutes; a 5-hourly/weekly/monthly
-  allowance is `allowance-exhausted` (still free, just spent). 0.28.0's rate-limit pattern matched
-  the word "quota" and cooled spent quotas for 2 minutes. **The queue is PUSHED, not polled** — a failure carrying uninterpretable refusals
-  returns `x-llm-relay-unknown-refusal: <n>` and the skill makes checking it the reflex on a pool
-  failure, because a queue nobody opens is a backlog. The dispatcher may `propose`; only the user
-  may `accept`. ⚠ Error bodies are untrusted external content and an agent reading them is an
-  injection target — the containment is that a proposal is a CLOSED enum on both axes (`--class`
-  validated against `FACT_KINDS` itself, `--scope` against the six of `SCOPE_PRECEDENCE`; the class
-  list is derived from the store rather than hand-listed, because a kind the store accepts and the
-  CLI rejects is invisible until somebody tries it — `rate-limited` shipped exactly that way), that
-  signatures are keyed per (provider, model) so one provider can never produce a verdict about
-  another, and that the header carries a COUNT, never the message. A `group` scope must also NAME
-  its members. Don't trade any of those for convenience.
-- **⚠ Never `res.clone()` a backend response on the failover path.** `clone()` tees the body and the
-  failover branch cancels the original, so the un-read branch strands the walk and the client gets
-  the FIRST candidate's error with the rest of the pool untouched. Read the body where it is already
-  being discarded (`discardCandidate()`) or already buffered (the terminal error branches).
-  `observeContextLimit` still clones — it is confined to 400/413 and has not been observed to bite,
-  but it is the same hazard; don't copy the pattern into a new call site. Three pre-existing 402
-  tests caught this, which is what the ≥2-candidate rule in `test/pool-failover.test.ts` is for.
-  ⚠ The learned stores are process-global: reset them per test (`resetFacts` /
-  `resetInterpretations`) like the breaker, or one test's refusal demotes another's first candidate.
-- **The served-response announcement set has ONE owner, and it did not before (2026-08-27).**
-  Both fronts assembled it by hand and the two copies had drifted twice, in ways nobody had
-  recorded. `x-llm-relay-served-by` was written only below 400 by `responseHeadersForTarget`, so
-  the Anthropic front carried NOTHING on a terminal upstream error while the OpenAI front supplied
-  the tried-list — contradicting both the header's own declaration ("when every candidate fails it
-  carries the list that was tried instead") and `docs/reference.md`. And
-  `x-llm-relay-unknown-refusal` was computed by the OpenAI front only inside its `status >= 400`
-  branch, so a walk that met an uninterpretable refusal and then SUCCEEDED reported nothing —
-  defeating the header's whole purpose, which is to push the eligibility queue at the moment it
-  matters. `ServedAnnouncementContext` is now what both fronts build. It is deliberately a narrow
-  structural type, not `Ctx`: the OpenAI front has no `Ctx`, and widening it would let a caller
-  omit `credentialHeaders` and silently lose the per-attempt credential attribution.
-  ⚠ Adopting it moved the OpenAI front's credential pair AFTER the degraded/quota/paid writes,
-  because that is the Anthropic front's long-standing order. No value moves — every name in the
-  set is a distinct `x-llm-relay-*` constant — and one owner means one order; don't "restore" the
-  old order on one front.
-  ⚠ SCOPE: this is the ordinary SERVED response only. `walkExitHeaders` owns terminal transport
-  and post-header exits, `respondAllCapped` owns the local all-capped 429, and `HARD_CAP_HEADER`
-  never rides a served response. The two RECORDED deliberate residues — the transport-exit
-  `servedBy` omission and the two dead-stream liveness spellings — are untouched.
-- **A pool's error is one member's error, so the walk is reported alongside it.** Every walk of ≥2
-  candidates carries `x-llm-relay-pool-attempts: "13 tried, 0 served: 4x402, 5x429, 3x403, 1x400"`
-  on BOTH fronts, successes included. A header, never a rewritten body — the served body stays the
-  last candidate's real upstream error, same maxim as the context guardrail. A single-candidate walk
-  emits nothing: the response already IS the walk.
-- **Don't add a blended "best target" score to `candidates.ts`.** The dimensions are deliberately
-  separate; averaging them buries the judgement the reader is there to make. Tests assert no
-  `score`/`rank` field, that every source keeps its own key under `scores`, and that the one
-  scalar (`sortInputs.strength` — which exists only because pool ordering needs an order) never
-  travels without `strengthBasis` + `strengthSignals`.
-- **Limits and prices are per-(provider, model).** The same model id on two providers is two
-  deployments — different context ceilings, different output caps, free on one and metered on the
-  other. Never present one provider's figure as another's: resolve through `resolveMetadata()` and
-  keep the `provider` / `reference` label. Tests in `test/metadata.test.ts` pin this, including that
-  an unknown limit or price stays **null** instead of being guessed.
-- ⚠⚠ **AMENDED 2026-09-01 — the guardrail now has TWO rungs, and this paragraph described one.**
-  `contextCeilingFor` in `server.ts` reads a relay-LEARNED ceiling FIRST (`observedContextLimit` — a
-  `context-limit` fact recorded when this exact deployment stated its own maximum while refusing an
-  over-length request), and falls back to the published figure. The change arrived unreviewed inside
-  the `server.ts` decomposition; it is kept because the learned rung is FIRST-PARTY evidence about
-  the exact deployment, which is the same standing `contextWindowResolver` already gives it, and the
-  paragraph's own stated reason — "a 400 invented from a number we made up" — does not describe a
-  number the provider itself stated. Everything else below still binds: no third rung, unknown still
-  means NO guardrail. ⚠ The refusal body now NAMES the rung; it claimed the provider "publishes" the
-  limit whatever its source until this date, which reports a measurement as a publication.
-  ⚠ Two residual costs, stated rather than hidden: a learned fact carries a 30-day TTL, so a
-  provider that RAISES its ceiling keeps losing that candidate from the walk until the fact expires;
-  and the refusal is now reachable where the request previously went upstream. Pinned by
-  `test/context-ceiling.test.ts`.
-- **The context guardrail fires only on a limit the SERVING provider published.** Unknown limit ⇒
-  no guardrail; the request goes upstream and the backend returns its own authoritative error. It
-  reads `catalog.cachedLimits()`, which never fetches — a cold cache degrades to "no guardrail",
-  never to a blocking round-trip on the request path. Don't reintroduce a fallback ceiling: a 400
-  invented from a number we made up is worse than a true upstream error. **It covers the OpenAI
-  front too (0.17.0)** — before that it was gated to `/v1/messages`, so Chat/Responses requests
-  reached backends with no context pre-check while a test comment in `test/openai-front.test.ts`
-  claimed otherwise (same "two paths, one policy empty" shape as the pool-failover incident).
-- **Capability data is synced, never typed.** Add a source by writing a fetcher in
-  `scripts/sync-tiers.mjs`, not a row in `BENCHMARK_DB`. Sources are independently failable — one
-  dead endpoint must not cost the others — but **schema drift inside a source still throws** (a
-  renamed column is corruption, not absence). Zero working sources is fatal. Coverage probe results
-  and the reasons three sources were rejected: [docs/capability-sources.md](docs/capability-sources.md).
-- **A source's absence is not a low score.** Models are never penalised for signals nobody
-  publishes; `signal_count` travels with the score instead, so a 1-source guess and a 5-source
-  consensus are distinguishable. Don't "fix" a sparse row by defaulting it to zero.
-- **⚠ Never pin a REAL model's band membership in a test — inject the tier rows.** Effort floors are
-  calibrated against the whole synced population, so a model's band moves when the population does,
-  with no change to that model's own evidence: `kimi-k2.6` drifted 0.794 → 0.799 on a routine
-  `npm run sync:tiers` (same two sources, same four signals), crossed into `xhigh`, and emptied the
-  degrade tail that `test/dynamic-pools.test.ts` exists to assert. The behaviour was correct and the
-  test was right to exist — the *fixture* was live data, so `sync:tiers` could turn the gate red for
-  a reason unrelated to any code change. `materializeDynamicPools` takes an optional `tierData` for
-  exactly this; production passes nothing and reads the snapshot as before.
-- **A host whose traffic never reaches the relay cannot be detected by the relay.** Every
-  subagent-reroute mechanism (`routing.subagents`, an `@relay:` directive, a `freeOnly` rule)
-  works by answering an HTTP request differently, so it needs the request to arrive. From Claude
-  Desktop it never does — the launcher pins `ANTHROPIC_BASE_URL` and beats the `settings.json`
-  `env` block (that block's *other* keys still land; only this one is managed). There is therefore
-  no request to classify, and `process.env` inside the **server** describes a process launched at
-  logon, not whoever is asking. Detection lives in `host-routing.ts`, runs in the **CLI**, and is
-  forwarded as `?host=`; `buildDispatch` takes it as an argument and must never sniff for it.
-  Absent ⇒ `unknown` ⇒ exactly the pre-existing behaviour.
-- **On a bypassed host, `requiresDirective` is never set and relay rungs are transposed.** The
-  directive hint is true advice under a routed host and *false* advice under a bypassed one, where
-  the `@relay:` line reaches the model as literal prompt text — a hint that cannot work is worse
-  than none, because the host acts on it and believes it offloaded. A `relay` rung needing the
-  reroute path is instead rendered as a CLI invoke from `routing.cliLane`. **Placeholder rules are
-  a security boundary, not a convenience:** `{spec}` and `{contextWindow}` are relay-resolved
-  configuration and are substituted in args AND env; `{task}` is request content and is substituted
-  in args ONLY — config load *rejects* it in an env value, because it would otherwise pass through
-  literally while the operator believed it worked.
-  ⚠ **Never put `--permission-mode plan` in a `cliLane` template.** Headless `claude -p` has no
-  `ExitPlanMode` tool, so a lane started in plan mode can never leave it: the agent explores with
-  its tools, writes a plan document into the config dir's `plans/`, and exits `is_error: false`
-  with `permission_denials: []`. Nothing in the result distinguishes "did the work" from "was
-  caged", so the lane looks healthy while completing none of its tasks — this machine's template
-  shipped that way and it read as "offload can't use tools". Tool use and the multi-turn loop were
-  never the problem. Use `acceptEdits` (plus `--allowedTools`, since other shell and network calls
-  still abort without it) for a working lane, or `dontAsk` for a read-only one that fails loudly
-  instead of silently. Measured evidence and the alternatives others use:
-  [docs/offload-agentic-capability.md](docs/offload-agentic-capability.md).
-  ⚠ **A lane child needs the client idle watchdogs raised, or a long think kills it.** Claude Code
-  has three CLIENT-side idle timers (event-level + byte-level streaming watchdogs and a body idle
-  timeout) that abort a silent generation at ~300 s on a custom base URL — and the relay's commit
-  probe (`stream-commit.ts`) holds bytes until meaningful content, so a long think IS silent to
-  them. The owner's `routing.cliLane.env` therefore sets
-  `CLAUDE_STREAM_IDLE_TIMEOUT_MS=1800000`, `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS=1800000` and
-  `API_FORCE_IDLE_TIMEOUT=0`; put the same three in any hand-written `cli` rung's `env`.
-  **`{contextWindow}` has THREE rungs, all real measurements** (`contextWindowResolver` in
-  `metadata.ts`): a ceiling this deployment *stated when refusing an over-length request*
-  (`context-limits.ts`), then its own published `contextLength`, then `context_length` from the
-  synced snapshot for the same model id. There is no guessed rung, same as `resolveMetadata`.
-  ⚠ The learning loop is wired into **both** request paths beside `observeAttemptHeaders` — a loop
-  running on one front only would silently know nothing about half the traffic, which is the exact
-  shape of the pool-failover incident. It reads a CLONE, so the client's body and failover are
-  untouched, and it never throws.
-  ⚠ **A pool member that resolves to nothing does NOT veto the pool** — the minimum over members
-  that DO resolve is used, with `contextWindowUnknownMembers` reporting the gap. The original
-  all-or-nothing rule let one model (`Qwen3-235B-A22B-Instruct-2507`) blank three of four pools
-  while 28/29, 38/41 and 44/49 members resolved. A pool is a ROUTING construct; membership says
-  nothing about a member's window, so "no data on one model" must not read as "nothing known about
-  this pool". The residual risk is exactly what the observed rung closes.
-  ⚠ Rung 2 is load-bearing, not a nicety: free providers publish almost nothing (NIM publishes
-  none), so rung 1 alone covered 0 of 29 `pool/high` members while the snapshot covered 28 of 29
-  (measured 2026-08-07). ⚠ **Fuzzy snapshot matches are rejected here** even though
-  `findTierModel` offers them — a borrowed SKU's *score* mis-ranks a pool, a borrowed SKU's
-  *context window* tells a client it may send tokens the backend will reject. A pool needs every
-  member to resolve and uses the MINIMUM (failover can land anywhere), so one unresolvable model
-  blocks a whole pool. Unknown ⇒ the entry is dropped, not emptied.
-  ⚠ **Never "fix" an unknown with a large speculative value.** Measured pool minimums here are
-  131,072–163,840 — *below* the 200k the `claude` CLI already assumes — so a speculative 1M would
-  overshoot the weakest member eightfold. Same reasoning as "the context guardrail fires only on a
-  limit the serving provider published": a number nobody published is worse than no number.
-  ⚠ `buildDispatch`'s LOCAL path must materialize dynamic pools first (`runDispatch` does). Until
-  materialized a `{ include: "free" }` pool has zero members, so it resolved to no window while the
-  same query against the running proxy resolved one — the fallback may know less about live state,
-  never about configuration. ⚠ **A rung pointing at the caller's own vendor passthrough
-  is NOT transposed** — an `anthropic`-kind provider with no `authEnv` is reachable as a plain
-  `Agent(...)` from anywhere, and that rung *means* "spend primary quota". With no template
-  configured the rung is marked `unreachable` and skipped when picking `next`; an explicit
-  `?lane=` still reaches it and says why it is blocked.
-- **The Agent hook is the DELIVERY of `offload claude on`, not a separate feature — so it must
-  track the setting in both directions.** `offload claude off` removes it. A forcing function that
-  outlived the rule justifying it would deny subagents nobody asked to redirect. It appends a new
-  matcher rather than editing the array (users run their own `Agent` hooks; Claude Code runs every
-  match), and it fails **open** everywhere: a hook that denied subagents because the proxy was down
-  would turn one unavailable optional lane into a total outage — same reasoning as an unset
-  `${ENV}` disabling one provider instead of aborting startup.
-- **A host with no subagent mechanism must be handed a COMMAND, and `unknown` is such a host
-  (fixed 2026-08-30).** `host-routing.ts` defines three states and says what `unknown` means in as
-  many words — *"not running inside a Claude Code session — no subagent routing to adapt to"*. But
-  `dispatch.ts` gated transposition on `host === "bypassed"` alone, so `unknown` fell through with
-  `routed`: a headless caller (a cron job, a CI step, `run-headless.ps1`) was handed a `target:`
-  spec to address as a subagent it does not have, and `--next-command` then refused with exit 2 and
-  left it nothing to run at all. That is the closed-vocabulary defect class above — an unhandled
-  member resolving to the STRONGER claim ("you can reach this") — and it reproduced with **zero
-  flags** in any shell without `CLAUDECODE`. The policy now lives in two named predicates plus one
-  reason function (`canAddressAsSubagent`, `mustTransposeEveryRung`, and `unreachableReason`, which
-  returns a string). ⚠ For `unknown` EVERY
-  relay rung is transposed, the plain Anthropic passthrough included — `reachableWithoutRelay` asks
-  whether a bare `Agent(...)` reaches a spec, and there is no `Agent(...)` here at all. ⚠ An
-  **absent** verdict is deliberately NOT `unknown`: `buildDispatch` collapses absent into
-  `"unknown"` for the rendered view, so the lane builder takes `opts.host` directly and a caller
-  that stated nothing keeps the pre-existing path. ⚠ The fix is SERVER-side, so a live host keeps
-  the old answer until the relay restarts onto it — the CLI asks the running relay over HTTP.
-  Evidence, the three adversarial reviews and the MCP verdict:
-  [docs/history/skill-dispatch-mcp-verification-2026-08-30.md](docs/history/skill-dispatch-mcp-verification-2026-08-30.md).
-- **⚠ THE MCP VERDICT IS REVERSED (owner decision, 2026-08-30 — later the same day).** The
-  paragraph below stated its own reversal condition in as many words, and the owner then stated
-  it: **agy must be able to DELEGATE, not only be delegated to.** So an MCP server is now WANTED,
-  and the backlog carries the work item. Everything below stays on the record and stays binding on
-  the DESIGN — the two invalid objections must not be repeated, and the four real design
-  constraints (an inert `dispatch()` on a stranger's install, a read tool duplicating `/dispatch`,
-  a caller-supplied `cwd`, no representation for a 30-minute lane) are unsolved, not withdrawn.
-  ⚠ **RETRACTED, same day, by the owner: agy's missing shell is NOT a security boundary and must
-  never be cited as one.** This paragraph first said to carry a security cost forward "because the
-  owner accepted it knowingly" — that was false. Owner correction 2026-08-30: *"some agent ordained
-  that AGY had certain limitations, that it did not have, that I didn't want"*. The 2026-08-11
-  `command(*)` revocation was an AGENT's act, and the global `CLAUDE.md` phrase "the accepted cost"
-  describes an acceptance no file history shows. So do not argue that an MCP server "reaches around
-  a deliberate revocation through a side door" — the premise does not hold. Design the server on
-  its own merits, and treat restoring agy's shell as a separate one-line change that needs explicit
-  owner instruction. ⚠ The general lesson is the one this file already teaches about provenance:
-  an agent-imposed limitation recorded in prose reads, three days later, exactly like an
-  owner-chosen policy. Say who decided, or do not call it a decision.
-  ⚠ **A related question was closed the OTHER way in the same decision:** `DEFAULT_CONFIG_TEMPLATE`
-  will NOT ship a `routing.ladder` or a `cliLane` (owner decision 2026-08-30, D2). Dispatch is
-  deliberately a per-machine feature, so **stop measuring dispatch work against rubric test 1** —
-  a stranger's install having no ladder is now a stated design choice, not a gap to close.
-- **Do NOT build an MCP server (assessed fresh 2026-08-30, owner-directed — SUPERSEDED above,
-  kept for its reasoning).** The 2026-08-16
-  ledger rejection was re-opened and re-argued from scratch; two of the obvious objections are
-  INVALID and should not be repeated — a minimal JSON-RPC-over-stdio server needs **no** new
-  dependency (this repo hand-rolls `sse-frames.ts` and four SSE parsers already), and `packBytes`
-  is a regenerable CEILING, not a size wall. The real reasons: a fresh install ships **no**
-  `routing.ladder` and no `cliLane` (`DEFAULT_CONFIG_TEMPLATE`, `config.example.json` and
-  `onboarding.ts` all have zero), so a `dispatch()` tool would do nothing for anyone but this
-  machine and fails rubric test 1; a tool that RETURNS a command is a read tool duplicating
-  `/dispatch`; and a tool that EXECUTES needs a caller-supplied `cwd`, escapes the harness's
-  permission gate, has no representation for a 30-minute lane, and is precisely the "future async
-  spawn site" the quota-reprobe design warned about. ⚠ The strongest argument FOR it is real and
-  recorded: **agy has no shell but does have `mcp(*)`**, so an agy session has zero delegation
-  mechanisms today. That reverses this verdict if the owner states agy must be able to DELEGATE
-  rather than only be delegated to. Reversal conditions are listed in the doc §4.3.
-- **The dispatch ladder decides ORDER; the REQUEST PATH never executes a lane.** `routing.ladder`
-  may name agent CLIs (`kind: "cli"`), and no lane command is ever spawned to answer an HTTP
-  turn: a lane's quota is client-bound, it runs its own tool loop, and it returns only final
-  text — so a relay that shelled out mid-request could never return the `tool_use` blocks the
-  turn owes its caller. `/dispatch` hands the host a command; the host runs it.
-  ⚠ **Owner-amended 2026-08-29** ([docs/history/quota-reprobe-design-2026-08-29.md](docs/history/quota-reprobe-design-2026-08-29.md)):
-  outside the request path there are exactly TWO lane-spawn sites — the operator CLI probe
-  (`lanes --probe`) and the background lane cadence (`lane-cadence.ts`), because keeping lane
-  metadata fresh and re-testing recorded quota deaths is the relay's own job, exactly as the
-  ping loop already does for HTTP. ⚠ The cadence hook fires only from `PingLoop.start()`'s OWN
-  loop iteration, never from `tickOnce` — the admitted `GET /ping` route calls `tickOnce`
-  directly, and a hook there let an HTTP request initiate lane work (caught by the 2026-08-30
-  closeout audit; pinned in `test/ping.test.ts`). The old flat sentence "the relay never spawns one" narrowed
-  to the request path; every reason behind it binds there and survives intact. Exhaustion state
-  is durable now (`dispatch-exhaustion-persistence.ts`), and a recorded death is re-probed on
-  the `routing.laneProbe` cadence until a real answer retracts it or it expires — no lane stays
-  parked on a stale record.
-- **Never use `routing.tiers` as an accidental subagent switch.** A subagent asking for `haiku` and a
-  human picking Haiku are byte-identical requests. Keep the destination map in `routing.subagents`
-  and use the originating client's explicit `routing.offload` scope; `scope: "all"` is the deliberate
-  choice when a full conversation should move too. Full reasoning: [docs/subagent-routing.md](docs/subagent-routing.md).
-- **The OUTBOUND body is the caller's conversation — never a stringified block the mapper did not
-  understand.** For three releases every `openai`-kind agentic request carried llm-bridge's own IR
-  envelope (`{"_original":{"provider":"anthropic",…},"tool_call":…}`) as `{type:"text"}` parts,
-  because `universalToOpenAI` has no case for `tool_call`/`tool_result` and falls through to
-  `JSON.stringify`. Models learned the notation in-context and echoed it back as their final
-  answer; prompts inflated ~3.1×, tool results triplicated, and `tool_calls` shipped with no
-  `role:"tool"` message to answer them. The request direction is now `openai-request.ts` and an
-  unrepresentable block is a clean 400. ⚠ **Do not "also" fix it on the response side** — no JSON
-  marker belongs in `DIALECT_MARKERS`: an arbitrary JSON object is not a closed envelope, and
-  promoting one to a `tool_use` is the fabricated intent `tool-dialects.ts` forbids. ⚠ The mapper
-  runs once **per candidate**, so an outbound-shape test with one candidate proves nothing —
-  `test/pool-failover.test.ts` walks ≥2. Diagnosis and the `toolu_*` tell:
-  [docs/tool-call-dialect-leak.md](docs/tool-call-dialect-leak.md) §"Second mechanism".
-  ⚠ **The Responses front had the same defect by a different route, fixed 2026-08-23**
-  (`responses-request.ts`): llm-bridge's `openaiResponsesToUniversal` dropped the assistant's
-  `function_call` and stringified its `output_text`, so a Codex multi-turn tool conversation was
-  broken past the first call on BOTH backend kinds. Same rule, same refusal policy — and the same
-  ≥2-candidate requirement, since that mapper also runs per candidate.
-- **A weak host's REPEATED tool-call ids kill Claude Code sessions — the relay mints unique ones at
-  the translation seam.** `nim/moonshotai/kimi-k3` emits OpenAI `tool_calls[].id` values of the form
-  `<ToolName>:<index in this response>` (`Read:0`, `Bash:0`), so the same id recurs on every turn
-  that calls that tool again. Claude Code normalizes the conversation while BUILDING every request:
-  it keeps a Set of seen `tool_use` ids, DROPS any repeat, substitutes `[Tool use interrupted]` when
-  that empties an assistant turn, and patches the orphaned `tool_result`s. So the model stops seeing
-  its own earlier calls (the "weak agentic loop" on kimi lanes — re-reading the same file, `No
-  response requested.`), and eventually the fresh turn is emptied and a headless `claude -p` run
-  ends with nothing to execute. `src/tool-use-ids.ts` mints `<id>_relay<k>` for a colliding id at the
-  openai-kind seam in `backend.ts` — buffered and streamed, after dialect recovery, before anything
-  that watches for the first `tool_use`. Announced as `x-llm-relay-tool-use-ids: "<n> rewritten"`
-  (buffered only — a stream's headers precede its first tool call) and as the `toolUseIdRewrites`
-  log counter, a count and never an id. ⚠ **No reverse map exists, by construction**: the client
-  echoes the minted id back in both the `tool_use` and the `tool_result`, and `openai-request.ts`
-  forwards both verbatim, so the backend sees a consistent pair with the relay remembering nothing.
-  ⚠ Confined to the TRANSLATED path — a native Anthropic response stays byte-exact, and the OpenAI
-  front's direct Chat passthrough (openai-kind + Chat) is left alone (different client, and
-  byte-exactness is the point). Every OTHER front combination runs through `fetchBackend`, so a
-  Codex `/v1/responses` turn on an openai-kind target DOES get the mint — and therefore owes the
-  same two announcements: the front forwards `x-llm-relay-tool-use-ids` across its rebuild and its
-  served log record carries `toolUseIdRewrites`.
-  Diagnostic tell: `[Tool use interrupted]` as the final assistant text of a headless run, with
-  `Read:0`-style ids repeating in the transcript.
-- **Mistral REFUSES every tool-call id this relay forwards — the outbound rewrite is opt-out, not
-  opt-in.** First-party, `mistral-medium-2505`: HTTP 400 `{"object":"error","message":"Tool call id
-  was toolu_01AAAAAAAAAAAAAAAAAAAAAA but must be a-z, A-Z, 0-9, with a length of 9.",
-  "type":"invalid_function_call","code":"3280"}`. `mistral-common` enforces `^[a-zA-Z0-9]{9}$` on
-  BOTH the assistant `tool_calls[].id` and the answering `tool_call_id`, and from v13 also LINKAGE
-  (a tool message must answer an id a prior assistant turn called) and UNIQUENESS. Every shape that
-  reaches the mapper violates it: `toolu_01…` (Anthropic), `Read:0` (nim kimi-k3), `Read:0_relay1`
-  (relay-minted), `call_…` (Codex), `tu_recovered_0` (dialect rescue). So `providers.<name>.compat`
-  carries `toolCallIds: "preserve" | "strict9"`, and its ABSENCE resolves through a **labelled
-  provider fact**: a `*.mistral.ai` base host ⇒ `strict9`, everything else ⇒ `preserve`. That is the
-  "Provider knowledge is data, not routing configuration" invariant's allowance — a fact in `src`
-  is legal only because config overrides it, and an explicit value wins in **both** directions
-  (`preserve` on mistral, `strict9` on anything else). ⚠ Resolved at TARGET-resolution time onto
-  `ResolvedTarget.toolCallIds`: the mapper gets a mode, never a provider name to sniff, so a
-  hand-built target with no mode behaves exactly as it did before this existed. ⚠ The rewrite is
-  **deterministic** (SHA-256 → base62, 9 chars; `#k` suffix on collision, first-appearance order) —
-  the `tool-use-ids.ts` precedent, and load-bearing here because a conversation only appends: a
-  random id would detach a `tool_result` from its call the moment the turn was replayed, retried,
-  or sent to a second failover candidate. An already-conforming id is kept, so a mistral-native id
-  round-trips. ⚠ Announced, like every other automatic fix on this path: `x-llm-relay-tool-call-ids:
-  "<n> rewritten"` plus the `toolCallIdRewrites` log counter — a COUNT, never an id — and unlike the
-  response-direction mint the header rides a STREAM too, because the figure is final before egress.
-  ⚠ An unknown `compat` key or value is a HARD config-load error naming it (the `configured-limits`
-  precedent): an ignored typo would read as a declaration that took effect while the wire was
-  unchanged. ⚠ The transform is a pure function of (caller body, that candidate's resolved compat),
-  so a pool walk can legitimately send DIFFERENT ids to different candidates — the
-  `test/pool-failover.test.ts` "same translation both times" assertion is scoped to a same-compat
-  fixture and stays true.
-  ⚠ **SCOPE — `compat` shapes only request bodies the RELAY AUTHORS, and that is a decision, not a
-  gap.** Both keys hang off `anthropicRequestToOpenAi`, so they reach the TRANSLATED lanes (an
-  Anthropic `/v1/messages` request to an `openai`-kind target, and a `/v1/responses` request doing
-  the same via `responses-request.ts` → this mapper). The OpenAI front's **direct Chat passthrough**
-  — `openai`-kind target + `chat` protocol, `backend.ts` `fetchOpenAiFront`'s first branch — posts
-  `{...base, model, stream}`, i.e. the caller's own body, and never enters the mapper; a declared
-  compat mode is therefore **inert there BY DESIGN**. Do not read that as the "two paths, one policy
-  empty" defect shape and go "finish" it: this is the same deliberate asymmetry as the
-  response-direction id mint, and the reason is that responsibility tracks AUTHORSHIP. An
-  OpenAI-native client wrote its own ids into its own body and gets mistral's 400 verbatim, which is
-  its to fix and which byte-exactness exists to preserve; on a translated lane the client cannot fix
-  what the relay wrote. State this whenever the question comes up rather than re-deriving it.
-- **Gemini 3.x REFUSES a replayed tool call that carries no `thought_signature`, and the relay
-  stamps Google's own opt-out token rather than inventing or storing one.** First-party,
-  `models/gemini-3.6-flash` via the OpenAI-compatible endpoint on
-  `generativelanguage.googleapis.com`: replaying an assistant `tool_calls` turn answers HTTP 400
-  *"Function call is missing a thought_signature in functionCall parts…"*. Google's documented
-  escape is the **raw string** `skip_thought_signature_validator` at
-  `tool_calls[N].extra_content.google.thought_signature` — never base64-encoded, which would make
-  it a malformed signature instead of the opt-out. So `compat` carries a SECOND key,
-  `thoughtSignature: "none" | "sentinel"`, on the identical mechanism: absence resolves through
-  `resolveThoughtSignatureMode()` from the same **labelled provider fact** allowance — base host
-  `generativelanguage.googleapis.com` ⇒ `sentinel`, everything else ⇒ `none`, explicit config wins
-  both directions — onto `ResolvedTarget.thoughtSignature`. ⚠ The host test is that ONE exact host,
-  not `*.googleapis.com`: Vertex is a different product with a different validator.
-  ⚠ **EVERY entry of a replayed turn is stamped**, not just the first. Verified live 2026-08-23:
-  the sentinel on a single call → 200 and a correct tool-informed answer; on BOTH entries of a
-  parallel pair → 200 (which contradicts a public report that a parallel pair rejects it); and on
-  only the first of a pair → also 200. Every-entry is the placement whose correctness does not
-  depend on which entry the validator inspects. ⚠ **Echoing the REAL signature was rejected, and
-  the reasons are invariants**: it would need either a conversation store keyed by tool-call id
-  holding vendor-private reasoning between turns — the reverse map `tool-use-ids.ts` deliberately
-  does NOT have ("no reverse map, by construction") — or a fabricated `thinking` block smuggled
-  into the caller's conversation, which would poison every anthropic-kind failover candidate with
-  content the caller never wrote. And there is no real signature in hand anyway: this mapper DROPS
-  `thinking`/`redacted_thinking` cross-vendor by rule, the same rule under which "a guessed
-  `reasoning_effort` would be an invention". The sentinel is the vendor's own token for "no
-  signature available" — a labelled parameter quirk, not an invented measurement — and it is
-  config-overridable, which is the condition the "Provider knowledge is data" invariant attaches.
-  ⚠ **No response header for this one**, deliberately, and it is the one asymmetry with
-  `toolCallIds`: the sentinel is vendor-protocol padding on the relay's OWN outbound shape and
-  alters nothing about the caller's data, so there is nothing a client could act on. It is still
-  counted — `thoughtSignatureSentinels` on the `LOG_FIELDS` allow-list, a COUNT and never a
-  signature — so the operator can see it fired. ⚠ Under `"none"` (everyone else) the outbound bytes
-  are byte-identical to before this existed, and the RESPONSE direction is untouched: nothing
-  captures `extra_content`, no store exists. ⚠ The authored-bodies SCOPE in the mistral gotcha above
-  governs this key too — the direct Chat passthrough is never stamped, deliberately.
-  ⚠ **RESIDUAL, stated so nobody mistakes it for verified: the default is HOST-scoped while the
-  evidence is MODEL-scoped.** First-party verification covered `models/gemini-3.6-flash` only, but
-  `resolveThoughtSignatureMode()` defaults the whole `generativelanguage.googleapis.com` host to
-  `sentinel`, so every gemini model routed through that base — 2.5-era included — gets the field.
-  Google's `extra_content` is an ENDPOINT-level extension of the OpenAI-compatible layer, so a model
-  whose validator does not ask for a signature is expected to ignore it; that expectation is
-  UNTESTED here. If a 2.5-era (or any other) model on that host starts 400ing on the extra field,
-  the escape hatch is per-provider config, not a code change:
-  `compat: { "thoughtSignature": "none" }` — which is precisely why the labelled fact is allowed to
-  live in `src` at all. Narrowing the default to a model-id test would need first-party evidence per
-  model, and inventing that test without it would be the guess the fact rule forbids.
+**Optional failure is not a total outage.** An unset variable in an optional provider base disables
+that provider with warnings. References to never-declared providers are errors; losing all usable
+providers or a required route can still be fatal. Preserve unknown fields when editing config,
+validate the whole document before writing, and retain option/arity guards before side effects.
+Help/version must not start the proxy or create configuration. Keep JSON stdout free of notices;
+MCP stdout contains protocol messages only.
+
+**Credential identity and custody provenance are different.** Attempt identity comes from the
+configured slot. Fleet env names are exact; legacy aliases form a closed list. Resolve environment
+sources before keystore sources and do not infer routing identity from the keystore row's labels.
+A missing declared key fails before egress. Authenticated 401/403 alone cannot distinguish a bad key
+from model entitlement; preserve `unverified`. Probes and redirects must not send keys to hosts the
+operator did not configure.
+
+**Rotation is narrow.** Refuse a shadowed keystore rotation without changing bytes. A successful
+rotation may clear only that credential's authentication faults through the admitted live seam,
+not allowance exhaustion, rate limits or unrelated evidence. Never race a daemon by editing its
+fact files. Corrupt/degraded credential stores refuse mutations rather than resetting to empty;
+re-learnable caches may degrade to missing data. Secrets do not belong in argv or child diagnostics.
+
+**XDG is path selection, not migration.** An existing preferred artifact wins; otherwise an existing
+legacy artifact remains in use. Nothing is moved or copied. Preserve artifact classification and
+explicit path overrides; the loaded config determines its control-token directory. Test guards
+belong in the individual resolvers/spawn seams. Windows environment recovery fills gaps only,
+compares names case-insensitively and does not import a user-scope PATH fragment as a complete PATH.
+
+### Candidate selection, evidence and recovery
+
+**Use the shared walk.** Health bands preserve candidates and ordering within the appropriate
+boundaries. Slot selection must not reorder deployments. Offering an attempt consumes nothing;
+the start boundary owns budget/LRU/egress bookkeeping. Re-offer an unstarted pending attempt and
+keep concurrent callbacks in per-attempt records. Record retriable outcomes even on the final
+candidate. Keep relay-local failures, provider failures and credential faults distinct.
+
+**Do not confuse cost, capability and availability.** Dynamic pools can place paid/unknown members
+behind free members within each effort band; `include: "free"` is not a free-only guarantee.
+`freeOnly` applies to resolved targets, including direct pool addresses and explicit directives;
+unknown cost cannot spend as free, and an empty allowed set must not fall through to primary quota.
+Measured pool bands and their degrade tails require qualifying capability evidence, whereas
+unknown *lane* capability is non-restrictive. Pins never cross guardrails or resurrect unavailable
+lanes. Announce capability degradation rather than silently changing the promised band.
+
+**Context limits have surface-specific evidence ladders.** The request guardrail uses an explicit
+ceiling learned from the exact deployment, then that provider's cached publication; unknown means
+no guardrail, not a guessed cap or a blocking lookup. Dispatch template context additionally accepts
+an exact synced snapshot match, never a fuzzy borrowed SKU. A pool uses the minimum known member
+window and reports unknown members separately; missing evidence is not a claim that every member
+supports that window. Keep these ladders distinct rather than widening request admission by accident.
+
+**Facts apply only where evidence supports them.** Preserve scope, explicit group members, kind,
+cost-class filters and reset provenance. A filtered fact matches nothing when the caller supplies
+no class; success clears it only within its class. Success can disprove conditions, not measurements.
+Exhausted free allowance is not a paid-only model, and paid allowance says nothing about free
+capacity. Only the appropriate eligibility conditions evict. Bare status codes or several sibling
+failures do not justify a broader credential/provider fact.
+
+**Interpretation stays out of band.** The request path does signature lookup; a miss learns nothing
+and queues evidence. Proposals may be agent-authored; acceptance is the operator's decision.
+Generated commands retain signature digests and every scope/cost narrowing flag. Treat provider
+messages as untrusted input. Network-block advice is display-only; do not suppress its recurring
+warning by rejecting the queue item merely to tidy the list.
+
+**Allowance, pacing and hard caps are distinct.** Quota demotion needs gateable evidence and a
+resolvable reset; learned allowance limits require the explicit opt-in, published reference data
+never gates, and unknown evidence has no effect. Pacing uses this relay's trailing attempt-start
+window and may consume explicitly learned rate ceilings without that allowance opt-in. It never
+sleeps, refuses or adds an invented cooldown. Hard caps use operator-declared numbers at their
+declared credential/deployment scope; skipped attempts consume no quota/LRU/health/accounting
+attempt. An all-capped refusal must not count against its own cap.
+
+**Cooldowns are evidence-labelled recovery policy.** Keep provider `Retry-After`, measured elapsed
+cooldowns and tunable fallback/escalation sources distinguishable. Retry another candidate rather
+than sleeping on `Retry-After`. A successful probe retracts only conditions/cooldowns its exact
+cell and source/status gates permit; it does not reset the real-traffic failure ladder wholesale.
+Persist full breaker evidence, including lapsed cooldown rows and counters: restarting is not a
+success. Never restore over fresh live state. Catalog refresh requires a listed model's evidenced
+absence, not any 404 or a caller's typo; refresh the roster rather than editing it from the error.
+
+**Keep latency datasets separate.** Request per-token measurements are primary and final once they
+have enough evidence; absolute fallback uses measurable probe samples only. A request without a
+token count belongs in neither statistic. Request samples must not update probe scheduling fields.
+Unknown latency is no demotion. Lane wall-clock history counts only completed answers as durations;
+failures/abandonment remain counts, not times-to-answer, and do not enter HTTP latency data.
+
+**Hedges win at meaningful-content commit, not headers or a metadata preamble.** Errors that the
+walk would retry are not winners. Resolve the second candidate when needed, abort losers through
+the explicit abandoned path, and keep their spend separate without charging provider health.
+After commit, watchdog failure ends the stream; a hedge cannot replace bytes the client already
+received. The production hedge decision has no output tokens before commit, so do not describe its
+per-token branch as active there. Its floor scales with input estimates; defaults are not measured
+provider limits. Ordinary client cancellation has a different, commit-state-based health policy.
+
+### Translation, repair and streaming
+
+**Preserve conversation structure.** Map tool calls/results with consistent IDs and ordering;
+refuse unrepresentable content with a local error instead of stringifying internal envelopes.
+Document conversion covers tool-result content too. Keep supported images lossless; do not promote
+arbitrary JSON or prose into a tool call. Direct native Chat passthrough and relay-authored translated
+requests intentionally have different compatibility responsibilities.
+
+**Destructive refusal happens before argument acceptance.** Use the one configured matcher:
+case-insensitive exact names, with an explicit trailing `*` for prefix matching; an empty list
+refuses nothing. Dialect parsers report every recognized name, including malformed calls they cannot
+commit. Refuse a destructive envelope whole, terminally and with local provenance on buffered and
+streamed paths; never reroll another provider or charge its health. Native well-formed calls remain
+the backend's intent. Repairs conserve block order/count, call IDs/names and the backend envelope.
+Transport failure throws through reshaper failover; a model refusal returns and is not retried.
+
+**Compatibility follows the resolved target.** Outbound strict-nine-character ID mapping is
+deterministic and preserves call/result linkage across retries. Response-side collision repair
+needs no reverse store because the client echoes the new ID. Sentinel thought signatures are the
+vendor's raw opt-out token, not invented reasoning; stamp through the authored Chat mapper, not
+native direct-Chat passthrough. Keep explicit overrides and record counts, never signatures.
+A host-scoped default is not evidence that every model on that host was live-tested.
+
+**Reasoning and output caps need explicit semantics.** Generic cross-vendor mapping does not invent
+a reasoning budget. DeepSeek's compatibility path may use caller reasoning or routed effort, but
+forced tool choice or replay without usable reasoning disables incompatible thinking and announces
+it. Never treat encrypted/redacted content as reasoning text. An absent Responses output limit
+stays absent for OpenAI targets; a required Anthropic limit is resolved at the target, with any
+fallback labelled as an implementation default. Learned output ceilings do not authorize clamping
+an explicit caller limit. A capped response is incomplete, not a successful whole answer.
+
+**Commit probes and stream transforms must be lossless.** Structural preflight and final-wire
+commitment are separate checks; both replay consumed prefixes. Do not clone a discarded failover
+body and leave an unread tee. Preserve each parser's event/whitespace policy, mixed line terminators
+and held-byte release on errors. Unknown think-tag shapes remain text. Stall, crawl, first-byte and
+total deadlines are different mechanisms; a zero-token crawl window leaves silence to the stall
+watchdog. A translator can emit an error and close normally after abort: inspect the attempt's
+signal before recording success, without sending a second error frame.
+
+### Dispatch, process ownership and restart recovery
+
+**Use MCP for portable task execution.** CLI `dispatch --next-command` and `/dispatch` are advisory.
+The model-serving data plane never shells out to an agent; operator/background probes and the
+admitted MCP broker are separate execution paths. Background lane hooks run only from the
+self-scheduled loop, not an HTTP-triggered probe tick. Default config deliberately has no
+machine-specific ladder or CLI template.
+
+**Host capability belongs to the caller.** The daemon cannot infer a bypassed host from its own
+environment. Preserve routed/bypassed/unknown and absent-verdict compatibility semantics.
+Transposition supplies executable commands where native children cannot address a relay spec;
+`requester=mcp` must reach the shared daemon view. Offload keys come from paths (`claude`, `codex`,
+`openai`, `default`), not arbitrary app names. Any supported child signal suffices; absent evidence
+does not become a child request. Keep explicit directives confined to the initial marked-child
+prompt, never later messages/tool results. Toggling offload preserves other rule fields and removes
+only its owned hook; generated host files must not overwrite user edits. Preserve the Desktop-specific
+MCP server name and explicitly selected relay-wrapper model rather than inheriting the caller's model.
+
+**Read-only is a mechanism, not a prompt.** Enforce cwd/allowed-root and supported harness-tool
+boundaries, skipping unsupported harnesses. Do not use headless plan mode as an editing lane or
+claim it completed work merely because it exited successfully. Preserve isolated routed-Claude
+configuration and configured idle-watchdog settings. Template task substitution is argv-only;
+config-resolved spec/context substitutions may also enter env. Windows npm shims resolve to verified
+Node entrypoints without a shell. Launchers share credential scrubbing, explicit operator env
+overrides/null unsets, recursion depth and owned-process cleanup.
+
+**Broker ownership survives the MCP host, not the daemon.** Fresh agent attempts prefer the daemon
+broker. Persist the execution identity before sending an idempotent start. Once a start may have
+been sent, transport uncertainty must not trigger a duplicate local launch. Resolve lane IDs against
+live daemon config; clients cannot supply arbitrary command/argv/env. A replacement MCP process
+claims only a dead owner's broker row and reconciles with the daemon; live foreign jobs remain
+foreign. Daemon shutdown cancels its owned trees. Hard-cap harness continuation is a different,
+unimplemented feature governed by the live evidence gate in the handoff/backlog.
+
+**Status carries the verdict.** Use the public liveness snapshot instead of asking callers to infer
+activity. Output, attributable relay traffic, tree changes and owned-tree CPU are evidence; a missing
+signal is not idle and the first CPU sample is only a baseline. Idle-only walk advancement must
+respect the last/no-reliable-next lane protections. Keep host-aware waits short enough for the tool
+transport and return a job handle for longer work; terminal polling includes the result. Cancellation
+and timeout do not justify claiming an owned process was reaped without checking its outcome.
+
+**Recovery must not erase its evidence.** Journal/archive read-merge-write operations share a
+transaction lock. Preserve unrelated rows and use conditional ownership/identity checks for claims
+and clears. Keep the journal until terminal archival succeeds. Bounded Windows replacement retries
+hold the lock and never unlink the destination first. Preserve bounded starting-tree metadata across
+lane changes, but not the prior attempt's broker identity. Missing legacy/oversized tree baselines
+are not an empty clean tree. Report status deltas and scope flags without reverting files or claiming
+causal attribution in a shared cwd; same-status edits may be absent from the delta even when mtime
+shows activity. AGY log evidence must be fresh and attributable; ambiguity remains inconclusive.
+
+### Accounting, dashboard and diagnostics
+
+**One ledger, explicit bases.** Keep reported and estimated tokens separate; never add them into a
+single claimed measurement. Price per deployment into integer micro-USD provenance cells, keeping
+unpriced/partial coverage visible. Served-answer spend, repair spend and abandoned-attempt spend
+have different meanings; do not fold losers into the answer total or duplicate token accounting in
+`LOG_FIELDS`. Raw backend usage is the ledger source. Do not silently expand accepted translated-SSE
+usage-parity limitations into a new translation project.
+
+**Persisted validity is part of correctness.** Schema additions need write/reload tests, not only
+in-memory assertions. Missing, corrupt and thrown reads have different meanings; a thrown read is
+not empty or zero. Writer failures remain observable without stopping serving. Read-only external
+readers do not repair or rewrite state. Atomic per-file writes are not a multi-file transaction;
+retain the documented bounded crash window rather than claiming replay/quarantine machinery exists.
+Flush write-behind stores on graceful shutdown; a hard process kill can still lose buffered changes.
+
+**Projection must not invent data.** Unknown metrics do not alone mean lost coverage; mark partial
+when held data was actually omitted/lost. Keep bounded projections and platform-free wire contracts.
+Cost CLI and dashboard use the same roll-up; print actual covered bounds and excluded partial buckets
+without moving the window to disguise them. Keep flush lag distinct from window coverage. Dashboard
+bootstrap/session authority is read-only, separate from control tokens, and revoked on restart.
+
+**Diagnose the process that serves the request.** A new CLI's environment can differ from a running
+daemon's. Consult live, admitted status before blaming credentials. Distinguish actual routed
+identity from upstream-reported model claims, capability from operational fitness, and no evidence
+from evidence of failure. Keep candidate dimensions separate rather than adding a blended best-target
+score. Capability data comes from sync; source absence is not a zero score, schema drift is not a
+successful empty source, effort variants are not base models, and price suffixes borrow weights only
+through the supported exact match, never prices or an unrelated SKU's context window.
 
 ## Status & open work
 
-**Read [HANDOFF.md](HANDOFF.md) §0 for current state and the immediate next step, and
-[docs/backlog.md](docs/backlog.md) for open work.** What follows is durable historical residue:
-decisions, standing warnings and lessons that outlive any one release.
+Current status belongs in [HANDOFF.md](HANDOFF.md); unmet properties belong in
+[docs/backlog.md](docs/backlog.md). Do not repeat test counts, account quotas, best-model claims,
+release diaries or blanket assertions that every gap is closed here.
 
-**v0.46.0 closed a safety-shaped code gap and opened another one in the same commit** — the
-dialect-rescue destructive filter (`091cf7c`, 2026-08-24). What it closed: `destructive` had
-reached none of `tool-dialects.ts`, `openai-dialect.ts`, `dialect-stream.ts`, so a WELL-FORMED
-destructive call the relay reconstructed out of assistant prose was served unfiltered. That half
-holds — such a call is refused whole and terminally at all four rescue commit points, with
-provenance declared rather than read off the wire; see the gotcha above and
-[docs/history/dialect-rescue-destructive-refusal-2026-08-24.md](docs/history/dialect-rescue-destructive-refusal-2026-08-24.md).
+For subsystem detail, use the live [reference](docs/reference.md),
+[pool failover](docs/pool-failover.md), [pool eligibility](docs/pool-eligibility.md),
+[subagent routing](docs/subagent-routing.md), [host dispatch](docs/host-adaptive-dispatch.md),
+[agent capabilities](docs/offload-agentic-capability.md), [capability sources](docs/capability-sources.md),
+[dialect handling](docs/tool-call-dialect-leak.md) and [delegate gate](docs/delegate-gate.md) guides.
 
-⚠⚠ **What it opened, unnoticed for thirteen days: the filter read the calls the parsers had
-COMMITTED.** Two parsers already discarded a malformed payload on that date —
-`fromTaggedJsonForms` since 2026-08-08 and `fromKimiTokenForm` since 2026-08-13 — so a destructive
-name inside a malformed envelope was already invisible to the filter the day it was written. It
-was found on 2026-09-06 only because CLONE-26 extended the same discard to a third parser and the
-change was verified afterwards rather than trusted. Fixed in v0.73.1: each parser now reports every
-name it RECOGNISED and the filter reads that list first.
-
-⚠ **So this section previously said "the last known safety-shaped code gap closed in v0.46.0", and
-that sentence was false the day it was written.** Kept here as the correction rather than deleted,
-because the lesson is the durable part: a check that reads what an earlier stage COMMITTED inherits
-that stage's discard policy as its own trigger condition, and no test, typecheck or gate can see it.
-Do not replace this with a fresh "no known gaps" claim — say what has been reviewed instead.
-Current binding constraints are in HANDOFF §1; current unmet properties are in `docs/backlog.md`.
-
-**The metering sprint is complete (2026-08-22, evening)** — Stages 0–6 of
-`docs/history/quota-metering-spec-2026-08-16.md` are delivered, through the event-sourced accounting store
-(`~/.llm-relay/usage/`, `b4ec7ee`), the usage observer on both fronts, the protected dashboard API
-and React SPA, and the evening sprint that closed the remainder: cache fields on
-`AssistantMessage.usage` (C3), operator-declared `limits` (Gap 5), learned rate-limit facts on both
-fronts (Gap 8, display-only), catalog harvesting of published rate limits (Gap 13), per-attempt
-spend priced from published prices into four provenance cells (Gap 11), the availability ladders +
-dashboard availability producer (Stage 3), quota as a demotion term on both fronts (Stage 5 /
-Gap 12, learned opt-in via `routing.quota.enforceLearned`), and the `llm-relay cost
---include-repair` roll-up. The G2 manual hard cap (`limits.hard`), M3, M4/Gap 10, and the custody
-program (`src/os-keyring.ts` + `src/keystore.ts` + the resolver keystore rung + the `keys` lifecycle
-CLI) are all delivered too.
-[docs/history/metering-reconciliation-2026-08-22.md](docs/history/metering-reconciliation-2026-08-22.md) §7 is the
-closeout ledger, and
-[docs/history/custody-sprint-plan-2026-08-24.md](docs/history/custody-sprint-plan-2026-08-24.md) holds the custody
-plan, its recon corrections and its seven build decisions. The commit-by-commit trail is in
-git; the standing DECISIONS are the part worth keeping here:
-
-- **Gaps 15, 16 and P4 were dropped outright.** Gap 7 was resolved by spec amendment (no new
-  endpoints).
-- **Streaming cross-protocol usage parity in llm-bridge is ACCEPTED AS-IS** (owner decision
-  2026-08-23) — the ledger observes the BACKEND stream, so accounting is correct; only the
-  client-facing translated SSE loses cache fields.
-- ⚠ **Do not "complete" Gap 3 by adding token fields to `LOG_FIELDS`** — the accounting store
-  superseded the JSONL-as-ledger plan; see the `log.ts` row above.
-
-✅ Earlier closed work, kept for its lessons: the four confirmed defects fixed 2026-08-14
-([docs/history/audit-2026-08-09.md](docs/history/audit-2026-08-09.md)) — the `argValue()` parser confusion
-(`961a750`), missing Codex destructive-tool defaults (`55ae136`), credential-carrying ping redirects
-(`fcc1452`), and case-sensitive `winenv` scope merge (`7f6f6e4`) — each closed with pinning tests.
-⚠ That run produced 676 findings but **only 6 were verified against source** — the rest are
-advisory output from an offload lane whose severities are a model's estimate, so do not treat such
-a report as a to-do list. A full audit was remediated to completion and its follow-up list closed
-in v0.12.0; the audit apparatus and handoff doc were then deleted, because a finished run's ledger
-is just a stale to-do list — anything that mattered became a code change, a test, or a paragraph
-in this file. The 2026-07-30 pool-failover symptoms are likewise fixed and closed — see
-[docs/pool-failover.md](docs/pool-failover.md) and the gotchas above.
-
-**Project goals are written down** — [docs/project-goals.md](docs/project-goals.md): personal
-tool first (shared with friends; README + `llm-relay onboard` must suffice for a stranger),
-traffic steering as the mission, stabilize-and-harden as the trajectory, and a five-test rubric
-for judging proposed changes. An external proposal was reviewed against it 2026-08-04
-([docs/history/suggestion-review-2026-08-04.md](docs/history/suggestion-review-2026-08-04.md)): four small
-pieces harvested (all landed), the enterprise-shaped remainder rejected with reasons — read it
-before proposing routing refactors, budgets, tracing stores, or LLM-assisted classification.
-A second external review (terms compliance + credential handling) was assessed 2026-08-05 —
-[docs/history/codex-review-2026-08-05.md](docs/history/codex-review-2026-08-05.md): its headline credential finding
-was false (it missed that the openai path builds its own headers), two changes were adopted anyway
-(`credentialMode`, the OR'd subagent signal), and it carries the verified terms position. Its
-2026-08-08 anti-hosting proposal was recalibrated 2026-08-16 into accounting metering plus the
-narrow no-hosted-relay/no-pooled-consumer-accounts boundary. Counting, ordering, and holding
-several of an operator's own keys remain allowed. ⚠ **Decisions shaped by any invariant must be
-stated aloud** — name the rule, what it excluded, and the alternative used.
-
-⚠ **A CLI process's environment is NOT the running relay's environment, and confusing the two
-fabricates credential bugs.** On Windows a User-scope environment variable enters a process only at
-**process start**, so the long-running relay (launched from `Startup` at logon) predated six keys
-that a freshly launched shell had. `llm-relay keys` / `llm-relay candidates` run as new processes and
-report *their own* env; `GET /registry` and `GET /candidates` are answered by the relay and are the
-authoritative `has_key`. The two disagreed, and the whole "half the pool is dead, seven 401s" finding
-of 2026-07-30 was this — **not** bad keys. `pool/coding` (the pools were task-named back then; they
-are effort-named — `low`/`medium`/`high`/`xhigh` — since v0.15.4) went from 5 live members to **11**
-(`llm-relay pools --probe`: 29/35 live overall). **`winenv.ts` now closes the gap at startup**, so a
-key added after logon is picked up on the next relay restart rather than needing a reboot. ⚠ Still
-check `curl 127.0.0.1:8791/registry | grep has_key` before ever concluding a key is bad. Genuinely
-down: `gemini` (real 429/quota), `ollama/qwen2.5-coder:7b` (local daemon not running),
-`nim/deepseek-ai/deepseek-v4-flash` (HTTP 529).
-
-⚠ **Health data must survive a restart, and a verdict must not turn on one sample.** Both were
-broken together: `PingLoop` held ping history in memory and read only that while `recordProbeResult`
-wrote to disk and nothing read it back (so every restart reset every model to `Pending`/`p95: -1`),
-and `getVerdict` was handed `isDown: lastPing.code !== "200"` (so one transient 503 buried fifty good
-samples). Now: entries carry a sample window + lifetime totals, `getModelPings()` hydrates from disk,
-and `isPersistentlyDown()` needs a RUN of failures plus poor uptime. ⚠ **The transient tolerance is
-scoped to transient codes.** A 401/403 is the provider stating a fact about the credential and is
-down immediately — otherwise a revoked key reads "Perfect", since fast 401s are still fast. When
-threading a probe-cache path through `PingLoop`, thread it to `getModelsDueForProbe` too: the module
-keeps a cache keyed by the last path it saw, so a call that omits it silently asks a different cache.
-
-⚠ One durable lesson from it, because it will cost you an hour otherwise: **several tests in this
-repo were written to pin the defect they should have caught.** A correct fix here can legitimately
-turn the suite red — read the failing test's stated reasoning before assuming your change is wrong,
-and change the test in the SAME commit as the source fix.
-
-Current: **usable end-to-end**, suite green, tsc clean — and verified by CI
-(the full Ubuntu `npm run build && npm run check` gate plus the targeted Windows process-boundary
-job) rather than by a local run only. A real `claude` agentic session completes through the proxy against NIM.
-(The point-in-time assessment doc that used to back this claim was deleted 2026-08-04 as a stale
-snapshot — CI and the suite are the living evidence.)
-
-**Client-specific offload is live but OPT-IN** (0.3.0; switched off by default in 0.4.0): Claude
-and Codex rules can independently route marked children, or their full conversations with
-`scope: "all"`, to non-Anthropic providers. Verified end-to-end on the wire. Use
-`llm-relay offload <client> on --scope subagents|all` (no restart); choose a target with
-`llm-relay candidates`. Design + evidence: [docs/subagent-routing.md](docs/subagent-routing.md).
-
-Every script in `scripts/` and every proxy endpoint has been exercised live against NIM;
-`multimodal-probe.mjs` is 5/5 green.
-
-**Capability ranking now lives here** (0.5.0), no longer deferred to the router/auditor project:
-`npm run sync:tiers` merges four effective sources — OpenRouter + BFCL + LMArena + Aider; the fifth
-fetcher, Artificial Analysis, is key-gated and currently unconfigured so it contributes nothing
-(`docs/tier-data.json` records it `model_count: 0, configured: false`) — into `docs/tier-data.json`,
-and `getStrength()` ranks pools off it. Source probe results, coverage per
-source, and why EvalPlus / HF Open LLM / LiveCodeBench were rejected:
-[docs/capability-sources.md](docs/capability-sources.md).
-
-⚠ **Reasoning-effort rows were being shattered, not missing** (fixed 2026-08-08). The sources spell
-the same variant three ways — `gpt-5 (high)` (Aider), `gpt-5-high` (LMArena), a bare id
-(OpenRouter) — so **0 of 60** effort-qualified rows joined across sources and every one looked like
-a 1-signal guess. `normName()` now canonicalizes the notation (8 of 71 joined, best case 3 sources
-/ 5 signals). ⚠ It REWRITES to suffix form against a **closed** vocabulary and never STRIPS —
-`gpt-5 (high)` → `gpt-5-high`, never `gpt-5`, because collapsing a variant into its base is exactly
-the borrowed-score bug. Artificial Analysis is also fetched first-hand now (key-gated; absent key
-skips cleanly, undocumented schema so the mapping is a throwing alias list). Neither change moved
-the current ladder — no source publishes two effort points for any model this machine routes to.
-Full diagnosis: [docs/history/effort-granularity-gap.md](docs/history/effort-granularity-gap.md).
-
-Best-known backend model on NIM: **`z-ai/glm-5.2`** (trip rate 0 across the scenario set; it topped
-the then-`coding` pool by synced strength, 4 signals — pools are effort-tiered now, see
-`config.example.json`). `llama-3.1-8b` trips 25% of calls and the reshaper
-fixes ~2/3 of those — the proxy's use case.
-
-Durable project state also lives in agent memory (`project-repair-proxy`).
+Dated records belong directly in [docs/history/](docs/history/); read its index before treating an
+old plan as instructions. In particular, the former MCP rejection and never-spawn wording were
+superseded, the unused kernel framework was removed, and restart-safe ownership/config reload are
+implemented rather than pending. The full pre-cleanup narrative remains in git history; this guide
+retains the contracts rather than another copy of the incidents. Keep links and existing heading
+anchors stable when editing documentation, and update the live guide when its behavior changes.
