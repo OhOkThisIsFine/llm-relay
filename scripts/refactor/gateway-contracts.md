@@ -30,7 +30,7 @@ The program prints one JSON result record. `allContractsPassed` reports compatib
 screen. Individual assertion failures are recorded and testing continues: a green comparison job
 means it generated evidence, not that a candidate passed. Setup/mock-server failures fail the job.
 Inspect unexpected endpoints and zero-egress errors for fixture/configuration mistakes before
-calling a failed assertion a dependency defect. The 20 positive/negative oracle checks run separately
+calling a failed assertion a dependency defect. The 30 positive/negative oracle checks run separately
 and are also exercised by the normal test gate.
 
 The fixture is deliberately small and bounded. It does not measure backpressure memory ceilings,
@@ -39,3 +39,10 @@ license suitability, or upgrade cost. Those still belong in the R1 decision pack
 RequestService acceptance. A passing result alone is not permission to replace the implementation.
 A verified failure of a required contract can reject an unmodified candidate without claiming its
 other features were exhaustively tested.
+
+Each task carries a distinct correlation token in its synthetic user text. Auxiliary markerless
+traffic is reported separately, not counted as a retry of the current task. Missing task text yields
+zero correlated egresses and cannot pass. The bounded case registry retains completed cases until
+candidate shutdown, so late retries are attributed to their original task and fail its count check.
+A whole-stream control distinguishes transport fragmentation from tool-call reconstruction failures.
+Native request extensions, response extensions and identity/cache usage are separate assertions.

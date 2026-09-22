@@ -25,6 +25,25 @@ const runFile = promisify(execFile);
 const self = fileURLToPath(import.meta.url);
 const timeout = (ms = 10_000) => AbortSignal.timeout(ms);
 
+function tagTask(body, correlation) {
+  const serialized = JSON.stringify(body);
+  assert(serialized.includes('Read the synthetic value.'), 'Fixture task text is missing');
+  return serialized.replace('Read the synthetic value.', `Read the synthetic value. ${correlation}`);
+}
+function taskCorrelation(body) {
+  const matches = [...new Set(JSON.stringify(body).match(/relay-fixture-[0-9a-f-]{36}/g) ?? [])];
+  assert(matches.length <= 1, 'Mixed fixture task identities');
+  return matches[0];
+}
+function refreshEgressResult(result, test) {
+  result.egresses = test.calls.length;
+  result.upstream = test.calls.map((call) => ({ protocol: call.protocol, stream: call.body.stream === true }));
+  if (test.calls.length !== 1) {
+    result.passed = false;
+    result.error ??= 'Expected exactly one task-correlated egress, including late calls';
+  }
+}
+
 function requestBody(front, model, stream = false, history = true) {
   const common = { model, stream };
   if (front === 'messages') return { ...common, max_tokens: 128, tools: [{ name: TOOL, input_schema: PARAMETERS }], messages: [
@@ -250,14 +269,30 @@ async function probe(candidate) {
   const dir = mkdtempSync(join(tmpdir(), 'relay-gateway-contracts-'));
   if (candidate !== 'relay') chmodSync(dir, 0o777); // Container writes only disposable synthetic configuration here.
   let active; let gateway;
+  const cases = new Map();
+  const auxiliaryEgresses = [];
+  const infrastructureErrors = [];
   const upstream = createServer(async (req, res) => {
-    const test = active;
-    if (!test || req.method !== 'POST') { res.writeHead(404); res.end(); return; }
+    let test;
+    if (req.method !== 'POST') { res.writeHead(404); res.end(); return; }
     try {
       let raw = ''; for await (const chunk of req) { raw += chunk; assert(raw.length <= 262_144); }
       const body = JSON.parse(raw);
       assert(/\/(messages|responses|chat\/completions)(?:\?|$)/.test(req.url), `Unexpected synthetic endpoint: ${req.url}`);
       const protocol = req.url.includes('/messages') ? 'messages' : req.url.includes('/responses') ? 'responses' : 'chat';
+      const correlation = taskCorrelation(body);
+      if (correlation === undefined) {
+        // Startup/model probes are not retries of the submitted fixture. Keep their evidence,
+        // but a request that loses its task text still fails its zero-correlated-egress check.
+        assert(auxiliaryEgresses.length < 1000, 'Unbounded auxiliary traffic');
+        auxiliaryEgresses.push({ protocol, stream: body.stream === true });
+        res.writeHead(200, { 'content-type': body.stream ? 'text/event-stream' : 'application/json' });
+        res.end(body.stream ? wire(protocol, frames(protocol, true)) : JSON.stringify(responseBody(protocol, true)));
+        return;
+      }
+      test = cases.get(correlation);
+      assert(test, 'Unknown fixture task identity');
+      assert(test.calls.length < 100, 'Unbounded task retries');
       const call = { protocol, body, headers: req.headers, closed: false };
       test.calls.push(call); res.on('close', () => { call.closed = true; });
       if (test.error) { res.writeHead(503, { 'content-type': 'application/json' }); res.end(JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'synthetic upstream failure' } })); return; }
@@ -280,20 +315,25 @@ async function probe(candidate) {
           assert(offset > 0); res.write(bytes.subarray(0, offset)); await delay(1); res.end(bytes.subarray(offset));
         }
       }
-    } catch (error) { test.infrastructureError = String(error); if (!res.destroyed) res.destroy(); }
+    } catch (error) {
+      infrastructureErrors.push(String(error));
+      if (test) test.infrastructureError = String(error);
+      if (!res.destroyed) res.destroy();
+    }
   });
-  const report = { version: 2, candidate, node: process.version, platform: process.platform, scope: 'synthetic fidelity screen; not full R1 acceptance', identity: null, results: [] };
+  const report = { version: 3, candidate, node: process.version, platform: process.platform, scope: 'synthetic fidelity screen; not full R1 acceptance', identity: null, results: [] };
   try {
     const upstreamBase = await listen(upstream);
     gateway = await startCandidate(candidate, upstreamBase, dir); report.identity = gateway.identity;
     const model = (provider) => candidate === 'litellm' ? provider : `${provider}/${MODEL[provider]}`;
     const endpoint = (front) => gateway.base + (candidate === 'bifrost' && front === 'messages' ? '/anthropic' : '') + FRONT_PATH[front];
-    const post = (front, body, signal = timeout()) => fetch(endpoint(front), { method: 'POST', headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', authorization: 'Bearer fixture-caller-key', 'x-api-key': 'fixture-caller-key' }, body: JSON.stringify(body), signal });
+    const post = (front, body, signal = timeout()) => fetch(endpoint(front), { method: 'POST', headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01', authorization: 'Bearer fixture-caller-key', 'x-api-key': 'fixture-caller-key' }, body: tagTask(body, active.correlation), signal });
     const textRequest = (front, provider) => {
       const body = requestBody(front, model(provider), true, false); delete body.tools; return body;
     };
     const check = async (name, test, action) => {
-      active = { calls: [], ...test };
+      active = { calls: [], correlation: `relay-fixture-${randomUUID()}`, ...test };
+      cases.set(active.correlation, active);
       const details = () => ({ egresses: active.calls.length,
         upstream: active.calls.map((call) => ({ protocol: call.protocol, stream: call.body.stream === true })),
         ...(active.observed ? { observed: active.observed } : {}),
@@ -360,9 +400,14 @@ async function probe(candidate) {
       const response = await post(front, requestBody(front, model('openai'), false, false)); await boundedText(response);
       assert(response.status >= 500); assert.equal(test.calls.length, 1, 'Gateway performed an unrequested retry');
     });
-    report.allContractsPassed = report.results.every((r) => r.passed);
+    // Shut down before finalizing counts: late retries remain attributed to their original case.
+    await gateway.stop(); gateway = undefined;
+    [...cases.values()].forEach((test, index) => refreshEgressResult(report.results[index], test));
+    report.auxiliaryEgresses = auxiliaryEgresses;
+    report.infrastructureErrors = infrastructureErrors;
+    report.allContractsPassed = report.results.every((r) => r.passed) && infrastructureErrors.length === 0;
     console.log(JSON.stringify(report));
-    if (report.results.some((r) => r.infrastructureError)) process.exitCode = 1;
+    if (infrastructureErrors.length > 0) process.exitCode = 1;
   } finally { await gateway?.stop(); await stopServer(upstream); rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -381,6 +426,17 @@ function selfTest() {
   }
   assert.throws(() => parseSse('data: {broken}\n\n')); assertions++;
   assert.deepEqual(parseSse(':keepalive\n\ndata: [DONE]\r\n\r\n'), ['[DONE]']); assertions++;
+  const correlation = 'relay-fixture-00000000-0000-4000-8000-000000000001';
+  for (const protocol of Object.keys(FRONT_PATH)) {
+    assert.equal(taskCorrelation(JSON.parse(tagTask(requestBody(protocol, 'fixture'), correlation))), correlation); assertions++;
+    assert.equal(taskCorrelation(requestBody(protocol, 'fixture')), undefined); assertions++;
+  }
+  assert.throws(() => tagTask({}, correlation), /task text is missing/); assertions++;
+  assert.throws(() => taskCorrelation({ text: correlation + ' relay-fixture-00000000-0000-4000-8000-000000000002' }), /Mixed/); assertions++;
+  const late = { passed: true };
+  refreshEgressResult(late, { calls: [{ protocol: 'chat', body: {} }, { protocol: 'chat', body: {} }] });
+  assert.equal(late.passed, false); assertions++;
+  const lost = { passed: true }; refreshEgressResult(lost, { calls: [] }); assert.equal(lost.passed, false); assertions++;
   console.log(JSON.stringify({ selfTest: true, assertions }));
 }
 

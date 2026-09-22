@@ -11,6 +11,6 @@ describe("gateway comparison fixture oracles", () => {
       timeout: 10_000,
       windowsHide: true,
     });
-    expect(JSON.parse(result)).toEqual({ selfTest: true, assertions: 20 });
+    expect(JSON.parse(result)).toEqual({ selfTest: true, assertions: 30 });
   });
 });
