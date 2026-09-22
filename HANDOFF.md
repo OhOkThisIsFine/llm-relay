@@ -4,8 +4,8 @@ Entry point for any agent picking up llm-relay. Read this before `CLAUDE.md`.
 
 ## 0. Current state — 2026-09-22
 
-The architecture refactor has begun with the R0 legacy-storage safety fix, executable runtime
-baselines and R1 infrastructure proofs. The target request, dispatch and SQLite ownership changes
+The architecture refactor has an R0 legacy-storage safety fix, executable runtime baselines and
+recorded R1 dependency/boundary choices. The target request, dispatch and SQLite ownership changes
 are not implemented; live continuation remains evidence-gated.
 
 - Published package version: **0.86.0**. This refactor work is not a new published release.
@@ -14,10 +14,17 @@ are not implemented; live continuation remains evidence-gated.
   The source checkpoint `5737286` passed CI run **791**, including the full Linux gate and targeted
   Windows suite. Lock evidence and the upgrade boundary are in
   [`docs/history/refactor-r0-2026-09-21.md`](docs/history/refactor-r0-2026-09-21.md).
-- Runtime and SDK/schema/SQLite probes pass on Linux and Windows at checkpoint `e49ea16`
-  (refactor evidence run **3**, ordinary CI run **795**). Decisions, measurements and remaining gates:
+- Runtime and SDK/schema/SQLite probes pass on Linux and Windows. Measurements and the protected
+  contract map are in
   [`docs/history/refactor-baselines-and-dependencies-2026-09-22.md`](docs/history/refactor-baselines-and-dependencies-2026-09-22.md).
+- R1 selects in-process native adapters plus llm-bridge for supported cross-wire translation,
+  official MCP SDK v2, Zod/Ajv schemas, and worker-isolated SQLite using DELETE/EXTRA. Decisions,
+  gateway comparisons, performance-budget policy and remaining acceptance boundaries are in
+  [`docs/history/refactor-r1-decisions-2026-09-22.md`](docs/history/refactor-r1-decisions-2026-09-22.md).
   Production dependencies and the Node engine range have not changed.
+- The expanded comparison confirms a current **native Responses fidelity defect**: unnecessary
+  translation changes native fields, IDs and usage structure. It is recorded in the backlog and
+  must be corrected by R2; it is not fixed by this evidence packet.
 - D1 restart-safe daemon-owned lane execution is implemented.
 - D2 transactional config hot reload is implemented.
 - Public dispatch/liveness state is explicit rather than inferred from circumstantial clues.
@@ -35,16 +42,20 @@ are not implemented; live continuation remains evidence-gated.
 ### Immediate next — architecture refactor
 
 Follow [`docs/architecture-refactor-plan.md`](docs/architecture-refactor-plan.md). Finished-system
-simplicity takes priority over refactor size. Execute the remaining R1 translation/gateway comparison
-(llm-bridge control, LiteLLM and Bifrost candidates) and calibrate paired performance budgets from
-the new R0 probe before R2. The current compact contract map protects unreviewed tests by default;
-review each affected assertion before replacing its owning implementation.
+simplicity takes priority over refactor size. R1 implementation choices are recorded: do not restart
+an open-ended gateway survey. Calibrate the matched same-build runtime controls against the explicit
+budget policy, then implement R2's one RequestService, including native Responses preservation.
+Delete both obsolete orchestration loops; answer mode must use a real internal consumer.
 
-The tested infrastructure direction is official MCP server SDK v2, Zod definitions with Ajv consumers,
-and worker-isolated `node:sqlite` using DELETE/EXTRA. These are decisions for implementation, not
-installed runtime changes. Node 22.13 is a tested minimum API level, not an operational patch
-recommendation; its SQLite API is experimental. Full host/schema/install and storage-cutover gates
-remain. Do not claim R0/R1 or the service refactor complete from the probes alone.
+The current compact contract map protects unreviewed tests by default; review each affected assertion
+before replacing its owning implementation. A passing comparison screen is not full qualification.
+The gateways' documented native passthrough routes passed all twelve tested native cases; their earlier
+unified-endpoint field losses are not evidence that native preservation is impossible.
+
+SDK/schema/SQLite choices are for implementation, not installed runtime changes. Node 22.13 is a
+tested minimum API level, not an operational patch recommendation; its SQLite API is experimental.
+Paired-control calibration, full host/schema/install and storage-cutover gates remain. Do not claim
+the service refactor or release acceptance complete from the probes alone.
 
 **Upgrade boundary:** drain and stop every old daemon, MCP and writing CLI process before running
 this lock version. A legacy `owner.json` lock is never reclaimed automatically. Only after all
@@ -105,6 +116,7 @@ design records.
 | `docs/README.md` | Documentation index |
 | `docs/backlog.md` | Current unmet properties |
 | `docs/architecture-refactor-plan.md` | Target architecture, implementation sequence and acceptance criteria |
+| `docs/history/refactor-r1-decisions-2026-09-22.md` | Selected dependencies, native-wire evidence, performance budgets and R2 boundary |
 | `docs/history/refactor-baselines-and-dependencies-2026-09-22.md` | Runtime measurements, contract map and tested infrastructure choices |
 | `docs/history/refactor-r0-2026-09-21.md` | Initial R0 lock evidence and upgrade boundary |
 | `docs/history/development-plan-2026-09-21.md` | Earlier continuation preparation sequence |

@@ -10,9 +10,11 @@
 ## Open
 
 - **Architecture refactor: single-owner request routing and dispatch.**
-  Follow [`architecture-refactor-plan.md`](architecture-refactor-plan.md). Next: the executable
-  translation/gateway comparison and paired performance budgets, then the ownership cutovers.
-  Runtime baselines, contract boundaries and tested SDK/schema/SQLite choices are recorded in
+  Follow [`architecture-refactor-plan.md`](architecture-refactor-plan.md). Implementation choices and
+  performance-budget policy are recorded in
+  [`history/refactor-r1-decisions-2026-09-22.md`](history/refactor-r1-decisions-2026-09-22.md).
+  Next: calibrate the matched runtime controls, then implement R2 with the selected in-process
+  translation boundary. The protected contract map and infrastructure proofs remain in
   [`history/refactor-baselines-and-dependencies-2026-09-22.md`](history/refactor-baselines-and-dependencies-2026-09-22.md).
   The [R0 lock safety fix](history/refactor-r0-2026-09-21.md) is not the target storage architecture.
   Optimize the finished architecture rather than diff size; preserve product guarantees, not
@@ -20,6 +22,16 @@
   **Property:** all API fronts share one request-execution lifecycle; the daemon owns each complete
   dispatch job; transactional job state has one mutation authority; maintained MCP/schema machinery
   replaces commodity handwritten code; migration is verified and superseded runtime paths are deleted.
+
+- **Native Responses traffic loses protocol information in a translation round-trip.**
+  `gateway-boundaries.mjs relay` reproduces this with a provider explicitly configured for Responses:
+  native request/response extensions are lost, item/event identity changes, buffered usage uses Chat
+  field names, and an upstream error body is rewrapped. Cancellation itself still reaches upstream.
+  Evidence and R2 acceptance requirements:
+  [`history/refactor-r1-decisions-2026-09-22.md`](history/refactor-r1-decisions-2026-09-22.md).
+  **Property:** compatible Responses-to-Responses requests, successes, errors and streams preserve
+  native fields, tool/item identity and usage/cache distinctions without an unnecessary intermediate
+  protocol; shared routing, accounting, commitment and destructive-tool safeguards still apply.
 
 - **Active hard-cap continuation is designed but not implemented.**
   Survey and measurement tooling are complete for AGY, Claude, Codex and OpenCode, but no harness is
