@@ -1,216 +1,172 @@
 # Contributing to llm-relay
 
-Thank you for helping. This page tells you how to set up, how to prove a change is correct, and
-how to report a problem without leaking a credential.
-
-- New to the project? Read [docs/architecture.md](docs/architecture.md) first. It explains what
-  the relay does and how the code is laid out.
-- Want to use the relay rather than change it? Read [docs/QUICKSTART.md](docs/QUICKSTART.md).
-- Want the full option list? Read [docs/reference.md](docs/reference.md).
-
----
+Start with [docs/architecture.md](docs/architecture.md) for the code map,
+[docs/QUICKSTART.md](docs/QUICKSTART.md) for setup, or
+[docs/reference.md](docs/reference.md) for commands and configuration.
 
 ## 1. Set up
 
-You need **Node.js 22 or later**. No other tool is required.
+Use **Node.js 22 or later**, npm, and Git for the checkout.
 
 ```bash
 git clone https://github.com/OhOkThisIsFine/llm-relay.git
 cd llm-relay
-npm install
+npm ci --ignore-scripts
 npm run build
 ```
 
-Run the relay from source without building:
+Run from source with an existing configuration:
 
 ```bash
 npm run dev -- --config config.json
 ```
 
-The relay binds to `127.0.0.1:8791` only. It refuses to start on any other address.
-
----
+The default listener is `127.0.0.1:8791`. Configuration may select another valid port and one of
+`127.0.0.1`, `localhost` or `::1`; other hosts are rejected.
 
 ## 2. The gate
 
-One command proves a change. Run it before you open a pull request.
+Run the complete gate before opening a pull request:
 
 ```bash
 npm run gate
 ```
 
-`npm run gate` is exactly `npm run build && npm run check`. Continuous integration runs that full
-gate on Linux. A targeted Windows job separately type-checks the test suite and runs the lane
-process/env/lifecycle tests, including a real local `.cmd` shim smoke test. `npm run check` runs five steps:
+This is `npm run build && npm run check`. Building first matters because package checks consume
+`dist/`. The check phase runs:
 
-| Step | What it proves |
+| Command | Coverage |
 |---|---|
-| `npm run typecheck` | `src/` compiles under `tsconfig.json` |
-| `npm run typecheck:test` | `test/` compiles under `tsconfig.test.json` |
-| `npm test` | the server suite passes (vitest) |
-| `npm run check:dashboard` | the dashboard compiles and its own suite passes |
-| `npm run check:package` | the published bundle inventory and a packed smoke test pass |
+| `npm run typecheck` | Source types. |
+| `npm run typecheck:test` | Test types; vitest alone does not type-check tests. |
+| `npm test` | Core test suite. |
+| `npm run check:dashboard` | Dashboard types and tests. |
+| `npm run check:package` | Bundle inventory and packed-package smoke test. |
 
-Build first. Several scripts read `dist/`, and a fresh clone has no `dist/`, so `npm run check`
-alone fails on `check:package`.
+CI runs the full gate on Ubuntu and separately checks that the postinstall hook is inert on a
+non-global install. The `windows-process-boundary` job type-checks tests and exercises Windows
+spawning, command shims, process lifecycle, broker recovery and concurrent persistence.
 
-Run one test file, or one test by name:
+For a focused run:
 
 ```bash
 npx vitest run test/repair.test.ts
 npx vitest run -t "refuses to reshape a destructive"
 ```
 
-`npm run analysis:run` runs eslint, knip, madge, dependency-cruiser, ts-prune and jscpd. It is
-**advisory**. It is not part of the gate and CI does not run it. Several of its default rules
-contradict a documented decision in this project; `eslint.config.mjs` names the decision beside
-each rule it disables.
-
----
+`npm run analysis:run` is advisory and outside the gate. Review its findings against the project's
+invariants; `eslint.config.mjs` explains intentionally disabled rules.
 
 ## 3. Rules a change must not break
 
-These are the project's invariants. A change that breaks one is rejected, however small it is.
-[CLAUDE.md](CLAUDE.md) argues each one in full.
+[CLAUDE.md](CLAUDE.md) contains the detailed invariants and rationale.
 
-1. **The repair boundary.** The relay fixes protocol *form*, never *judgment*. It corrects a tool
-   call whose arguments violate a schema. It never invents intent. No model opinion enters the
-   request path. Routing comes from configuration and from deterministic classification.
-2. **Provenance.** Never label a guess as a measurement. Unknown stays `null`, never `0`. A total
-   that mixes two bases shows the split instead of one undifferentiated number. Do not invent an
-   unpublished provider limit, price or context ceiling.
-3. **Health demotes, never drops.** An unhealthy candidate moves down the order. It is never
-   removed from the list. A pool that filtered unhealthy members once narrowed to nothing at the
-   moment it was needed.
-4. **Destructive tool calls are refused, never fabricated.** Repair output can run with full
-   permissions. An unrepairable call fails clean.
-5. **Loopback only, and loopback is not authorization.** Startup refuses a non-loopback bind.
-   Mutating endpoints still check `Host`, `Origin`, content type, and a per-install control token.
-6. **Logs hold metadata only.** Never a request body, a response body, a header, or a URL
-   parameter *value*.
-7. **Both request paths get every policy.** The Anthropic front (`/v1/messages`) and the OpenAI
-   front (`/v1/chat/completions`, `/v1/responses`) must enforce the same rule. A policy on one
-   path that the other walks around is not a policy.
-
----
+1. **Repair protocol form, not judgment.** Correct malformed arguments without inventing intent.
+   Routing uses configuration and deterministic classification, not a model's opinion.
+2. **Preserve provenance.** Unknown is not zero. Keep measured, declared and estimated values
+   distinguishable; never invent provider limits, prices or context ceilings.
+3. **Health demotes, never drops.** Retain unhealthy candidates for failover and recovery.
+4. **Never fabricate destructive tool calls.** Unrepairable calls fail cleanly.
+5. **Loopback is not authorization.** Admission checks `Host` and any supplied `Origin` against
+   the listener. Mutating requests require JSON. Protected control routes additionally require
+   the per-install control token; data-plane requests do not use that token as client authentication.
+6. **Log metadata only.** Never log request or response bodies, headers, or URL parameter values.
+7. **Apply shared policy to both fronts.** Cover Anthropic Messages and OpenAI Chat/Responses.
+   A rule enforced on only one front is incomplete.
 
 ## 4. Writing a test
 
-Four conventions cause most review comments. Learn them once.
+- Use at least two candidates to prove failover; a single-candidate failure cannot demonstrate it.
+- Give hand-built configs the required `repair` fields and each provider its `kind`. An omitted
+  kind can exercise a different wire path than intended.
+- Inject capability data instead of pinning a real model's pool band; synced rankings change.
+- Reset process-global stores between tests so one test's facts or cooldowns cannot affect another.
 
-1. **A failover test needs at least two candidates.** With one candidate, "it failed over" and "it
-   cannot fail over at all" produce the same observation. A real defect shipped past a suite that
-   made this mistake.
-2. **A hand-built `Config` object needs `repair: { maxAttempts, destructiveTools }`, and every
-   provider entry needs its `kind`.** Loading defaults an absent `kind` to `"anthropic"`, so an
-   OpenAI-kind fixture that omits it exercises a different code path than it claims to.
-3. **Never pin a real model's pool band.** Capability scores are synced from live leaderboards, so
-   a model's band moves when the population moves. Inject tier rows instead.
-4. **Reset the process-global stores between tests** (`resetFacts`, `resetInterpretations`, the
-   circuit breaker). Otherwise one test's refusal demotes another test's first candidate.
+Tests must not contact real providers or use the operator's credentials and state. Preserve the
+existing guards, use temporary state and inject test seams where needed.
 
-Some tests in this repository were written to pin a defect rather than to catch it. A correct fix
-can therefore turn the suite red. Read the failing test's stated reasoning before you assume your
-change is wrong, and change the test in the **same commit** as the source fix.
-
-Tests never reach a real provider. Under vitest the credential store, the state directory and the
-lane spawner all redirect or refuse. Do not add a code path that bypasses those guards.
-
----
+When a regression fails, verify the mechanism before weakening its assertion or raising its
+timeout. A test can pin a defect rather than the intended property; update it with the source fix
+only after establishing that distinction.
 
 ## 5. Commit and open a pull request
 
-1. Branch from `main`.
-2. Keep the change focused. A behaviour change and a refactor belong in separate commits.
-3. Pin new behaviour with a test. Unpinned behaviour regresses without anybody noticing.
-4. Run `npm run gate` on a clean tree.
-5. Write a commit message that states what changed and why.
-6. If a language model authored the change, add a trailer naming that model:
+Branch from `main`, keep changes focused, and separate behavior changes from refactoring. Pin new
+behavior with a regression and run `npm run gate` on the final tree. Process, spawning or
+persistence changes also need the Windows boundary checks.
 
-   ```
-   Co-Authored-By: <model name> <noreply@anthropic.com>
-   ```
+Write a commit message explaining what changed and why. For model-authored changes, include a
+trailer naming the model and an appropriate attribution address:
 
-7. Open the pull request. Describe what you measured, not only what you wrote.
+```text
+Co-Authored-By: <model name> <attribution email>
+```
 
-In the pull request body, say which of the two request paths you tested. If you tested one, say
-so plainly. That is more useful than a claim of full coverage.
-
----
+In the pull request, report checks actually run and their results. State which HTTP fronts were
+covered when relevant, and distinguish local results from CI. Do not claim full coverage from a
+focused test run.
 
 ## 6. Testing the relay and reporting a problem
 
 ### Collect the diagnosis
 
-Run these and attach the output. None of them prints a secret.
+Useful diagnostics:
 
 ```bash
 llm-relay version
-llm-relay keys             # credential status, metadata only
-llm-relay pools --probe    # does every configured model actually answer?
-llm-relay candidates       # the routing decision table
-llm-relay cost             # spend roll-up
+llm-relay keys
+llm-relay pools --probe
+llm-relay candidates
+llm-relay cost
 ```
 
-For a failing request, the response headers carry the diagnosis. Every one is safe to share:
+`pools --probe` makes real model requests. The other outputs and relay diagnostic headers expose
+metadata, which can still contain deployment names or other details you may wish to redact.
 
-| Header | Tells you |
+| Header | Meaning |
 |---|---|
-| `x-llm-relay-served-by` | which deployment answered, or the list that was tried |
-| `x-llm-relay-pool-attempts` | how many candidates were tried, and how each failed |
-| `x-llm-relay-degraded` | the answer came from below the requested capability band |
-| `x-llm-relay-quota-demoted` | a candidate was passed over because its quota was spent |
-| `x-llm-relay-unknown-refusal` | a refusal the relay could not interpret, with a count |
+| `x-llm-relay-served-by` | Deployment that answered, or the attempted list. |
+| `x-llm-relay-pool-attempts` | Candidate attempts and failures. |
+| `x-llm-relay-degraded` | Response from below the requested capability band. |
+| `x-llm-relay-quota-demoted` | Quota-based demotion. |
+| `x-llm-relay-unknown-refusal` | Refusals without an accepted interpretation. |
 
-To capture a request log, set `log.file` in your configuration. The log is metadata only by
-design: it never holds a request body, a response body, a header, or a parameter value.
+Set `log.file` to capture the relay's metadata-only request log.
 
 ### Redact before you send
 
-**Never attach these files. They hold credentials.**
+Never attach `.env`, `keystore.json` or `control-token`: they hold plaintext keys, encrypted
+credentials or a control capability. Inspect `config.json` too; environment references are not
+secrets, but literal credentials are. Replace literal values with `REDACTED`.
 
-| File | Holds |
-|---|---|
-| `~/.llm-relay/.env` | provider API keys in plain text |
-| `~/.llm-relay/keystore.json` | the encrypted credential store |
-| `~/.llm-relay/control-token` | the token that authorizes control endpoints |
+Inspect all attachments for secrets and account details. Key prefixes such as `sk-`, `nvapi-`,
+`gsk_`, `hf_` and `AIza` are useful search hints, not an exhaustive detection method. Provider
+error bodies may contain account or organization information even when relay logs do not.
 
-`~/.llm-relay/config.json` is usually safe, because a credential normally appears as an
-environment reference such as `${NVIDIA_API_KEY}`. Check it anyway. If a literal key sits in the
-file, replace it with `REDACTED` before you attach it.
-
-Two more checks before you send anything:
-
-1. **Scan for key-shaped strings.** Provider keys start with recognisable prefixes, such as `sk-`,
-   `nvapi-`, `gsk_`, `hf_` or `AIza`. Search your attachment for each and replace the whole value.
-2. **Read provider error bodies.** The relay passes a provider's error through unchanged, and some
-   providers name your account or organization in it. Replace that text.
-
-On this project, `~/.llm-relay/` is the default state directory. If you set `XDG_CONFIG_HOME` or
-`XDG_CACHE_HOME`, the files move; [docs/reference.md](docs/reference.md) has the mapping.
+The legacy state directory is `~/.llm-relay/`. XDG variables change preferred config/cache paths,
+not existing files: when the preferred artifact is absent and a legacy copy exists, that legacy
+path remains in use. Nothing is migrated automatically. An explicit config path also determines
+its control-token directory. See [docs/reference.md](docs/reference.md) for the full mapping.
 
 ### Report a security problem privately
 
-Do not open a public issue for a vulnerability. Open a private security advisory on the
-repository instead, under the **Security** tab.
-
----
+Do not publish credentials or vulnerabilities in an issue. Use the repository's private security
+advisory flow under the **Security** tab.
 
 ## 7. Where documentation lives
 
-| File | Holds |
+| File | Purpose |
 |---|---|
-| [README.md](README.md) | the short front door |
-| [docs/QUICKSTART.md](docs/QUICKSTART.md) | staged setup for a new install |
-| [docs/architecture.md](docs/architecture.md) | what the code does, and where |
-| [docs/reference.md](docs/reference.md) | every option, endpoint and caveat |
-| [docs/project-goals.md](docs/project-goals.md) | what this project is, and is not |
-| [docs/project-philosophy.md](docs/project-philosophy.md) | the convictions that settle a question |
-| [docs/backlog.md](docs/backlog.md) | open work, stated as unmet properties |
-| [HANDOFF.md](HANDOFF.md) | current state and the immediate next step |
-| [CLAUDE.md](CLAUDE.md) | the full source map and the reason behind each rule |
-| [docs/history/](docs/history/) | dated records. Evidence, not instructions. |
+| [README.md](README.md) | Short project introduction. |
+| [docs/QUICKSTART.md](docs/QUICKSTART.md) | Staged setup. |
+| [docs/architecture.md](docs/architecture.md) | Code map. |
+| [docs/reference.md](docs/reference.md) | Commands, configuration, APIs and caveats. |
+| [docs/project-goals.md](docs/project-goals.md), [docs/project-philosophy.md](docs/project-philosophy.md) | Scope and design principles. |
+| [docs/backlog.md](docs/backlog.md) | Unmet properties only. |
+| [HANDOFF.md](HANDOFF.md) | Current state and the immediate next step. |
+| [CLAUDE.md](CLAUDE.md) | Detailed agent guidance and invariants. |
+| [docs/history/](docs/history/) | Dated designs, audits and measurements. |
 
-`CLAUDE.md` is large and is written for an AI coding assistant. Read
-[docs/architecture.md](docs/architecture.md) first, then open `CLAUDE.md` for the one module you
-are changing.
+Keep live guidance current when behavior changes. Put dated evidence in `docs/history/` rather
+than appending a release diary to the live guides. Comments should explain contracts, boundaries
+and non-obvious reasons, not repeat the implementation or narrate prior cleanup sessions.
