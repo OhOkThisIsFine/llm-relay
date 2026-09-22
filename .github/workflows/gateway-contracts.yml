@@ -44,3 +44,6 @@ jobs:
         run: node scripts/refactor/gateway-contracts.mjs ${{ matrix.candidate }}
       - name: Verify native bypasses and single-wire providers
         run: node scripts/refactor/gateway-boundaries.mjs ${{ matrix.candidate }}
+      - name: Verify documented Chat-only bridge override
+        if: matrix.candidate == 'litellm'
+        run: node scripts/refactor/gateway-boundaries.mjs litellm --chat-bridge

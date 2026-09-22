@@ -90,7 +90,7 @@ async function relayChild(wire) {
   }, { catalog: new ModelCatalog({ cachePath: null }) });
   process.send({ base: await listen(server) });
 }
-async function candidateStart(candidate, wire, upstream, dir) {
+async function candidateStart(candidate, wire, upstream, dir, chatBridge) {
   if (candidate === 'relay') {
     const child = fork(self, ['--relay-child', wire], { execArgv: [], env: { ...cleanEnv(dir), BOUNDARY_UPSTREAM: upstream, BOUNDARY_KEY: KEY }, stdio: ['ignore', 'ignore', 'pipe', 'ipc'], windowsHide: true });
     let ready; let error = ''; let spawnError;
@@ -109,7 +109,7 @@ async function candidateStart(candidate, wire, upstream, dir) {
   const port = new URL(base).port; const name = `boundary-${randomUUID()}`;
   const auth = wire === 'messages' ? { 'x-api-key': KEY, 'anthropic-version': '2023-06-01' } : { authorization: `Bearer ${KEY}` };
   const config = candidate === 'litellm' ? {
-    model_list: [{ model_name: 'fixture', litellm_params: { model: `${provider(wire)}/${MODELS[wire]}`, api_base: apiBase(candidate, wire, upstream), api_key: KEY, max_retries: 0 } }],
+    model_list: [{ model_name: 'fixture', litellm_params: { model: `${provider(wire)}/${MODELS[wire]}`, api_base: apiBase(candidate, wire, upstream), api_key: KEY, max_retries: 0, ...(chatBridge ? { use_chat_completions_api: true } : {}) } }],
     general_settings: { pass_through_endpoints: [{ path: '/native' + PATHS[wire], target: upstream + PATHS[wire], auth: false, forward_headers: false, methods: ['POST'], headers: { ...auth, 'content-type': 'application/json' } }] },
     litellm_settings: { telemetry: false, drop_params: false, num_retries: 0 }, router_settings: { num_retries: 0, fallbacks: [], disable_cooldowns: true },
   } : { providers: { [provider(wire)]: { keys: [{ name: 'fixture', value: KEY, models: ['*'], weight: 1 }], network_config: { base_url: apiBase(candidate, wire, upstream), allow_private_network: true, max_retries: 0, default_request_timeout_in_seconds: 10 } } }, config_store: { enabled: false }, logs_store: { enabled: false } };
@@ -123,8 +123,10 @@ async function candidateStart(candidate, wire, upstream, dir) {
 }
 async function probe(candidate) {
   assert(['relay', 'litellm', 'bifrost'].includes(candidate), 'Choose relay, litellm or bifrost');
-  const report = { version: 2, candidate, node: process.version, platform: process.platform, results: [], identities: [], auxiliaryEgresses: 0, infrastructureErrors: [] };
-  for (const wire of Object.keys(PATHS)) {
+  const chatBridge = process.argv[3] === '--chat-bridge';
+  assert(process.argv[3] === undefined || (candidate === 'litellm' && chatBridge), 'Only litellm supports --chat-bridge');
+  const report = { version: 3, candidate, profile: chatBridge ? 'explicit-chat-bridge' : 'default', node: process.version, platform: process.platform, results: [], identities: [], auxiliaryEgresses: 0, infrastructureErrors: [] };
+  for (const wire of (chatBridge ? ['chat'] : Object.keys(PATHS))) {
     const dir = mkdtempSync(join(tmpdir(), 'relay-boundary-')); const cases = new Map(); let gateway;
     const upstream = createServer(async (req, res) => {
       try {
@@ -144,7 +146,7 @@ async function probe(candidate) {
       } catch (error) { report.infrastructureErrors.push(String(error)); if (!res.destroyed) res.destroy(); }
     });
     try {
-      gateway = await candidateStart(candidate, wire, await listen(upstream), dir); report.identities.push({ wire, ...gateway.identity });
+      gateway = await candidateStart(candidate, wire, await listen(upstream), dir, chatBridge); report.identities.push({ wire, ...gateway.identity });
       const check = async (front, native, behavior) => {
         const token = `boundary-task-${randomUUID()}`;
         const test = { calls: [], hold: behavior === 'cancel', fail: behavior === 'error', expected: behavior === 'error' ? { error: { type: 'api_error', message: 'synthetic failure' }, vendor_extension: EXTENSION } : { ...reply(wire), ...(native ? { vendor_extension: EXTENSION } : {}) } };
