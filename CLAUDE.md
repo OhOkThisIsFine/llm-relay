@@ -1,5 +1,9 @@
 # CLAUDE.md — llm-relay (agent orientation)
 
+**llm-relay is retired (2026-09-23).** The repository is archived. Do not start work here: read
+[HANDOFF.md](HANDOFF.md) for the replacement. The rest of this file describes the last release,
+v0.86.0, and is kept for reference only.
+
 Read [HANDOFF.md](HANDOFF.md) first for the current checkpoint and immediate next step.
 This file holds durable engineering rules and the source map, not release status or a work queue.
 [docs/backlog.md](docs/backlog.md) is the queue; [docs/README.md](docs/README.md) is the documentation
