@@ -1,5 +1,11 @@
 # llm-relay
 
+> **Retired 2026-09-23.** This project gets no further work, and the repository is archived. The npm
+> package is deprecated. Its replacement is agent-dispatch, a private project that adopts standard
+> components instead: an OpenCode worker behind an MCP bridge, with a LiteLLM proxy in front of the
+> model endpoints. [HANDOFF.md](HANDOFF.md) has the detail. The text below
+> describes the last release (v0.86.0) and is kept for reference only.
+
 A local traffic router for LLM clients and coding agents. It gives one client a single place to route requests across models, providers, credentials, and agent lanes, with failover and observability built in.
 
 Use it to:

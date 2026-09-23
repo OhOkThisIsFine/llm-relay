@@ -1,5 +1,8 @@
 # Backlog — llm-relay
 
+> **Closed 2026-09-23: llm-relay is retired** (see [`../HANDOFF.md`](../HANDOFF.md)). The entries
+> below are closed without action and are kept for reference only.
+
 > The work queue. Each entry states an unmet **Property** and is deleted once that property is met.
 > Shipped work belongs in git history and dated records under [`history/`](history/).
 > [`../HANDOFF.md`](../HANDOFF.md) holds current runtime state. The authoritative implementation
